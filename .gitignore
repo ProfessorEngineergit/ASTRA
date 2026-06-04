@@ -1,0 +1,32 @@
+# ─── Secrets ────────────────────────────────────────────────────────────────
+.env
+*.env
+!.env.example
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.uv/
+uv.lock
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ─── Runtime data / state (NEVER commit — contains messages, sessions, keys) ──
+data/
+postgres_data/
+redis_data/
+n8n_data/
+waha_data/
+signal_data/
+caddy_data/
+caddy_config/
+
+# ─── OS / editor ──────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.log

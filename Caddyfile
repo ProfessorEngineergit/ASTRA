@@ -1,0 +1,28 @@
+# ASTRA reverse proxy. Only the cortex webhook surface is exposed publicly;
+# n8n / WAHA / Langfuse stay on 127.0.0.1 binds (see docker-compose.yml).
+# With ASTRA_DOMAIN=localhost, Caddy uses its internal CA automatically.
+
+{
+	email {$ACME_EMAIL}
+}
+
+{$ASTRA_DOMAIN} {
+	# Telegram webhook (only used when ASTRA_TELEGRAM_MODE=webhook)
+	handle /telegram/* {
+		reverse_proxy cortex:8000
+	}
+
+	# Home Assistant conversation agent (Phase 3)
+	handle /ha/* {
+		reverse_proxy cortex:8000
+	}
+
+	handle /health {
+		reverse_proxy cortex:8000
+	}
+
+	# Everything else is closed.
+	handle {
+		respond "ASTRA" 404
+	}
+}

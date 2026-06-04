@@ -1,0 +1,162 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  ASTRA v2 — full stack.  See README.md for the minimal first-run subset.
+#  Architecture contract: cortex owns ALL logic/state; n8n holds ONLY stateless
+#  tool workflows; inbound normalization happens in cortex (/ingress/*).
+# ═══════════════════════════════════════════════════════════════════════════
+name: astra
+
+x-restart: &restart
+  restart: unless-stopped
+
+networks:
+  astra:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  n8n_data:
+  waha_data:
+  signal_data:
+  caddy_data:
+  caddy_config:
+
+services:
+  # ─── Reverse proxy / TLS (public surface) ──────────────────────────────────
+  caddy:
+    image: caddy:2-alpine
+    <<: *restart
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      ASTRA_DOMAIN: ${ASTRA_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [cortex]
+    networks: [astra]
+
+  # ─── Postgres + pgvector (cortex app DB + vector store; also n8n + langfuse) ─
+  postgres:
+    image: pgvector/pgvector:pg16
+    <<: *restart
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db:/db:ro
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [astra]
+
+  # ─── Redis (thread state machine, deferral timers, pub/sub) ─────────────────
+  redis:
+    image: redis:7-alpine
+    <<: *restart
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks: [astra]
+
+  # ─── Cortex (the brain) ─────────────────────────────────────────────────────
+  cortex:
+    build: ./cortex
+    <<: *restart
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/cortex
+      REDIS_URL: redis://redis:6379/0
+      N8N_BASE_URL: http://n8n:5678
+      WAHA_BASE_URL: http://waha:3000
+      SIGNAL_BASE_URL: http://signal-cli:8080
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports:
+      - "127.0.0.1:8088:8000"   # local dev only; public traffic via Caddy
+    networks: [astra]
+
+  # ─── n8n (stateless tool workflows ONLY — no business logic) ────────────────
+  n8n:
+    image: n8nio/n8n
+    <<: *restart
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
+      GENERIC_TIMEZONE: ${ASTRA_TIMEZONE}
+      WEBHOOK_URL: http://n8n:5678/
+      # Available to workflows for outbound calls:
+      CORTEX_SHARED_SECRET: ${CORTEX_SHARED_SECRET}
+      WAHA_API_KEY: ${WAHA_API_KEY}
+    volumes:
+      - n8n_data:/home/node/.n8n
+    ports:
+      - "127.0.0.1:5678:5678"
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [astra]
+
+  # ─── WAHA (WhatsApp). Inbound goes straight to cortex ingress. ──────────────
+  waha:
+    image: devlikeapro/waha:latest
+    <<: *restart
+    environment:
+      WHATSAPP_API_KEY: ${WAHA_API_KEY}
+      WAHA_DASHBOARD_USERNAME: ${WAHA_DASHBOARD_USERNAME}
+      WAHA_DASHBOARD_PASSWORD: ${WAHA_DASHBOARD_PASSWORD}
+      WHATSAPP_HOOK_URL: http://cortex:8000/ingress/waha
+      WHATSAPP_HOOK_EVENTS: message
+    volumes:
+      - waha_data:/app/.sessions
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks: [astra]
+
+  # ─── signal-cli-rest-api ────────────────────────────────────────────────────
+  signal-cli:
+    image: bbernhard/signal-cli-rest-api:latest
+    <<: *restart
+    environment:
+      MODE: json-rpc
+    volumes:
+      - signal_data:/home/.local/share/signal-cli
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks: [astra]
+
+  # ─── Langfuse (LLM tracing). v2 needs only Postgres. ────────────────────────
+  langfuse:
+    image: langfuse/langfuse:2
+    <<: *restart
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3001
+      NEXTAUTH_SECRET: ${LANGFUSE_SECRET}
+      SALT: ${LANGFUSE_SALT}
+      TELEMETRY_ENABLED: "false"
+    ports:
+      - "127.0.0.1:3001:3000"
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [astra]
