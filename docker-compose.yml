@@ -106,9 +106,14 @@ services:
       N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
       GENERIC_TIMEZONE: ${ASTRA_TIMEZONE}
       WEBHOOK_URL: http://n8n:5678/
-      # Available to workflows for outbound calls:
+      # Available to the tool/send_* workflows for outbound calls + auth:
       CORTEX_SHARED_SECRET: ${CORTEX_SHARED_SECRET}
+      WAHA_BASE_URL: http://waha:3000
       WAHA_API_KEY: ${WAHA_API_KEY}
+      WAHA_SESSION: ${WAHA_SESSION}
+      SIGNAL_BASE_URL: http://signal-cli:8080
+      SIGNAL_PHONE_NUMBER: ${SIGNAL_PHONE_NUMBER}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
     volumes:
       - n8n_data:/home/node/.n8n
     ports:
@@ -127,6 +132,8 @@ services:
       WAHA_DASHBOARD_PASSWORD: ${WAHA_DASHBOARD_PASSWORD}
       WHATSAPP_HOOK_URL: http://cortex:8000/ingress/waha
       WHATSAPP_HOOK_EVENTS: message
+      # Forward the shared secret so cortex can authenticate the webhook
+      WHATSAPP_HOOK_HEADERS: X-Astra-Secret:${CORTEX_SHARED_SECRET}
     volumes:
       - waha_data:/app/.sessions
     ports:
