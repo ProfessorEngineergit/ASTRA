@@ -30,10 +30,12 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, status
+from fastapi.responses import HTMLResponse
 
-from . import brain, db
+from . import brain, briefing, db, knowledge
 from .channels import get_channels
 from .config import get_settings
+from .integrations.transcription import get_transcriber
 
 log = logging.getLogger("astra.main")
 
@@ -139,9 +141,16 @@ async def _handle_tg_update(
             )
         return
 
-    # ── Regular text message ─────────────────────────────────────────────────
+    # ── Regular message (text, caption, or voice/audio note) ─────────────────
     if msg := update.get("message"):
         text = msg.get("text") or msg.get("caption") or ""
+
+        # Voice / audio → transcribe with Whisper, then treat as text.
+        if not text and (voice := (msg.get("voice") or msg.get("audio"))):
+            text = await _transcribe_voice(voice, base, client)
+            if text:
+                text = f"🎤 {text}"
+
         if not text:
             return  # ignore stickers, photos without caption, etc.
 
@@ -153,6 +162,31 @@ async def _handle_tg_update(
             text=text,
             sender_display=_tg_display(sender),
         )
+
+
+async def _transcribe_voice(voice: dict, base: str, client: httpx.AsyncClient) -> str:
+    """Download a Telegram voice/audio file and transcribe it via Whisper."""
+    tr = get_transcriber()
+    if not tr.enabled:
+        log.info("Voice message received but transcription disabled.")
+        return ""
+    file_id = voice.get("file_id")
+    if not file_id:
+        return ""
+    try:
+        meta = await client.get(f"{base}/getFile", params={"file_id": file_id})
+        meta.raise_for_status()
+        file_path = meta.json()["result"]["file_path"]
+        token = get_settings().telegram_bot_token
+        dl = await client.get(f"https://api.telegram.org/file/bot{token}/{file_path}")
+        dl.raise_for_status()
+        fname = file_path.split("/")[-1] or "voice.ogg"
+        text = await tr.transcribe(dl.content, filename=fname)
+        log.info("Transcribed voice note (%d chars).", len(text))
+        return text
+    except Exception as e:  # noqa: BLE001
+        log.warning("voice download/transcribe failed: %s", e)
+        return ""
 
 
 def _tg_display(user: dict) -> str:
@@ -175,6 +209,7 @@ async def lifespan(app: FastAPI):
     )
 
     log.info("ASTRA cortex starting up…")
+    knowledge.ensure_seeded()
     await db.init_pool()
 
     tasks: list[asyncio.Task] = []
@@ -189,6 +224,17 @@ async def lifespan(app: FastAPI):
         log.info("Telegram poller started (mode=poll).")
     else:
         log.info("Telegram mode=%s — no background poller.", s.astra_telegram_mode)
+
+    if s.astra_briefing_enabled and s.telegram_enabled:
+        briefing_task = asyncio.create_task(briefing.scheduler(), name="briefing")
+        tasks.append(briefing_task)
+        log.info("Morning briefing scheduler started (%s).", s.astra_briefing_time)
+
+    # Log which optional capabilities are live, so the boot log is self-documenting.
+    log.info(
+        "Capabilities — voice:%s ha:%s edupage:%s rmv:%s tasks:%s",
+        s.voice_enabled, s.ha_enabled, s.edupage_enabled, s.rmv_enabled, s.google_tasks_enabled,
+    )
 
     yield  # ← server is running
 
@@ -223,6 +269,34 @@ def _verify_secret(x_astra_secret: str | None) -> None:
 @app.get("/health", tags=["infra"])
 async def health():
     return {"status": "ok"}
+
+
+# ─── Morning briefing (manual trigger) ──────────────────────────────────────────
+
+@app.post("/briefing/run", tags=["briefing"])
+async def briefing_run(x_astra_secret: str | None = Header(default=None)):
+    _verify_secret(x_astra_secret)
+    ok = await briefing.send()
+    return {"ok": ok}
+
+
+@app.get("/briefing/preview", tags=["briefing"])
+async def briefing_preview(x_astra_secret: str | None = Header(default=None)):
+    """Render the briefing text without sending it (for testing)."""
+    _verify_secret(x_astra_secret)
+    return {"text": await briefing.compose()}
+
+
+# ─── Dashboard (lightweight status GUI) ─────────────────────────────────────────
+
+@app.get("/dashboard", response_class=HTMLResponse, tags=["infra"])
+async def dashboard():
+    from .dashboard import render
+    s = get_settings()
+    threads = await db.list_threads(20)
+    approvals = await db.pending_approvals()
+    audit = await db.recent_audit(25)
+    return render(s, threads, approvals, audit)
 
 
 # ─── Telegram webhook (optional — used when ASTRA_TELEGRAM_MODE=webhook) ──────

@@ -20,6 +20,7 @@ volumes:
   signal_data:
   caddy_data:
   caddy_config:
+  brain_data:        # ASTRA's durable, editable knowledge (markdown) — not in git
 
 services:
   # ─── Reverse proxy / TLS (public surface) ──────────────────────────────────
@@ -76,18 +77,27 @@ services:
   cortex:
     build: ./cortex
     <<: *restart
-    env_file: [.env]
+    env_file: [.env]   # all HA / EduPage / RMV / Tasks / briefing / voice vars flow in here
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/cortex
       REDIS_URL: redis://redis:6379/0
       N8N_BASE_URL: http://n8n:5678
       WAHA_BASE_URL: http://waha:3000
       SIGNAL_BASE_URL: http://signal-cli:8080
+      BRAIN_DATA_DIR: /srv/data          # durable, editable knowledge (volume below)
+    volumes:
+      - brain_data:/srv/data             # persona/facts/routines markdown — survives updates
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
     ports:
       - "127.0.0.1:8088:8000"   # local dev only; public traffic via Caddy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     networks: [astra]
 
   # ─── n8n (stateless tool workflows ONLY — no business logic) ────────────────

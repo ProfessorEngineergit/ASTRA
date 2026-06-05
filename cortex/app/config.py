@@ -44,6 +44,37 @@ class Settings(BaseSettings):
     astra_domain: str = "localhost"
     log_level: str = "INFO"
 
+    # ── Durable, editable knowledge (lives in a Docker volume, survives updates) ─
+    # Markdown files here are loaded into ASTRA's system prompt. NOT in git.
+    brain_data_dir: str = "/srv/data"
+
+    # ── Voice (Whisper transcription of Telegram voice notes) ────────────────────
+    astra_voice_transcription: bool = True
+    whisper_model: str = "whisper-1"
+
+    # ── Home Assistant (active control + status) ─────────────────────────────────
+    home_assistant_base_url: str = ""        # e.g. http://homeassistant.local:8123
+    home_assistant_token: str = ""           # long-lived access token
+
+    # ── EduPage (school timetable) ───────────────────────────────────────────────
+    edupage_subdomain: str = ""              # e.g. "gymnasium-xy"  → gymnasium-xy.edupage.org
+    edupage_username: str = ""
+    edupage_password: str = ""
+
+    # ── RMV (public transport, HAFAS open API) ───────────────────────────────────
+    rmv_api_key: str = ""                    # accessId for https://www.rmv.de/hapi
+    rmv_home_stop_id: str = ""               # default origin (station extId)
+    rmv_school_stop_id: str = ""             # default destination
+
+    # ── Google Tasks (added via an n8n tool workflow that holds the OAuth) ────────
+    google_tasks_enabled: bool = False
+    google_tasks_list: str = "@default"
+
+    # ── Morning briefing ─────────────────────────────────────────────────────────
+    astra_briefing_enabled: bool = False
+    astra_briefing_time: str = "07:00"       # local time HH:MM
+    astra_briefing_chat_id: str = ""         # defaults to telegram_owner_chat_id
+
     @property
     def openai_enabled(self) -> bool:
         return bool(self.openai_api_key)
@@ -51,6 +82,26 @@ class Settings(BaseSettings):
     @property
     def telegram_enabled(self) -> bool:
         return bool(self.telegram_bot_token)
+
+    @property
+    def voice_enabled(self) -> bool:
+        return self.astra_voice_transcription and self.openai_enabled
+
+    @property
+    def ha_enabled(self) -> bool:
+        return bool(self.home_assistant_base_url and self.home_assistant_token)
+
+    @property
+    def edupage_enabled(self) -> bool:
+        return bool(self.edupage_subdomain and self.edupage_username and self.edupage_password)
+
+    @property
+    def rmv_enabled(self) -> bool:
+        return bool(self.rmv_api_key)
+
+    @property
+    def briefing_chat(self) -> str:
+        return self.astra_briefing_chat_id or self.telegram_owner_chat_id
 
 
 @lru_cache

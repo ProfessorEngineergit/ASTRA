@@ -28,7 +28,21 @@ async def init_pool() -> None:
         _pool = await asyncpg.create_pool(
             get_settings().database_url, min_size=1, max_size=10, init=_init_conn
         )
+        await _migrate()
         log.info("Postgres pool ready.")
+
+
+async def _migrate() -> None:
+    """Idempotent schema additions — safe on both fresh and existing databases."""
+    await _pool.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key        TEXT PRIMARY KEY,
+            value      JSONB NOT NULL DEFAULT '{}'::jsonb,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
 
 
 async def close_pool() -> None:
@@ -185,6 +199,73 @@ async def decide_approval(approval_id: str, decision: str) -> dict | None:
         approval_id, decision,
     )
     return dict(row) if row else None
+
+
+# ─── Briefing / dashboard read models ────────────────────────────────────────
+async def inbound_since(since: datetime) -> list[dict]:
+    """Third-party inbound messages since `since`, newest last, with contact name."""
+    rows = await pool().fetch(
+        """
+        SELECT m.thread_id, m.content, m.created_at, t.channel,
+               COALESCE(c.display_name, m.sender_handle) AS who,
+               c.is_owner
+        FROM messages m
+        JOIN threads t ON t.thread_id = m.thread_id
+        LEFT JOIN contacts c ON c.id = t.contact_id
+        WHERE m.role = 'user' AND m.created_at >= $1
+        ORDER BY m.created_at
+        """,
+        since,
+    )
+    return [dict(r) for r in rows]
+
+
+async def list_threads(limit: int = 25) -> list[dict]:
+    rows = await pool().fetch(
+        """
+        SELECT t.thread_id, t.channel, t.state, t.last_event_at,
+               COALESCE(c.display_name, t.thread_id) AS who, c.trust_tier
+        FROM threads t LEFT JOIN contacts c ON c.id = t.contact_id
+        ORDER BY t.last_event_at DESC LIMIT $1
+        """,
+        limit,
+    )
+    return [dict(r) for r in rows]
+
+
+async def pending_approvals() -> list[dict]:
+    rows = await pool().fetch(
+        "SELECT id, thread_id, question, created_at FROM approvals "
+        "WHERE status='pending' ORDER BY created_at DESC"
+    )
+    return [dict(r) for r in rows]
+
+
+async def recent_audit(limit: int = 30) -> list[dict]:
+    rows = await pool().fetch(
+        "SELECT ts, event_type, channel, thread_id, detail FROM audit_log "
+        "ORDER BY ts DESC LIMIT $1",
+        limit,
+    )
+    return [dict(r) for r in rows]
+
+
+# ─── Settings KV (runtime toggles from the dashboard) ─────────────────────────
+async def get_setting(key: str, default=None):
+    val = await pool().fetchval("SELECT value FROM settings WHERE key=$1", key)
+    if val is None:
+        return default
+    return val.get("v", default) if isinstance(val, dict) else val
+
+
+async def set_setting(key: str, value) -> None:
+    await pool().execute(
+        """
+        INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, now())
+        ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()
+        """,
+        key, {"v": value},
+    )
 
 
 # ─── Audit ────────────────────────────────────────────────────────────────────

@@ -6,6 +6,7 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from . import knowledge
 from .config import get_settings
 from .models import get_gateway
 from .persona import Register, system_prompt
@@ -55,6 +56,12 @@ async def generate_reply(
         register, owner=s.astra_owner_name, now=_now_str(s.astra_timezone), tz=s.astra_timezone
     )
     messages: list[dict] = [{"role": "system", "content": sys}]
+    if register == Register.OWNER:
+        kb = knowledge.owner_context()
+        if kb:
+            messages.append(
+                {"role": "system", "content": f"Dauerhaftes Wissen über {s.astra_owner_name}:\n{kb}"}
+            )
     if summary:
         messages.append({"role": "system", "content": f"Bisheriger Gesprächskontext: {summary}"})
     if register == Register.THIRD:
@@ -73,10 +80,12 @@ async def generate_reply(
         messages.append({"role": "system", "content": extra_system})
     messages += _history_to_messages(history)
 
+    is_owner = register == Register.OWNER
     ctx = ToolContext(
-        thread_id=thread_id, channel=channel, contact=contact, max_sensitivity=max_sensitivity
+        thread_id=thread_id, channel=channel, contact=contact, max_sensitivity=max_sensitivity,
+        is_owner=is_owner,
     )
-    tools = openai_tools()
+    tools = openai_tools(is_owner=is_owner)
 
     for _ in range(MAX_TOOL_ITERS):
         msg = await gw.chat(messages, tools=tools)
