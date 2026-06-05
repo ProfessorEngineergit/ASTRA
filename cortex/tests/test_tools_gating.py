@@ -1,43 +1,52 @@
-"""The owner-only safety gate: a third party messaging Bahrian must never be able
-to see or invoke personal-assistant tools (Home Assistant, tasks, timetable …)."""
+"""The owner-only safety gate: a third party messaging Bahrian must never see or
+invoke personal-assistant tools (core remember_fact + every plugin tool)."""
 from __future__ import annotations
 
 import asyncio
 
-from app.tools import REGISTRY, ToolContext, dispatch, openai_tools
+from app.plugins.registry import _discover_classes
+from app.tools import REGISTRY, Tool, ToolContext, clear_source, dispatch, openai_tools, register
 
-OWNER_ONLY = {
-    "remember_fact", "home_assistant_state", "home_assistant_call",
-    "get_timetable", "get_departures", "add_google_task",
-}
-ALWAYS = {"recall_memory", "request_owner_approval"}
+CORE_ALWAYS = {"recall_memory", "request_owner_approval"}
 
 
-def test_owner_only_tools_registered():
-    for name in OWNER_ONLY:
-        assert name in REGISTRY, f"{name} not registered"
-        assert REGISTRY[name].owner_only is True
+def test_core_tools_registered():
+    assert CORE_ALWAYS <= set(REGISTRY)
+    assert REGISTRY["remember_fact"].owner_only is True
 
 
-def test_third_party_tool_list_hides_owner_tools():
-    third = {t["function"]["name"] for t in openai_tools(is_owner=False)}
-    owner = {t["function"]["name"] for t in openai_tools(is_owner=True)}
-    assert OWNER_ONLY & third == set(), "owner-only tools leaked to third party"
-    assert ALWAYS <= third
-    assert OWNER_ONLY <= owner
+def test_every_plugin_tool_is_owner_only():
+    for cls in _discover_classes():
+        for t in cls({"__enabled": True}).tools():
+            assert t.owner_only is True
+
+
+def test_third_party_never_sees_owner_tools():
+    # Register a representative plugin tool, then check visibility for a third party.
+    rmv = next(c for c in _discover_classes() if c.slug == "rmv")
+    for t in rmv({"__enabled": True, "api_key": "k"}).tools():
+        register(t)
+    try:
+        third = {t["function"]["name"] for t in openai_tools(is_owner=False)}
+        owner = {t["function"]["name"] for t in openai_tools(is_owner=True)}
+        assert "get_departures" not in third
+        assert "remember_fact" not in third
+        assert CORE_ALWAYS <= third
+        assert "get_departures" in owner
+    finally:
+        clear_source("rmv")
 
 
 def test_dispatch_blocks_owner_tool_for_third_party():
-    ctx = ToolContext(thread_id="waha:49x@c.us", channel="waha", contact={"id": None}, is_owner=False)
-    res = asyncio.run(
-        dispatch("home_assistant_call", {"domain": "light", "service": "turn_on"}, ctx)
-    )
-    assert "nur für Bahrian" in res
+    register(Tool(name="_t_owner", description="x", parameters={"type": "object", "properties": {}},
+                  handler=lambda a, c: _async("ok"), owner_only=True, source="test"))
+    try:
+        ctx = ToolContext(thread_id="waha:x", channel="waha", contact={"id": None}, is_owner=False)
+        res = asyncio.run(dispatch("_t_owner", {}, ctx))
+        assert "nur für Bahrian" in res
+    finally:
+        clear_source("test")
 
 
-def test_unconfigured_tool_returns_friendly_message_for_owner():
-    # Owner allowed through the gate; integration is unconfigured → graceful message,
-    # never an exception.
-    ctx = ToolContext(thread_id="telegram:1", channel="telegram", contact={"id": None}, is_owner=True)
-    res = asyncio.run(dispatch("home_assistant_state", {"entity_id": "light.x"}, ctx))
-    assert "nicht konfiguriert" in res
+async def _async(v):
+    return v

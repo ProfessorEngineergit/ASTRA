@@ -90,7 +90,9 @@ def render(s, threads: list[dict], approvals: list[dict], audit: list[dict]) -> 
 </style></head>
 <body>
 <header>
-  <h1>🌌 ASTRA <small>· {_esc(s.astra_owner_name)} · {_esc(s.astra_timezone)}</small></h1>
+  <h1>🌌 ASTRA <small>· {_esc(s.astra_owner_name)} · {_esc(s.astra_timezone)}</small>
+    <a href="/admin" style="font-size:13px;margin-left:14px;color:#60a5fa">⚙️ Plugins &amp; Konfiguration</a>
+  </h1>
   <div class="caps">{caps}</div>
 </header>
 <main>

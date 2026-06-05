@@ -48,6 +48,13 @@ class Settings(BaseSettings):
     # Markdown files here are loaded into ASTRA's system prompt. NOT in git.
     brain_data_dir: str = "/srv/data"
 
+    # ── Web admin (plugin catalog + config) ──────────────────────────────────────
+    # Admin password: set here OR via the first-run wizard on first opening /admin.
+    astra_admin_password: str = ""
+    # Fernet key for encrypting plugin secrets at rest. Blank → generated once and
+    # persisted to {brain_data_dir}/.config_key (survives updates).
+    astra_config_key: str = ""
+
     # ── Voice (Whisper transcription of Telegram voice notes) ────────────────────
     astra_voice_transcription: bool = True
     whisper_model: str = "whisper-1"

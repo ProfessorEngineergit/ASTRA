@@ -36,6 +36,9 @@ from . import brain, briefing, db, knowledge
 from .channels import get_channels
 from .config import get_settings
 from .integrations.transcription import get_transcriber
+from .plugins.registry import get_manager
+from .web import admin as web_admin
+from .web import auth as web_auth
 
 log = logging.getLogger("astra.main")
 
@@ -211,6 +214,10 @@ async def lifespan(app: FastAPI):
     log.info("ASTRA cortex starting up…")
     knowledge.ensure_seeded()
     await db.init_pool()
+    await web_auth.ensure_password_from_env()
+
+    # Load plugins → register their tools + start their background tasks.
+    await get_manager().rebuild()
 
     tasks: list[asyncio.Task] = []
 
@@ -230,15 +237,14 @@ async def lifespan(app: FastAPI):
         tasks.append(briefing_task)
         log.info("Morning briefing scheduler started (%s).", s.astra_briefing_time)
 
-    # Log which optional capabilities are live, so the boot log is self-documenting.
-    log.info(
-        "Capabilities — voice:%s ha:%s edupage:%s rmv:%s tasks:%s",
-        s.voice_enabled, s.ha_enabled, s.edupage_enabled, s.rmv_enabled, s.google_tasks_enabled,
-    )
+    # Self-documenting boot log: voice + which plugins are live.
+    enabled_plugins = ", ".join(p.slug for p in get_manager().enabled()) or "(none)"
+    log.info("Capabilities — voice:%s · plugins: %s", s.voice_enabled, enabled_plugins)
 
     yield  # ← server is running
 
     log.info("ASTRA cortex shutting down…")
+    await get_manager().shutdown()
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -251,6 +257,7 @@ async def lifespan(app: FastAPI):
 # ─── FastAPI app ───────────────────────────────────────────────────────────────
 
 app = FastAPI(title="ASTRA cortex", version="2.0.0", lifespan=lifespan)
+app.include_router(web_admin.router)
 
 
 # ─── Auth helper ──────────────────────────────────────────────────────────────

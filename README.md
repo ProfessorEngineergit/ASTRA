@@ -138,11 +138,52 @@ curl -X POST localhost:8088/briefing/run -H "X-Astra-Secret: $CORTEX_SHARED_SECR
 ### 📊 Dashboard
 Status-GUI (read-only) unter **`http://127.0.0.1:8088/dashboard`** — aktive Threads, offene Freigaben, Audit-Log, welche Fähigkeiten live sind. Hinter VPN/Caddy halten.
 
+## 🧩 Plugins & Web-Konfiguration
+
+Integrationen sind **Plugins**, die du in einer Weboberfläche verwaltest — Stöbern,
+Suchen, Filtern nach Kategorie, Favoriten (★), Ein/Aus-Schalter, Config-Formular und
+„Verbindung testen" — **wie die Home-Assistant-Integrationssuche**. Konfiguration läuft
+**live, ohne Container-Neustart**.
+
+```
+http://127.0.0.1:8088/admin
+```
+
+**Zugriff (Standard: nicht öffentlich)** per SSH-Tunnel:
+```bash
+ssh -L 8088:127.0.0.1:8088 root@<server>     # dann im Browser: http://localhost:8088/admin
+```
+
+- **Erstes Öffnen → Setup-Wizard:** du legst ein Admin-Passwort fest (oder vorab via
+  `ASTRA_ADMIN_PASSWORD`). Danach Login mit signiertem Session-Cookie.
+- **Katalog:** alle Plugins als Karten mit Status (aktiv / aus / nicht konfiguriert),
+  Suche, Kategorie-Chips, „nur Favoriten".
+- **Plugin konfigurieren:** Formular aus dem Plugin-Schema, Secrets **verschlüsselt**
+  (Fernet) und write-only (Anzeige „•••• gesetzt"), Toggle, „Verbindung testen".
+- **Sicherheit:** Secrets at-rest verschlüsselt; jede Änderung + Login landet im
+  `audit_log`; persönliche Plugin-Tools bleiben **owner-only** (Dritte sehen sie nie).
+
+### Mitgelieferte Plugins (Phase 1)
+🚆 **RMV** · 🏠 **Home Assistant** · 🏫 **EduPage** · ✅ **Google Tasks** — weitere
+Kategorien (Kalender/CalDAV, Deutsche Bahn, Wetter, Medien, Proxmox …) folgen nach
+demselben Muster.
+
+### Neues Plugin hinzufügen (für Entwickler)
+Eine Datei in `cortex/app/plugins/builtin/` mit einer `Plugin`-Subklasse: `slug`,
+`name`, `category`, `config_fields` (treibt Formular + Validierung) und die Hooks, die
+du brauchst (`tools()`, `briefing_section()`, `background_tasks()`, `health_check()`).
+Discovery, Web-Formular, Verschlüsselung und Tool-Registrierung passieren automatisch.
+Vorbild: [`builtin/rmv.py`](cortex/app/plugins/builtin/rmv.py).
+
+> `.env`-Variablen (HOME_ASSISTANT_*, RMV_* …) wirken weiter als **Fallback**; gesetzte
+> Web-Werte haben Vorrang (Precedence: DB > .env > Default).
+
 ## 🔌 API-Endpoints (cortex)
 
 | Methode | Pfad | Zweck |
 |---------|------|-------|
 | GET  | `/health` | Docker-Healthcheck |
+| GET  | `/admin` | Plugin-Katalog + Konfiguration (Login) |
 | GET  | `/dashboard` | Status-GUI (HTML) |
 | POST | `/ingress/waha` | WhatsApp-Eingang (WAHA) |
 | POST | `/ingress/signal` | Signal-Eingang |
@@ -150,7 +191,7 @@ Status-GUI (read-only) unter **`http://127.0.0.1:8088/dashboard`** — aktive Th
 | POST | `/briefing/run` | Briefing jetzt senden |
 | GET  | `/briefing/preview` | Briefing-Text rendern (nicht senden) |
 
-Alle `/ingress/*` und `/briefing/*` verlangen den Header `X-Astra-Secret: <CORTEX_SHARED_SECRET>`.
+`/ingress/*` und `/briefing/*` verlangen den Header `X-Astra-Secret: <CORTEX_SHARED_SECRET>`; `/admin*` ist passwortgeschützt.
 
 ## ✅ Tests
 

@@ -13,15 +13,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import date, datetime, time, timedelta
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from . import db, knowledge
 from .config import get_settings
 from .channels import get_channels
-from .integrations.edupage import get_edupage
-from .integrations.rmv import get_rmv
 from .models import get_gateway
+from .plugins.registry import get_manager
 
 log = logging.getLogger("astra.briefing")
 
@@ -55,36 +54,6 @@ async def _overnight_section() -> str:
     return "\n".join(lines)
 
 
-async def _timetable_section() -> str:
-    ep = get_edupage()
-    if not ep.enabled:
-        return ""
-    lessons = await ep.timetable(date.today())
-    if not lessons:
-        return "🏫 Heute kein Stundenplan (frei?)."
-    head = lessons[0]
-    tail = lessons[-1]
-    body = ", ".join(f"{l.subject}" for l in lessons[:8])
-    return f"🏫 *Schule:* {head.start}–{tail.end} · {body}"
-
-
-async def _transit_section() -> str:
-    rmv = get_rmv()
-    if not rmv.enabled or not get_settings().rmv_home_stop_id:
-        return ""
-    deps = await rmv.departures(max_results=4)
-    if not deps:
-        return ""
-    parts = []
-    for d in deps[:4]:
-        if d["cancelled"]:
-            parts.append(f"⚠️ {d['time']} {d['line']} FÄLLT AUS")
-        else:
-            rt = f"→{d['rtTime']}" if d["rtTime"] and d["rtTime"] != d["time"] else ""
-            parts.append(f"{d['time']}{rt} {d['line']}")
-    return "🚆 *Abfahrten:* " + " · ".join(parts)
-
-
 async def _intro(sections: list[str]) -> str:
     gw = get_gateway()
     if not gw.enabled:
@@ -108,14 +77,14 @@ async def _intro(sections: list[str]) -> str:
 async def compose() -> str:
     """Build the full briefing text (Telegram Markdown)."""
     sections: list[str] = []
-    for coro in (_overnight_section(), _timetable_section(), _transit_section()):
-        try:
-            s = await coro
-        except Exception as e:  # noqa: BLE001
-            log.warning("briefing section failed: %s", e)
-            s = ""
-        if s:
-            sections.append(s)
+    try:
+        overnight = await _overnight_section()
+        if overnight:
+            sections.append(overnight)
+    except Exception as e:  # noqa: BLE001
+        log.warning("overnight section failed: %s", e)
+    # Plugin-contributed sections (timetable, transit, …)
+    sections.extend(await get_manager().briefing_sections())
     intro = await _intro(sections)
     today = datetime.now(_tz()).strftime("%A, %d.%m.%Y")
     return f"{intro}\n\n_{today}_\n\n" + "\n\n".join(sections)

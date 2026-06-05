@@ -43,6 +43,18 @@ async def _migrate() -> None:
         )
         """
     )
+    await _pool.execute(
+        """
+        CREATE TABLE IF NOT EXISTS plugin_config (
+            plugin_slug TEXT NOT NULL,
+            key         TEXT NOT NULL,
+            value       JSONB,                       -- encrypted string when is_secret
+            is_secret   BOOLEAN NOT NULL DEFAULT FALSE,
+            updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (plugin_slug, key)
+        )
+        """
+    )
 
 
 async def close_pool() -> None:
@@ -265,6 +277,40 @@ async def set_setting(key: str, value) -> None:
         ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()
         """,
         key, {"v": value},
+    )
+
+
+# ─── Plugin config (per-plugin key/value, secrets stored as ciphertext) ───────
+async def plugin_config_all(slug: str) -> dict[str, dict]:
+    """All stored config for one plugin → {key: {"value": ..., "is_secret": bool}}."""
+    rows = await pool().fetch(
+        "SELECT key, value, is_secret FROM plugin_config WHERE plugin_slug=$1", slug
+    )
+    out: dict[str, dict] = {}
+    for r in rows:
+        v = r["value"]
+        out[r["key"]] = {
+            "value": v.get("v") if isinstance(v, dict) else v,
+            "is_secret": r["is_secret"],
+        }
+    return out
+
+
+async def plugin_config_set(slug: str, key: str, value, is_secret: bool = False) -> None:
+    await pool().execute(
+        """
+        INSERT INTO plugin_config (plugin_slug, key, value, is_secret, updated_at)
+        VALUES ($1,$2,$3,$4, now())
+        ON CONFLICT (plugin_slug, key)
+        DO UPDATE SET value=EXCLUDED.value, is_secret=EXCLUDED.is_secret, updated_at=now()
+        """,
+        slug, key, {"v": value}, is_secret,
+    )
+
+
+async def plugin_config_delete(slug: str, key: str) -> None:
+    await pool().execute(
+        "DELETE FROM plugin_config WHERE plugin_slug=$1 AND key=$2", slug, key
     )
 
 

@@ -21,6 +21,17 @@
 		reverse_proxy cortex:8000
 	}
 
+	# ── Web admin (Plugin-Katalog + Konfiguration) ──────────────────────────
+	# STANDARD: NICHT öffentlich. Zugriff per SSH-Tunnel:
+	#   ssh -L 8088:127.0.0.1:8088 root@<server>  →  http://localhost:8088/admin
+	# Nur bewusst öffentlich machen (starkes Passwort + TLS!) — dann auskommentieren:
+	# handle /admin* {
+	# 	reverse_proxy cortex:8000
+	# }
+	# handle /dashboard {
+	# 	reverse_proxy cortex:8000
+	# }
+
 	# Everything else is closed.
 	handle {
 		respond "ASTRA" 404
