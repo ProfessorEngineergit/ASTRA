@@ -1,12 +1,20 @@
-# ASTRA reverse proxy. Only the cortex webhook surface is exposed publicly;
+# ASTRA reverse proxy. Webhook surface + admin catalog exposed locally;
 # n8n / WAHA / Langfuse stay on 127.0.0.1 binds (see docker-compose.yml).
 # With ASTRA_DOMAIN=localhost, Caddy uses its internal CA automatically.
 
 {
 	email {$ACME_EMAIL}
+	# auto_https off  # ← uncomment if you get HTTPS downgrade warnings
 }
 
 {$ASTRA_DOMAIN} {
+	# Force HTTPS (except localhost dev mode)
+	@insecure {
+		protocol http
+		not host localhost 127.0.0.1
+	}
+	redir @insecure https://{host}{uri}
+
 	# Telegram webhook (only used when ASTRA_TELEGRAM_MODE=webhook)
 	handle /telegram/* {
 		reverse_proxy cortex:8000
@@ -22,15 +30,17 @@
 	}
 
 	# ── Web admin (Plugin-Katalog + Konfiguration) ──────────────────────────
-	# STANDARD: NICHT öffentlich. Zugriff per SSH-Tunnel:
-	#   ssh -L 8088:127.0.0.1:8088 root@<server>  →  http://localhost:8088/admin
-	# Nur bewusst öffentlich machen (starkes Passwort + TLS!) — dann auskommentieren:
-	# handle /admin* {
-	# 	reverse_proxy cortex:8000
-	# }
-	# handle /dashboard {
-	# 	reverse_proxy cortex:8000
-	# }
+	# Exposed to local network only (auth via bcrypt + session cookie + rate-limit).
+	# TLS: Caddy auto-generates self-signed cert for localhost/IP.
+	handle /admin* {
+		reverse_proxy cortex:8000
+	}
+	handle /dashboard {
+		reverse_proxy cortex:8000
+	}
+	handle /favorite* {
+		reverse_proxy cortex:8000
+	}
 
 	# Everything else is closed.
 	handle {
