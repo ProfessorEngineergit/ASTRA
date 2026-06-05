@@ -23,19 +23,31 @@ class GoogleTasksPlugin(Plugin):
     category = PluginCategory.PRODUCTIVITY
     icon = "✅"
     config_fields = [
+        ConfigField("n8n_url", "n8n URL", required=True, default="http://n8n:5678",
+                    env_fallback="N8N_BASE_URL",
+                    help="Basis-URL deines n8n (Standard: http://n8n:5678 im Docker-Netz)"),
+        ConfigField("shared_secret", "ASTRA Shared Secret", required=True, secret=True,
+                    env_fallback="CORTEX_SHARED_SECRET",
+                    help="CORTEX_SHARED_SECRET aus der .env — authentifiziert cortex → n8n"),
         ConfigField("list", "Task-Liste", default="@default",
-                    help="@default oder eine Listen-ID", env_fallback="google_tasks_list"),
+                    help="@default oder eine Listen-ID aus Google Tasks",
+                    env_fallback="google_tasks_list"),
     ]
 
+    def _n8n_url(self) -> str:
+        return (self.get("n8n_url") or get_settings().n8n_base_url).rstrip("/")
+
+    def _secret(self) -> str:
+        return self.get("shared_secret") or get_settings().cortex_shared_secret
+
     async def add(self, title: str, notes: str = "", due: str | None = None) -> bool:
-        s = get_settings()
-        if s.astra_dry_run:
+        if get_settings().astra_dry_run:
             log.info("[DRY_RUN] Google Task: %s", title)
             return True
         async with httpx.AsyncClient(timeout=20) as c:
             r = await c.post(
-                f"{s.n8n_base_url}/webhook/tool/google_tasks_add",
-                headers={"X-Astra-Secret": s.cortex_shared_secret},
+                f"{self._n8n_url()}/webhook/tool/google_tasks_add",
+                headers={"X-Astra-Secret": self._secret()},
                 json={"list": self.get("list", "@default"), "title": title,
                       "notes": notes, "due": due},
             )
@@ -45,7 +57,12 @@ class GoogleTasksPlugin(Plugin):
     async def health_check(self) -> HealthStatus:
         if not self.is_toggled_on:
             return HealthStatus.disabled()
-        return HealthStatus.ok("Aktiv — Versand läuft über n8n (Workflow muss importiert sein).")
+        try:
+            async with httpx.AsyncClient(timeout=5) as c:
+                r = await c.get(self._n8n_url(), timeout=5)
+            return HealthStatus.ok(f"n8n erreichbar ({r.status_code}). Workflow muss importiert sein.")
+        except Exception as e:
+            return HealthStatus.error(f"n8n nicht erreichbar: {e}")
 
     def tools(self) -> list[Tool]:
         async def _add(args: dict, ctx: ToolContext) -> str:

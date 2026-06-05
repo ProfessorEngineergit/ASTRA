@@ -139,18 +139,25 @@ async def catalog(request: Request, _: bool = Depends(auth.require_admin)):
         badge = ('<span class="badge b-ok">aktiv</span>' if p.enabled
                  else '<span class="badge b-off">aus</span>' if configured
                  else '<span class="badge b-off">nicht konfiguriert</span>')
+        cat_label = esc(CATEGORY_LABELS.get(p.category, p.category.value))
         is_fav = p.slug in favs
         cards.append(f"""
         <div class="card" data-name="{esc((p.name + ' ' + p.description).lower())}"
              data-cat="{p.category.value}" data-fav="{'1' if is_fav else '0'}">
-          <div class="top"><span class="icon">{esc(p.icon)}</span>
-            <h3>{esc(p.name)}</h3>
+          <div class="top">
+            <span class="icon">{esc(p.icon)}</span>
+            <div class="meta">
+              <h3>{esc(p.name)}</h3>
+              <div class="cat">{cat_label}</div>
+            </div>
             <button class="star {'on' if is_fav else ''}" data-slug="{esc(p.slug)}"
-                    title="Favorit">★</button></div>
+                    title="Favorit">★</button>
+          </div>
           <p>{esc(p.description)}</p>
           <div class="row">{badge}
-            <a class="btn secondary" style="margin-left:auto;padding:6px 12px"
-               href="/admin/plugin/{esc(p.slug)}">Konfigurieren</a></div>
+            <a class="btn secondary sm" style="margin-left:auto"
+               href="/admin/plugin/{esc(p.slug)}">Einrichten →</a>
+          </div>
         </div>""")
 
     body = f"""
