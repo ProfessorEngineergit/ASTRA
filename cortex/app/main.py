@@ -28,9 +28,12 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
+from pathlib import Path
+
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
 from . import brain, briefing, db, knowledge
 from .channels import get_channels
@@ -257,6 +260,11 @@ async def lifespan(app: FastAPI):
 # ─── FastAPI app ───────────────────────────────────────────────────────────────
 
 app = FastAPI(title="ASTRA cortex", version="2.0.0", lifespan=lifespan)
+
+_STATIC_DIR = Path(__file__).parent / "web" / "static"
+if _STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
 app.include_router(web_admin.router)
 
 

@@ -11,7 +11,7 @@ from ..config_store import SECRET_SENTINEL, get_config_store
 from ..plugins.base import CATEGORY_LABELS, FieldType
 from ..plugins.registry import get_manager
 from . import auth
-from .templates import astra_mark, esc, page
+from .templates import LOGO_LONG, esc, icon_html, page
 
 log = logging.getLogger("astra.web.admin")
 router = APIRouter()
@@ -47,7 +47,7 @@ async def setup_form(request: Request):
         return RedirectResponse("/admin/login", status_code=303)
     token = await auth.issue_csrf()
     body = f"""<div class="center">
-      <div class="auth-logo">{astra_mark(52)}<span class="word">ASTRA</span></div>
+      <div class="auth-logo"><img src="{LOGO_LONG}" alt="ASTRA"></div>
       <div class="panel">
         <h2>Willkommen 👋</h2>
         <p class="note" style="text-align:center;margin:-6px 0 20px">Lege ein Admin-Passwort für
@@ -89,7 +89,7 @@ async def login_form(request: Request, error: str = ""):
     token = await auth.issue_csrf()
     err = f'<div class="flash err">{esc(error)}</div>' if error else ""
     body = f"""<div class="center">
-      <div class="auth-logo">{astra_mark(52)}<span class="word">ASTRA</span></div>
+      <div class="auth-logo"><img src="{LOGO_LONG}" alt="ASTRA"></div>
       <div class="panel">
         <h2>Anmeldung</h2>{err}
         <form method="post" action="/admin/login">
@@ -154,7 +154,7 @@ def _card_html(p, is_fav: bool) -> str:
              data-name="{esc((p.name + ' ' + p.description).lower())}"
              data-cat="{p.category.value}" data-fav="{'1' if is_fav else '0'}">
           <div class="top">
-            <span class="icon">{esc(p.icon)}</span>
+            {icon_html(p.slug, p.icon)}
             <div class="meta">
               <h3>{esc(p.name)}</h3>
               <div class="cat">{cat_label}</div>
@@ -398,3 +398,118 @@ async def toggle_favorite(slug: str, request: Request, _: bool = Depends(auth.re
         is_fav = True
     await db.set_setting("favorites", favs)
     return JSONResponse({"favorite": is_fav})
+
+
+# ─── Settings (general + location) ────────────────────────────────────────────
+async def _app_settings() -> dict:
+    return await db.get_setting("app_settings", {}) or {}
+
+
+@router.get("/admin/settings", response_class=HTMLResponse)
+async def settings_form(request: Request, _: bool = Depends(auth.require_admin), saved: str = ""):
+    s = await _app_settings()
+    loc = s.get("location", {}) or {}
+    token = await auth.issue_csrf()
+    flash = '<div class="flash ok">Gespeichert.</div>' if saved else ""
+    lat = loc.get("lat", 50.1109)
+    lon = loc.get("lon", 8.6821)
+    city = loc.get("city", "")
+    tz_opts = "".join(
+        f'<option {"selected" if s.get("timezone", "Europe/Berlin") == t else ""}>{t}</option>'
+        for t in ["Europe/Berlin", "Europe/Vienna", "Europe/Zurich", "Europe/London", "UTC"])
+    units = s.get("units", "metric")
+    lang = s.get("language", "de")
+    body = f"""
+    <div class="hero"><h1>Einstellungen</h1>
+      <p>Allgemeine Angaben & dein Standort — den nutzen Plugins für Wetter, nächste Haltestelle
+         und „in der Nähe".</p></div>
+    {flash}
+    <form method="post" action="/admin/settings" id="settings-form">
+      <input type="hidden" name="csrf" value="{esc(token)}">
+      <div class="panel" style="margin-bottom:16px">
+        <div class="field"><label>Name</label>
+          <input type="text" name="owner_name" value="{esc(s.get('owner_name', 'Bahrian'))}"></div>
+        <div class="row" style="gap:16px;align-items:flex-start">
+          <div class="field" style="flex:1"><label>Zeitzone</label>
+            <select name="timezone">{tz_opts}</select></div>
+          <div class="field" style="flex:1"><label>Einheiten</label>
+            <select name="units">
+              <option value="metric" {"selected" if units == "metric" else ""}>Metrisch (°C, km)</option>
+              <option value="imperial" {"selected" if units == "imperial" else ""}>Imperial (°F, mi)</option>
+            </select></div>
+          <div class="field" style="flex:1"><label>Sprache</label>
+            <select name="language">
+              <option value="de" {"selected" if lang == "de" else ""}>Deutsch</option>
+              <option value="en" {"selected" if lang == "en" else ""}>English</option>
+            </select></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2 style="margin:0 0 6px;font-size:15px">📍 Standort</h2>
+        <p class="note" style="margin:0 0 14px">Klick auf die Karte oder zieh den Pin. Die Stadt wird
+           automatisch erkannt.</p>
+        <div class="row" style="gap:12px;margin-bottom:14px">
+          <div class="field" style="flex:2;margin:0"><label>Stadt</label>
+            <input type="text" name="city" id="city" value="{esc(city)}" placeholder="wird erkannt…"></div>
+          <div class="field" style="flex:1;margin:0"><label>Breite</label>
+            <input type="text" name="lat" id="lat" value="{lat}" readonly></div>
+          <div class="field" style="flex:1;margin:0"><label>Länge</label>
+            <input type="text" name="lon" id="lon" value="{lon}" readonly></div>
+        </div>
+        <div id="map" style="height:340px;border-radius:var(--r);overflow:hidden;
+             border:1px solid var(--border)"></div>
+        <hr>
+        <button class="btn" type="submit">Speichern</button>
+      </div>
+    </form>
+
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+      const map = L.map('map').setView([{lat}, {lon}], 11);
+      L.tileLayer('https://{{s}}.basemaps.cartocdn.com/dark_all/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+        attribution: '© OpenStreetMap, © CARTO', maxZoom: 19 }}).addTo(map);
+      const marker = L.marker([{lat}, {lon}], {{ draggable: true }}).addTo(map);
+      async function reverse(la, lo) {{
+        document.getElementById('lat').value = la.toFixed(5);
+        document.getElementById('lon').value = lo.toFixed(5);
+        try {{
+          const r = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${{la}}&lon=${{lo}}&zoom=10&accept-language=de`);
+          const d = await r.json(); const a = d.address || {{}};
+          const c = a.city || a.town || a.village || a.county || d.name || '';
+          if (c) document.getElementById('city').value = c;
+        }} catch (e) {{}}
+      }}
+      map.on('click', e => {{ marker.setLatLng(e.latlng); reverse(e.latlng.lat, e.latlng.lng); }});
+      marker.on('dragend', e => {{ const p = e.target.getLatLng(); reverse(p.lat, p.lng); }});
+      setTimeout(() => map.invalidateSize(), 200);
+    </script>"""
+    return _html_with_csrf(page("Einstellungen", body, active="settings"), token)
+
+
+@router.post("/admin/settings")
+async def settings_save(request: Request, _: bool = Depends(auth.require_admin)):
+    form = await request.form()
+    if not await _check_csrf(request, form):
+        return RedirectResponse("/admin/settings", status_code=303)
+
+    def _f(v, default=0.0):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    s = await _app_settings()
+    s.update({
+        "owner_name": form.get("owner_name", "").strip(),
+        "timezone": form.get("timezone", "Europe/Berlin"),
+        "units": form.get("units", "metric"),
+        "language": form.get("language", "de"),
+        "location": {"lat": _f(form.get("lat"), 50.1109),
+                     "lon": _f(form.get("lon"), 8.6821),
+                     "city": form.get("city", "").strip()},
+    })
+    await db.set_setting("app_settings", s)
+    await db.audit("settings_change", actor="owner", detail={"city": s["location"]["city"]})
+    return RedirectResponse("/admin/settings?saved=1", status_code=303)
