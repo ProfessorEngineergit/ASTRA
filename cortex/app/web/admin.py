@@ -11,7 +11,8 @@ from ..config_store import SECRET_SENTINEL, get_config_store
 from ..plugins.base import CATEGORY_LABELS, FieldType
 from ..plugins.registry import get_manager
 from . import auth
-from .templates import LOGO_LONG, esc, icon_html, page
+from ..plugins import extended_catalog
+from .templates import LOGO_LONG, brand_icon, esc, icon_html, page
 
 log = logging.getLogger("astra.web.admin")
 router = APIRouter()
@@ -131,6 +132,9 @@ async def _favorites() -> list[str]:
     return await db.get_setting("favorites", []) or []
 
 
+GH_NEW_ISSUE = "https://github.com/ProfessorEngineergit/ASTRA/issues/new"
+
+
 def _card_html(p, is_fav: bool) -> str:
     if getattr(p, "coming_soon", False):
         badge = '<span class="badge b-soon">bald</span>'
@@ -152,11 +156,11 @@ def _card_html(p, is_fav: bool) -> str:
     return f"""
         <div class="card {'on' if p.enabled else ''}"
              data-name="{esc((p.name + ' ' + p.description).lower())}"
-             data-cat="{p.category.value}" data-fav="{'1' if is_fav else '0'}">
+             data-cat="{p.category.value}" data-source="nativ" data-fav="{'1' if is_fav else '0'}">
           <div class="top">
             {icon_html(p.slug, p.icon)}
             <div class="meta">
-              <h3>{esc(p.name)}</h3>
+              <h3>{esc(p.name)} <span class="tag-nativ">nativ</span></h3>
               <div class="cat">{cat_label}</div>
             </div>
             <button class="star {'on' if is_fav else ''}" data-slug="{esc(p.slug)}"
@@ -164,6 +168,28 @@ def _card_html(p, is_fav: bool) -> str:
           </div>
           <p>{esc(p.description)}</p>
           <div class="row">{badge}{action}</div>
+        </div>"""
+
+
+def _catalog_card_html(e) -> str:
+    """A non-native catalog entry — tagged 'Katalog', links to a GitHub request."""
+    cat_label = esc(CATEGORY_LABELS.get(e.category, e.category.value))
+    issue = f"{GH_NEW_ISSUE}?title=Integration:+{esc(e.name)}&labels=integration"
+    return f"""
+        <div class="card cat-entry"
+             data-name="{esc((e.name + ' ' + e.description).lower())}"
+             data-cat="{e.category.value}" data-source="katalog" data-fav="0">
+          <div class="top">
+            {brand_icon(e.brand, e.icon)}
+            <div class="meta">
+              <h3>{esc(e.name)} <span class="tag-katalog">Katalog</span></h3>
+              <div class="cat">{cat_label}</div>
+            </div>
+          </div>
+          <p>{esc(e.description)}</p>
+          <div class="row"><span class="badge b-soon">nicht nativ</span>
+            <a class="btn ghost sm" style="margin-left:auto" target="_blank" rel="noopener"
+               href="{issue}">Anfragen ↗</a></div>
         </div>"""
 
 
@@ -176,23 +202,31 @@ async def catalog(request: Request, _: bool = Depends(auth.require_admin)):
     n_ready = sum(1 for p in plugins if p.has_required and not p.enabled
                   and not getattr(p, "coming_soon", False))
 
-    # Category chips (ordered by the canonical CATEGORY_LABELS order).
-    cat_order = [c for c in CATEGORY_LABELS if any(p.category == c for p in plugins)]
+    # Extended catalog: skip entries that overlap an existing native plugin (by name).
+    native_names = {p.name.lower() for p in plugins} | {p.slug for p in plugins}
+    cat_entries = [e for e in extended_catalog.all_entries()
+                   if e.name.lower() not in native_names]
+    n_total = len(plugins) + len(cat_entries)
+
+    cat_order = list(CATEGORY_LABELS)
     chips = '<span class="chip active" data-cat="all">Alle</span>' + "".join(
         f'<span class="chip" data-cat="{c.value}">{esc(CATEGORY_LABELS.get(c, c.value))}</span>'
-        for c in cat_order
+        for c in cat_order if any(p.category == c for p in plugins) or any(e.category == c for e in cat_entries)
     )
 
-    # Cards grouped into category sections.
     sections = []
     for c in cat_order:
         members = [p for p in plugins if p.category == c]
+        entries = [e for e in cat_entries if e.category == c]
+        if not members and not entries:
+            continue
         cards = "".join(_card_html(p, p.slug in favs) for p in members)
+        cards += "".join(_catalog_card_html(e) for e in entries)
         sections.append(f"""
         <div class="section" data-section="{c.value}">
           <div class="section-head">
             <h2>{esc(CATEGORY_LABELS.get(c, c.value))}</h2>
-            <span class="count">{len(members)}</span>
+            <span class="count">{len(members) + len(entries)}</span>
           </div>
           <div class="grid">{cards}</div>
         </div>""")
@@ -204,25 +238,32 @@ async def catalog(request: Request, _: bool = Depends(auth.require_admin)):
     body = f"""
     <div class="hero">
       <h1>Deine <span class="grad">Integrationen</span></h1>
-      <p>Verbinde ASTRA mit deiner Welt — Verkehr, Smart Home, Server, Messenger und mehr.</p>
+      <p>Verbinde ASTRA mit deiner Welt — Verkehr, Smart Home, Server, Messenger und mehr.
+         <span class="note">Über {n_total} Dienste im Katalog.</span></p>
       <div class="stats">
         <div class="stat"><span class="dot" style="background:var(--ok)"></span><b>{n_active}</b> aktiv</div>
-        <div class="stat"><span class="dot" style="background:var(--aurora-1)"></span><b>{n_ready}</b> startklar</div>
-        <div class="stat"><span class="dot" style="background:var(--text-faint)"></span><b>{len(plugins)}</b> insgesamt</div>
+        <div class="stat"><span class="dot" style="background:var(--link)"></span><b>{n_ready}</b> startklar</div>
+        <div class="stat"><span class="dot" style="background:#a78bfa"></span><b>{len(plugins)}</b> nativ</div>
+        <div class="stat"><span class="dot" style="background:var(--text-faint)"></span><b>{len(cat_entries)}</b> im Katalog</div>
       </div>
     </div>
     <div class="toolbar">
       <div class="searchwrap">{search_icon}
-        <input class="search" id="q" type="text" placeholder="Plugins durchsuchen…"></div>
+        <input class="search" id="q" type="text" placeholder="Über {n_total} Integrationen durchsuchen…"></div>
+      <div class="seg" id="seg">
+        <button class="seg-btn active" data-src="all">Alle</button>
+        <button class="seg-btn" data-src="nativ">Nativ</button>
+        <button class="seg-btn" data-src="katalog">Katalog</button>
+      </div>
       <label class="switch"><input type="checkbox" id="favonly" class="toggle"
         style="width:40px;height:23px"> nur Favoriten</label>
     </div>
     <div class="chips" id="chips">{chips}</div>
     <div id="sections">{''.join(sections)}</div>
-    <div class="empty" id="empty" style="display:none">Keine Plugins gefunden.</div>
+    <div class="empty" id="empty" style="display:none">Keine Integrationen gefunden.</div>
     <script>
       const q=document.getElementById('q'), favonly=document.getElementById('favonly');
-      let cat='all';
+      let cat='all', src='all';
       function apply() {{
         const term=q.value.toLowerCase(); let anyVisible=false;
         document.querySelectorAll('.section').forEach(sec=>{{
@@ -231,7 +272,8 @@ async def catalog(request: Request, _: bool = Depends(auth.require_admin)):
             const okQ=c.dataset.name.includes(term);
             const okC=cat==='all'||c.dataset.cat===cat;
             const okF=!favonly.checked||c.dataset.fav==='1';
-            const ok=okQ&&okC&&okF;
+            const okS=src==='all'||c.dataset.source===src;
+            const ok=okQ&&okC&&okF&&okS;
             c.style.display=ok?'':'none'; if(ok) shown++;
           }});
           sec.style.display=shown?'':'none'; if(shown) anyVisible=true;
@@ -242,6 +284,10 @@ async def catalog(request: Request, _: bool = Depends(auth.require_admin)):
       document.querySelectorAll('#chips .chip').forEach(ch=>ch.onclick=()=>{{
         document.querySelectorAll('#chips .chip').forEach(x=>x.classList.remove('active'));
         ch.classList.add('active'); cat=ch.dataset.cat; apply();
+      }});
+      document.querySelectorAll('#seg .seg-btn').forEach(b=>b.onclick=()=>{{
+        document.querySelectorAll('#seg .seg-btn').forEach(x=>x.classList.remove('active'));
+        b.classList.add('active'); src=b.dataset.src; apply();
       }});
       document.querySelectorAll('.star').forEach(s=>s.onclick=async()=>{{
         const r=await fetch('/admin/favorite/'+s.dataset.slug,{{method:'POST'}});

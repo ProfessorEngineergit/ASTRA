@@ -53,14 +53,18 @@ BRAND_ICONS: dict[str, str] = {
 }
 
 
-def icon_html(slug: str, emoji: str) -> str:
-    """Render a plugin icon: monochrome brand logo, else the emoji fallback."""
-    brand = BRAND_ICONS.get(slug)
+def brand_icon(brand: str | None, emoji: str) -> str:
+    """Icon box with a monochrome Simple-Icons brand logo, emoji fallback on error."""
     if brand:
         return (f'<span class="icon" data-emoji="{esc(emoji)}">'
                 f'<img src="https://cdn.simpleicons.org/{brand}/d8dbe3" alt="" loading="lazy" '
                 f'onerror="this.parentNode.textContent=this.parentNode.dataset.emoji"></span>')
     return f'<span class="icon">{esc(emoji)}</span>'
+
+
+def icon_html(slug: str, emoji: str) -> str:
+    """Render a plugin icon by slug: brand logo if mapped, else emoji."""
+    return brand_icon(BRAND_ICONS.get(slug), emoji)
 
 
 # ─── Design tokens + components ────────────────────────────────────────────────
@@ -251,6 +255,23 @@ hr { border: none; border-top: 1px solid var(--hair); margin: 20px 0; }
 .auth-logo { display: flex; justify-content: center; margin-bottom: 26px; }
 .auth-logo img { height: 64px; }
 .center h2 { font-size: 19px; margin: 0 0 16px; text-align: center; font-weight: 650; }
+
+/* segmented control (source filter) */
+.seg { display: inline-flex; background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r-sm); padding: 3px; gap: 2px; }
+.seg-btn { background: none; border: none; color: var(--text-dim); font-size: 13px;
+  font-family: inherit; padding: 6px 13px; border-radius: 6px; cursor: pointer; transition: all .12s; }
+.seg-btn:hover { color: var(--text); }
+.seg-btn.active { background: var(--surface-3); color: var(--text); }
+
+/* source tags on card titles */
+.tag-nativ, .tag-katalog { font-size: 9.5px; font-weight: 600; letter-spacing: .04em;
+  text-transform: uppercase; padding: 2px 6px; border-radius: 5px; vertical-align: middle;
+  margin-left: 4px; }
+.tag-nativ { background: rgba(167,139,250,.16); color: #c4b5fd; }
+.tag-katalog { background: rgba(255,255,255,.06); color: var(--text-faint); }
+.card.cat-entry { opacity: .82; }
+.card.cat-entry:hover { opacity: 1; }
 
 /* empty state */
 .empty { text-align: center; color: var(--text-faint); padding: 54px 20px; font-size: 14px; }

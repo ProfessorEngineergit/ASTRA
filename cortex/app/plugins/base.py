@@ -28,13 +28,24 @@ class PluginCategory(str, Enum):
 
 
 CATEGORY_LABELS: dict[PluginCategory, str] = {
-    PluginCategory.TRANSPORT: "🚆 Transport",
-    PluginCategory.SMART_HOME: "🏠 Smart Home",
-    PluginCategory.SCHOOL: "🏫 Schule",
-    PluginCategory.PRODUCTIVITY: "✅ Produktivität",
-    PluginCategory.MEDIA: "🎧 Medien",
-    PluginCategory.INFRA_AI: "🧩 Infra & KI",
-    PluginCategory.COMMS: "💬 Kommunikation",
+    PluginCategory.TRANSPORT: "Transport",
+    PluginCategory.SMART_HOME: "Smart Home",
+    PluginCategory.SCHOOL: "Schule",
+    PluginCategory.PRODUCTIVITY: "Produktivität",
+    PluginCategory.MEDIA: "Medien",
+    PluginCategory.INFRA_AI: "Infra & KI",
+    PluginCategory.COMMS: "Kommunikation",
+}
+
+# Fallback card icon per category (cards may still use emojis; filter chips don't).
+CATEGORY_EMOJI: dict[PluginCategory, str] = {
+    PluginCategory.TRANSPORT: "🚆",
+    PluginCategory.SMART_HOME: "🏠",
+    PluginCategory.SCHOOL: "🎓",
+    PluginCategory.PRODUCTIVITY: "✅",
+    PluginCategory.MEDIA: "🎬",
+    PluginCategory.INFRA_AI: "🧩",
+    PluginCategory.COMMS: "💬",
 }
 
 
