@@ -48,6 +48,8 @@ BRAND_ICONS: dict[str, str] = {
     "philips_hue": "philipshue", "homekit": "apple", "mqtt": "mqtt",
     "zigbee2mqtt": "zigbee2mqtt", "vaultwarden": "vaultwarden", "rss": "rss",
     "uptime_kuma": "uptimekuma", "linear": "linear", "crypto": "bitcoin",
+    "jira": "jira", "tailscale": "tailscale", "cloudflare": "cloudflare",
+    "truenas": "truenas", "vikunja": "vikunja", "audiobookshelf": "audiobookshelf",
 }
 
 
