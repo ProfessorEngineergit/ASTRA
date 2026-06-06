@@ -1,21 +1,43 @@
 <div align="center">
-  <h1>🌌 ASTRA</h1>
-  <p><strong>Dein persönlicher, serverseitiger KI-Agent für alles.</strong></p>
+  <img src="ASTRA-long.png" alt="ASTRA" width="520">
+  <p><em>Ein persönlicher KI-Agent, der auf deinem eigenen Server lebt.</em></p>
 </div>
 
 ---
 
-**ASTRA** ist ein persönlicher KI-Agent, der auf einem Server läuft und als intelligentes Bindeglied zwischen deinen Messengern, APIs und automatisierten Workflows fungiert. ASTRA ist dein "Gehirn" in der Cloud, das Nachrichten orchestriert, Kontexte versteht, Zustände verwaltet und dir Arbeit abnimmt.
+Stell dir einen Assistenten vor, der wirklich *dir* gehört. Er läuft zu Hause auf deinem
+Server, liest deine Nachrichten über WhatsApp, Signal und Telegram, kennt deinen
+Stundenplan und deine nächste Bahn, schaltet das Licht, merkt sich, was dir wichtig ist –
+und fragt nach, bevor er etwas Wichtiges in deinem Namen tut. Keine fremde Cloud, keine
+Datensammler. Dein Gehirn, dein Server, deine Regeln.
 
-> ⚠️ **Status:** Starkes Work in Progress (WIP)
+Das ist **ASTRA**.
 
-## ✨ Konzept & Features
+> 🛠️ **Status:** Aktiv in Entwicklung – schon nutzbar, wächst täglich.
 
-- **Omnichannel:** Bündelt deine Kommunikation (WhatsApp, Signal, Telegram) an einem zentralen Ort.
-- **Human-in-the-Loop:** ASTRA fragt über einen privaten Telegram-Kanal nach Erlaubnis für kritische Aktionen.
-- **Deferral Timer:** Wartet eine definierte Zeit (`ASTRA_DEFER_SECONDS`), ob du selbst antworten möchtest, bevor die KI übernimmt.
-- **Shadow Mode:** Im `ASTRA_DRY_RUN`-Modus analysiert ASTRA alles im Hintergrund und loggt Aktionen, ohne sie nach außen zu senden.
-- **Volle Kontrolle:** Deine Daten, dein Server. Die Logik liegt zentral in deinem eigenen Cortex.
+<div align="center">
+  <img src="docs/screenshots/catalog.png" alt="Integrations-Katalog" width="800"><br>
+  <sub>Über 65 Integrationen – konfigurierbar in einer Weboberfläche, ganz ohne Neustart.</sub>
+</div>
+
+## ✨ Was ASTRA besonders macht
+
+- **Eine Oberfläche für alles:** Ein OLED-schwarzes Web-Dashboard, in dem du Plugins
+  durchsuchst, verbindest und ein-/ausschaltest – im Stil der Home-Assistant-Integrationen.
+- **Über 65 Integrationen:** Verkehr, Smart Home, Messenger, Medien, Server & KI –
+  von RMV und Deutsche Bahn über Home Assistant, Spotify und Proxmox bis zu lokalem Ollama.
+- **Fragt, bevor es handelt:** Für heikle Aktionen meldet sich ASTRA per Telegram und
+  wartet auf dein ✅ – Mensch bleibt in der Schleife.
+- **Vergisst dich nicht:** Persona, Fakten und Routinen liegen als editierbare Dateien
+  in einem Volume und überleben jedes Update.
+- **Dein Standort, dein Kontext:** Setz einen Pin auf der Karte – Plugins wie Wetter
+  und Nahverkehr wissen dann, wo „in der Nähe" ist.
+- **Komplett selbst gehostet:** Deine Daten verlassen deinen Server nicht.
+
+<div align="center">
+  <img src="docs/screenshots/settings.png" alt="Einstellungen mit Standort-Karte" width="800"><br>
+  <sub>Standort per Karte setzen – wie in Home Assistant.</sub>
+</div>
 
 ## 🧩 Architektur
 
@@ -145,6 +167,11 @@ Suchen, Filtern nach Kategorie, Favoriten (★), Ein/Aus-Schalter, Config-Formul
 „Verbindung testen" — **wie die Home-Assistant-Integrationssuche**. Konfiguration läuft
 **live, ohne Container-Neustart**.
 
+<div align="center">
+  <img src="docs/screenshots/login.png" alt="ASTRA Login" width="620"><br>
+  <sub>Beim ersten Öffnen legst du ein Admin-Passwort fest – danach Login per Session-Cookie.</sub>
+</div>
+
 ```
 http://<server-ip>:8088/admin     # z. B. http://192.168.178.189:8088/admin
 ```
@@ -242,7 +269,8 @@ Prüfen, dass die Datei wirklich im Image liegt: `docker compose run --rm cortex
 
 - **Signal-Eingang:** `signal-cli-rest-api` im `json-rpc`-Mode pusht keine Webhooks. Optionen: (a) ein n8n-Schedule-Workflow, der `GET {SIGNAL_BASE_URL}/v1/receive/{NUMBER}` pollt und jede Nachricht an `/ingress/signal` weiterreicht, oder (b) den nativen Empfangs-Websocket nutzen. Ausgang funktioniert bereits.
 - **Kalender-Schreibzugriff:** der Briefing-/Konflikt-Flow (Klavier↔Astroclub) liest bereits Stundenplan & ÖPNV; ein `calendar_add`/CalDAV- oder Google-Calendar-n8n-Workflow als nächstes Tool ergänzt das aktive Umbuchen.
-- **Proxmox-Agent & RMV-Trip-Routing:** als weitere owner-only Tools nach demselben Muster (`integrations/` + Registry-Eintrag).
+- **Verbleibende Katalog-Platzhalter:** CalDAV, HVV, IServ, MQTT, Vaultwarden und Zigbee2MQTT sind im Katalog gelistet, aber noch nicht implementiert (brauchen Libs/Auth, die noch fehlen) — als „bald" markiert.
+- **Proxmox-Agent & RMV-Trip-Routing:** als weitere owner-only Tools nach demselben Muster (`plugins/builtin/` — eine Datei pro Plugin).
 
 ---
 
