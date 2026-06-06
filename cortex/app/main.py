@@ -222,6 +222,16 @@ async def lifespan(app: FastAPI):
     # Load plugins → register their tools + start their background tasks.
     await get_manager().rebuild()
 
+    # Apply web-configured preferences (chat model override + UI font) live.
+    try:
+        appset = await db.get_setting("app_settings", {}) or {}
+        from .models import set_model_override
+        from .web.templates import set_font
+        set_model_override(appset.get("ai_model"))
+        set_font(appset.get("font"))
+    except Exception:  # noqa: BLE001
+        log.warning("Could not apply saved app_settings.", exc_info=True)
+
     tasks: list[asyncio.Task] = []
 
     sweeper_task = asyncio.create_task(_deferral_sweeper(), name="deferral_sweeper")

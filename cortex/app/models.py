@@ -17,6 +17,19 @@ from .config import get_settings
 
 log = logging.getLogger("astra.models")
 
+# Runtime model override set from the web settings (DB) — wins over the .env default.
+_MODEL_OVERRIDE: str | None = None
+
+
+def set_model_override(model: str | None) -> None:
+    """Pick the chat model live from the admin UI (None → fall back to .env)."""
+    global _MODEL_OVERRIDE
+    _MODEL_OVERRIDE = (model or "").strip() or None
+
+
+def get_model_override() -> str | None:
+    return _MODEL_OVERRIDE
+
 
 class TriageResult(BaseModel):
     mode: str          # auto | defer | ask
@@ -53,7 +66,7 @@ class ModelGateway:
     ) -> Any:
         client = self._require()
         kwargs: dict[str, Any] = {
-            "model": model or self._s.openai_model,
+            "model": model or _MODEL_OVERRIDE or self._s.openai_model,
             "messages": messages,
             "temperature": temperature,
         }

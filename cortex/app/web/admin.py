@@ -6,13 +6,24 @@ import logging
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from .. import db
+from .. import db, sysinfo
+from ..config import get_settings
 from ..config_store import SECRET_SENTINEL, get_config_store
 from ..plugins.base import CATEGORY_LABELS, FieldType
 from ..plugins.registry import get_manager
 from . import auth
+from ..models import set_model_override
 from ..plugins import extended_catalog
-from .templates import LOGO_LONG, brand_icon, esc, icon_html, page
+from .templates import (
+    LOGO_LONG, brand_icon, esc, font_choices, icon_html, page, set_font,
+)
+
+GH_REPO = "https://github.com/ProfessorEngineergit/ASTRA"
+_GH_SVG = ('<svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor">'
+           '<path d="M12 .5A12 12 0 0 0 8.2 23.9c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.5-1.4-1.3-1.8-1.3-1.8'
+           '-1.1-.7.1-.7.1-.7 1.2 0 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.4-1.3-5.4-5.9'
+           '0-1.3.5-2.4 1.2-3.2 0-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17 4.7 18 5 18 5c.6 1.6.1 2.8.1 3.1'
+           '.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.5 5.9.5.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .5Z"/></svg>')
 
 log = logging.getLogger("astra.web.admin")
 router = APIRouter()
@@ -465,10 +476,17 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
         for t in ["Europe/Berlin", "Europe/Vienna", "Europe/Zurich", "Europe/London", "UTC"])
     units = s.get("units", "metric")
     lang = s.get("language", "de")
+    model = esc(s.get("ai_model", ""))
+    eco = "checked" if s.get("economy_mode") else ""
+    cur_font = s.get("font", "inter")
+    addr = esc(loc.get("address", ""))
+    font_opts = "".join(
+        f'<option value="{esc(k)}" {"selected" if k == cur_font else ""}>{esc(name)}</option>'
+        for k, name in font_choices())
     body = f"""
     <div class="hero"><h1>Einstellungen</h1>
-      <p>Allgemeine Angaben & dein Standort — den nutzen Plugins für Wetter, nächste Haltestelle
-         und „in der Nähe".</p></div>
+      <p>Allgemeine Angaben, KI-Modell & dein Standort — den nutzen Plugins für Wetter,
+         nächste Haltestelle und „in der Nähe".</p></div>
     {flash}
     <form method="post" action="/admin/settings" id="settings-form">
       <input type="hidden" name="csrf" value="{esc(token)}">
@@ -491,10 +509,29 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
         </div>
       </div>
 
-      <div class="panel">
+      <div class="panel" style="margin-bottom:16px">
+        <h2 style="margin:0 0 12px;font-size:15px">KI-Modell</h2>
+        <div class="field"><label>Chat-Modell</label>
+          <input type="text" name="ai_model" value="{model}" placeholder="z. B. gpt-4o, gpt-4o-mini, o3-mini">
+          <div class="help">Überschreibt die .env-Vorgabe live. Kleinere Modelle sparen Geld.
+            Links: <a href="https://platform.openai.com/docs/models" target="_blank" rel="noopener">OpenAI-Modelle ↗</a> ·
+            <a href="https://platform.openai.com/usage" target="_blank" rel="noopener">Nutzung &amp; Kosten ↗</a></div></div>
+        <div class="toggle-row"><input class="toggle" type="checkbox" name="economy" {eco}>
+          <div><div style="font-weight:600;font-size:14px">Sparmodus</div>
+            <div class="note" style="font-size:12px">Reduziert proaktive API-Aufrufe (Briefing-Quellen,
+              Health-Checks) — weniger Requests, weniger Kosten.</div></div></div>
+      </div>
+
+      <div class="panel" style="margin-bottom:16px">
         <h2 style="margin:0 0 6px;font-size:15px">📍 Standort</h2>
-        <p class="note" style="margin:0 0 14px">Klick auf die Karte oder zieh den Pin. Die Stadt wird
-           automatisch erkannt.</p>
+        <p class="note" style="margin:0 0 12px">Adresse suchen, Pin ziehen oder Browser-Standort nutzen —
+           die Stadt wird automatisch erkannt.</p>
+        <div class="row" style="gap:10px;margin-bottom:12px">
+          <input type="text" id="addr" value="{addr}" placeholder="Adresse suchen (Straße, Ort)…" style="flex:1">
+          <button class="btn secondary" type="button" id="addrbtn">Suchen</button>
+          <button class="btn secondary" type="button" id="geobtn">Mein Standort</button>
+        </div>
+        <input type="hidden" name="address" id="address" value="{addr}">
         <div class="row" style="gap:12px;margin-bottom:14px">
           <div class="field" style="flex:2;margin:0"><label>Stadt</label>
             <input type="text" name="city" id="city" value="{esc(city)}" placeholder="wird erkannt…"></div>
@@ -505,9 +542,25 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
         </div>
         <div id="map" style="height:340px;border-radius:var(--r);overflow:hidden;
              border:1px solid var(--border)"></div>
-        <hr>
-        <button class="btn" type="submit">Speichern</button>
       </div>
+
+      <div class="panel" style="margin-bottom:16px">
+        <h2 style="margin:0 0 6px;font-size:15px">Labs</h2>
+        <p class="note" style="margin:0 0 12px">Experimentell. Eigene Schriften einfach in
+           <code>cortex/app/web/static/fonts/</code> ablegen — sie erscheinen hier automatisch.</p>
+        <div class="field" style="margin:0"><label>Schriftart der Oberfläche</label>
+          <select name="font">{font_opts}</select></div>
+      </div>
+
+      <div class="panel" style="margin-bottom:16px">
+        <div class="lab-card">{_GH_SVG}
+          <div style="flex:1"><div style="font-weight:600;font-size:14px">Auf GitHub mitwirken</div>
+            <div class="note" style="font-size:12px">Code, Ideen und Bug-Reports sind willkommen.</div></div>
+          <a class="btn secondary sm" target="_blank" rel="noopener" href="{GH_REPO}">Repository ↗</a>
+        </div>
+      </div>
+
+      <button class="btn" type="submit">Alles speichern</button>
     </form>
 
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
@@ -521,14 +574,28 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
         document.getElementById('lat').value = la.toFixed(5);
         document.getElementById('lon').value = lo.toFixed(5);
         try {{
-          const r = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${{la}}&lon=${{lo}}&zoom=10&accept-language=de`);
+          const r = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${{la}}&lon=${{lo}}&zoom=14&accept-language=de`);
           const d = await r.json(); const a = d.address || {{}};
           const c = a.city || a.town || a.village || a.county || d.name || '';
           if (c) document.getElementById('city').value = c;
+          if (d.display_name) document.getElementById('address').value = d.display_name;
         }} catch (e) {{}}
       }}
+      function place(la, lo) {{ map.setView([la, lo], 14); marker.setLatLng([la, lo]); reverse(la, lo); }}
       map.on('click', e => {{ marker.setLatLng(e.latlng); reverse(e.latlng.lat, e.latlng.lng); }});
       marker.on('dragend', e => {{ const p = e.target.getLatLng(); reverse(p.lat, p.lng); }});
+      document.getElementById('addrbtn').onclick = async () => {{
+        const q = document.getElementById('addr').value.trim(); if (!q) return;
+        document.getElementById('address').value = q;
+        const r = await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&accept-language=de&q=${{encodeURIComponent(q)}}`);
+        const d = await r.json(); if (d[0]) place(parseFloat(d[0].lat), parseFloat(d[0].lon));
+      }};
+      document.getElementById('geobtn').onclick = () => {{
+        if (!navigator.geolocation) return alert('Geolocation nicht verfügbar.');
+        navigator.geolocation.getCurrentPosition(
+          p => place(p.coords.latitude, p.coords.longitude),
+          () => alert('Standortzugriff abgelehnt.'), {{ enableHighAccuracy: true, timeout: 8000 }});
+      }};
       setTimeout(() => map.invalidateSize(), 200);
     </script>"""
     return _html_with_csrf(page("Einstellungen", body, active="settings"), token)
@@ -552,10 +619,232 @@ async def settings_save(request: Request, _: bool = Depends(auth.require_admin))
         "timezone": form.get("timezone", "Europe/Berlin"),
         "units": form.get("units", "metric"),
         "language": form.get("language", "de"),
+        "ai_model": form.get("ai_model", "").strip(),
+        "economy_mode": "economy" in form,
+        "font": form.get("font", "inter"),
         "location": {"lat": _f(form.get("lat"), 50.1109),
                      "lon": _f(form.get("lon"), 8.6821),
-                     "city": form.get("city", "").strip()},
+                     "city": form.get("city", "").strip(),
+                     "address": form.get("address", "").strip()},
     })
     await db.set_setting("app_settings", s)
-    await db.audit("settings_change", actor="owner", detail={"city": s["location"]["city"]})
+    set_model_override(s["ai_model"])     # live, no restart
+    set_font(s["font"])
+    await db.audit("settings_change", actor="owner",
+                   detail={"city": s["location"]["city"], "model": s["ai_model"], "font": s["font"]})
     return RedirectResponse("/admin/settings?saved=1", status_code=303)
+
+
+# ─── System: performance + services & URLs ────────────────────────────────────
+def _meter(pct, used_h, total_h) -> str:
+    if pct is None:
+        return f'<div class="sub">{esc(used_h)} / {esc(total_h)}</div>'
+    cls = " warn" if pct > 85 else ""
+    return (f'<div class="sub">{esc(used_h)} / {esc(total_h)} · {pct:.0f}%</div>'
+            f'<div class="meter{cls}"><i style="width:{min(pct,100):.0f}%"></i></div>')
+
+
+@router.get("/admin/system", response_class=HTMLResponse)
+async def system_page(request: Request, _: bool = Depends(auth.require_admin)):
+    snap = sysinfo.snapshot()
+    st = get_settings()
+    host = request.url.hostname or "127.0.0.1"
+    mem, disk, cpu = snap["mem"], snap["disk"], snap["cpu"]
+    load = (f'{cpu["load1"]:.2f} / {cpu["load5"]:.2f} / {cpu["load15"]:.2f}'
+            if cpu["load1"] is not None else "n/a")
+
+    def pc(v):
+        return f"{v:.0f}%" if v is not None else "n/a"
+
+    metrics = f"""
+    <div class="metrics">
+      <div class="metric"><div class="k">Arbeitsspeicher</div>
+        <div class="v">{pc(mem['pct'])}</div>{_meter(mem['pct'], mem['used_h'], mem['total_h'])}
+        <div class="sub" style="margin-top:6px">{esc(mem['scope'] or '')}</div></div>
+      <div class="metric"><div class="k">Speicherplatz</div>
+        <div class="v">{pc(disk['pct'])}</div>{_meter(disk['pct'], disk['used_h'], disk['total_h'])}</div>
+      <div class="metric"><div class="k">CPU-Last ({cpu['count']} Kerne)</div>
+        <div class="v">{pc(cpu['load_pct'])}</div>
+        <div class="sub">load avg: {load}</div></div>
+      <div class="metric"><div class="k">Laufzeit</div>
+        <div class="v" style="font-size:20px">{esc(snap['uptime_h'])}</div>
+        <div class="sub">{snap['procs'] or '?'} Prozesse · Stand {esc(snap['ts'])}</div></div>
+    </div>"""
+
+    recs = "".join(
+        f'<div class="rec {r["level"]}">{"⚠️" if r["level"]=="warn" else "✅"}&nbsp; {esc(r["text"])}</div>'
+        for r in snap["recommendations"])
+
+    services = [
+        ("ASTRA Admin", f"http://{host}:8088/admin", True),
+        ("Status-Dashboard", f"http://{host}:8088/dashboard", True),
+        ("n8n (Workflows)", f"http://{host}:5678", False),
+        ("WAHA (WhatsApp)", f"http://{host}:3000", False),
+        ("Langfuse (Tracing)", f"http://{host}:3001", False),
+        ("Signal-API", f"http://{host}:8080", False),
+    ]
+    svc_rows = "".join(
+        f'<div class="svc"><span class="dot {"up" if internal else ""}"></span>'
+        f'<div style="flex:1"><div class="nm">{esc(nm)}</div><div class="u">{esc(url)}</div></div>'
+        f'<a class="btn ghost sm" target="_blank" rel="noopener" href="{esc(url)}">Öffnen ↗</a></div>'
+        for nm, url, internal in services)
+
+    body = f"""
+    <div class="hero"><h1>System</h1>
+      <p>Container-Leistung, Empfehlungen und alle Dienste auf diesem Server.</p></div>
+    <h2 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-dim);margin:0 0 12px">Leistung</h2>
+    {metrics}
+    <div style="margin:18px 0 26px">{recs}</div>
+    <div class="panel" style="margin-bottom:18px">
+      <h2 style="margin:0 0 4px;font-size:15px">Dienste &amp; URLs</h2>
+      <p class="note" style="margin:0 0 8px">Vom Server vergebene Adressen. Interne Ports nur im LAN erreichbar.</p>
+      {svc_rows}
+    </div>
+    <p class="note">Modell aktiv: <b>{esc(st.openai_model)}</b> (überschreibbar in den Einstellungen) ·
+      <a href="/admin/updates">Updates &amp; Versionen →</a></p>
+    <script>setTimeout(() => location.reload(), 15000);</script>"""
+    return HTMLResponse(page("System", body, active="system"))
+
+
+# ─── Chat: talk to ASTRA from the web (full owner agent) ──────────────────────
+async def _chat_history() -> list[dict]:
+    return await db.get_setting("web_chat", []) or []
+
+
+@router.get("/admin/chat", response_class=HTMLResponse)
+async def chat_page(request: Request, _: bool = Depends(auth.require_admin)):
+    hist = await _chat_history()
+    bubbles = "".join(
+        f'<div class="msg {"user" if m["role"] == "user" else "bot"}">{esc(m["content"])}</div>'
+        for m in hist) or '<div class="msg sys">Sag Hallo zu ASTRA — alles wie in Telegram, nur hier.</div>'
+    body = f"""
+    <div class="chat-wrap">
+      <div class="chat-log" id="log">{bubbles}</div>
+      <div class="chat-input">
+        <textarea id="inp" placeholder="Nachricht oder Aufgabe an ASTRA…" rows="1"></textarea>
+        <button class="btn" id="send">Senden</button>
+        <button class="btn ghost sm" id="clear" title="Verlauf leeren">Leeren</button>
+      </div>
+    </div>
+    <script>
+      const log=document.getElementById('log'), inp=document.getElementById('inp');
+      const scroll=()=>log.scrollTop=log.scrollHeight; scroll();
+      function add(cls,txt){{const d=document.createElement('div');d.className='msg '+cls;d.textContent=txt;log.appendChild(d);scroll();return d;}}
+      inp.addEventListener('input',()=>{{inp.style.height='auto';inp.style.height=Math.min(inp.scrollHeight,160)+'px';}});
+      inp.addEventListener('keydown',e=>{{if(e.key==='Enter'&&!e.shiftKey){{e.preventDefault();go();}}}});
+      document.getElementById('send').onclick=go;
+      async function go(){{
+        const t=inp.value.trim(); if(!t) return; inp.value=''; inp.style.height='auto';
+        add('user',t); const typing=add('typing','ASTRA tippt…');
+        try{{
+          const r=await fetch('/admin/chat/send',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{message:t}})}});
+          const d=await r.json(); typing.remove(); add('bot', d.reply||'(keine Antwort)');
+        }}catch(e){{ typing.remove(); add('bot','Fehler: '+e); }}
+      }}
+      document.getElementById('clear').onclick=async()=>{{
+        await fetch('/admin/chat/clear',{{method:'POST'}}); log.innerHTML='';
+        add('sys','Verlauf geleert.');
+      }};
+    </script>"""
+    return HTMLResponse(page("Chat", body, active="chat"))
+
+
+@router.post("/admin/chat/send")
+async def chat_send(request: Request, _: bool = Depends(auth.require_admin)):
+    from ..agent import generate_reply
+    from ..persona import Register
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001
+        data = {}
+    msg = (data.get("message") or "").strip()
+    if not msg:
+        return JSONResponse({"reply": "(leer)"})
+    st = get_settings()
+    hist = await _chat_history()
+    hist.append({"role": "user", "content": msg})
+    try:
+        reply = await generate_reply(
+            register=Register.OWNER,
+            contact={"id": "owner", "name": st.astra_owner_name, "is_owner": True},
+            thread_id="web-owner", channel="web", history=hist,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.exception("web chat failed")
+        return JSONResponse({"reply": f"Fehler: {e}"})
+    hist.append({"role": "assistant", "content": reply})
+    await db.set_setting("web_chat", hist[-40:])
+    await db.audit("web_chat", actor="owner", detail={"len": len(msg)})
+    return JSONResponse({"reply": reply})
+
+
+@router.post("/admin/chat/clear")
+async def chat_clear(request: Request, _: bool = Depends(auth.require_admin)):
+    await db.set_setting("web_chat", [])
+    return JSONResponse({"ok": True})
+
+
+# ─── Updates: release notes + hyperspace + GitHub links ───────────────────────
+@router.get("/admin/updates", response_class=HTMLResponse)
+async def updates_page(request: Request, _: bool = Depends(auth.require_admin)):
+    import httpx
+    commits_html = '<p class="note">Konnte GitHub gerade nicht erreichen.</p>'
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get("https://api.github.com/repos/ProfessorEngineergit/ASTRA/commits",
+                            params={"per_page": 12}, headers={"Accept": "application/vnd.github+json"})
+        if r.status_code == 200:
+            rows = []
+            for cm in r.json():
+                sha = cm.get("sha", "")[:7]
+                msg = (cm.get("commit", {}).get("message", "") or "").split("\n")[0]
+                url = cm.get("html_url", "#")
+                rows.append(f'<div class="commit"><a class="h" href="{esc(url)}" target="_blank" '
+                            f'rel="noopener">{esc(sha)} ↗</a><div class="m">{esc(msg)}</div></div>')
+            commits_html = "".join(rows)
+    except Exception:  # noqa: BLE001
+        pass
+
+    body = f"""
+    <div id="hyper"><canvas id="hsc"></canvas></div>
+    <div class="hero"><h1>Updates</h1>
+      <p>Neueste Änderungen aus dem Repository. Prüfe auf Updates und sieh dir die Notes an.</p></div>
+    <div class="row" style="margin-bottom:20px">
+      <button class="btn" id="check">Auf Updates prüfen</button>
+      <a class="btn secondary" target="_blank" rel="noopener"
+         href="https://github.com/ProfessorEngineergit/ASTRA/commits/main">Alle Commits ↗</a>
+      <a class="btn ghost" target="_blank" rel="noopener"
+         href="https://github.com/ProfessorEngineergit/ASTRA/releases">Releases ↗</a>
+    </div>
+    <div class="panel" style="margin-bottom:18px">
+      <h2 style="margin:0 0 6px;font-size:15px">So aktualisierst du</h2>
+      <p class="note" style="margin:0 0 8px">Auf dem Server ausführen — Code holen &amp; neu bauen:</p>
+      <pre style="background:var(--bg-2);border:1px solid var(--border);border-radius:var(--r-sm);
+        padding:12px 14px;font-family:'JetBrains Mono',monospace;font-size:13px;overflow-x:auto">cd /opt/astra &amp;&amp; git pull origin main &amp;&amp; docker compose up -d --build cortex</pre>
+    </div>
+    <h2 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-dim);margin:0 0 12px">Was ist neu</h2>
+    <div id="notes">{commits_html}</div>
+    <script>
+      const hyper=document.getElementById('hyper'), cv=document.getElementById('hsc');
+      function hyperspace(ms){{
+        hyper.classList.add('on'); const ctx=cv.getContext('2d');
+        cv.width=innerWidth; cv.height=innerHeight;
+        const cx=cv.width/2, cy=cv.height/2, N=320, stars=[];
+        for(let i=0;i<N;i++) stars.push({{x:(Math.random()-0.5)*cv.width,y:(Math.random()-0.5)*cv.height,z:Math.random()*cv.width}});
+        let t0=performance.now(), raf;
+        (function frame(t){{
+          ctx.fillStyle='rgba(0,0,0,.35)'; ctx.fillRect(0,0,cv.width,cv.height);
+          ctx.strokeStyle='#cfe0ff'; ctx.lineWidth=2;
+          for(const s of stars){{
+            s.z-=18; if(s.z<1){{s.z=cv.width;s.x=(Math.random()-0.5)*cv.width;s.y=(Math.random()-0.5)*cv.height;}}
+            const k=128/s.z, x=cx+s.x*k, y=cy+s.y*k, k2=128/(s.z+18), px=cx+s.x*k2, py=cy+s.y*k2;
+            ctx.beginPath(); ctx.moveTo(px,py); ctx.lineTo(x,y); ctx.stroke();
+          }}
+          if(t-t0<ms) raf=requestAnimationFrame(frame);
+          else {{ cancelAnimationFrame(raf); hyper.classList.remove('on'); }}
+        }})(t0);
+      }}
+      document.getElementById('check').onclick=()=>{{ hyperspace(1800);
+        setTimeout(()=>document.getElementById('notes').scrollIntoView({{behavior:'smooth'}}),1400); }};
+    </script>"""
+    return HTMLResponse(page("Updates", body, active="updates"))

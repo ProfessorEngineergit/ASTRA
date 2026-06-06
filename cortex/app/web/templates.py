@@ -67,6 +67,70 @@ def icon_html(slug: str, emoji: str) -> str:
     return brand_icon(BRAND_ICONS.get(slug), emoji)
 
 
+# ─── Labs: selectable UI fonts ─────────────────────────────────────────────────
+# key → (display name, css family, Google-Fonts query or None for local @font-face)
+FONTS: dict[str, tuple[str, str, str | None]] = {
+    "inter": ("Inter", "'Inter'", "Inter:wght@400;500;600;700;800"),
+    "exo2": ("Exo 2", "'Exo 2'", "Exo+2:wght@400;500;600;700;800"),
+    "orbitron": ("Orbitron", "'Orbitron'", "Orbitron:wght@400;500;700;900"),
+    "rajdhani": ("Rajdhani", "'Rajdhani'", "Rajdhani:wght@400;500;600;700"),
+    "spacegrotesk": ("Space Grotesk", "'Space Grotesk'", "Space+Grotesk:wght@400;500;600;700"),
+    "chakra": ("Chakra Petch", "'Chakra Petch'", "Chakra+Petch:wght@400;500;600;700"),
+    "jetbrains": ("JetBrains Mono", "'JetBrains Mono'", "JetBrains+Mono:wght@400;500;700"),
+}
+_ACTIVE_FONT = "inter"
+
+
+def _font_dir():
+    from pathlib import Path
+    return Path(__file__).parent / "static" / "fonts"
+
+
+def local_fonts() -> dict[str, str]:
+    """User-dropped fonts in static/fonts/ → {key: filename}."""
+    d = _font_dir()
+    out: dict[str, str] = {}
+    if d.is_dir():
+        for f in sorted(d.iterdir()):
+            if f.suffix.lower() in (".woff2", ".woff", ".ttf", ".otf"):
+                out[f"local_{f.stem.lower().replace(' ', '_')}"] = f.name
+    return out
+
+
+def font_choices() -> list[tuple[str, str]]:
+    """(key, display) for the Labs picker — curated + any local files."""
+    out = [(k, v[0]) for k, v in FONTS.items()]
+    for key, fname in local_fonts().items():
+        out.append((key, fname.rsplit(".", 1)[0]))
+    return out
+
+
+def set_font(key: str | None) -> None:
+    global _ACTIVE_FONT
+    if key and (key in FONTS or key in local_fonts()):
+        _ACTIVE_FONT = key
+
+
+def _font_head() -> str:
+    """<link>/@font-face + the --ui-font variable for the active font."""
+    locals_ = local_fonts()
+    faces = ""
+    for key, fname in locals_.items():
+        ext = fname.rsplit(".", 1)[-1].lower()
+        fmt = {"woff2": "woff2", "woff": "woff", "ttf": "truetype", "otf": "opentype"}.get(ext, "woff2")
+        faces += (f"@font-face{{font-family:'{key}';src:url('/static/fonts/{esc(fname)}') "
+                  f"format('{fmt}');font-display:swap;}}")
+    active = _ACTIVE_FONT
+    if active in FONTS:
+        _disp, family, query = FONTS[active]
+        link = (f'<link href="https://fonts.googleapis.com/css2?family={query}&display=swap" '
+                f'rel="stylesheet">') if query else ""
+    else:
+        family = f"'{active}'"
+        link = ""
+    return f'{link}<style>{faces}:root{{--ui-font:{family};}}</style>'
+
+
 # ─── Design tokens + components ────────────────────────────────────────────────
 _CSS = """
 :root {
@@ -96,7 +160,7 @@ _CSS = """
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
 body {
-  font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-family: var(--ui-font, 'Inter'), ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
   margin: 0; min-height: 100vh; color: var(--text); background: var(--bg);
   -webkit-font-smoothing: antialiased; letter-spacing: -.01em;
 }
@@ -273,6 +337,48 @@ hr { border: none; border-top: 1px solid var(--hair); margin: 20px 0; }
 .card.cat-entry { opacity: .82; }
 .card.cat-entry:hover { opacity: 1; }
 
+/* system metrics */
+.metrics { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px,1fr)); gap: 14px; }
+.metric { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg); padding: 18px; }
+.metric .k { font-size: 12px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .05em; }
+.metric .v { font-size: 26px; font-weight: 700; margin: 6px 0 4px; letter-spacing: -.5px; }
+.metric .sub { font-size: 12px; color: var(--text-dim); }
+.meter { height: 7px; border-radius: 999px; background: var(--surface-3); overflow: hidden; margin-top: 10px; }
+.meter > i { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg,#36d399,#a78bfa); }
+.meter.warn > i { background: linear-gradient(90deg,#f5c451,#fb7185); }
+.rec { display: flex; gap: 10px; align-items: flex-start; padding: 11px 14px; border-radius: var(--r);
+  background: var(--surface-2); border: 1px solid var(--border-soft); margin-bottom: 8px; font-size: 13.5px; }
+.rec.warn { border-color: rgba(245,196,81,.3); } .rec.ok { border-color: rgba(54,211,153,.25); }
+.svc { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-bottom: 1px solid var(--hair); }
+.svc:last-child { border-bottom: none; }
+.svc .nm { font-weight: 550; } .svc .u { color: var(--text-faint); font-size: 12px; }
+.svc .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); }
+.svc .dot.up { background: var(--ok); } .svc .dot.down { background: var(--err); }
+
+/* chat */
+.chat-wrap { display: flex; flex-direction: column; height: calc(100vh - 60px - 100px); max-width: 820px; margin: 0 auto; }
+.chat-log { flex: 1; overflow-y: auto; padding: 8px 2px 16px; display: flex; flex-direction: column; gap: 12px; }
+.msg { max-width: 78%; padding: 11px 15px; border-radius: 16px; font-size: 14.5px; line-height: 1.5;
+  white-space: pre-wrap; word-wrap: break-word; }
+.msg.user { align-self: flex-end; background: var(--accent); color: var(--accent-ink); border-bottom-right-radius: 5px; }
+.msg.bot { align-self: flex-start; background: var(--surface-2); border: 1px solid var(--border); border-bottom-left-radius: 5px; }
+.msg.sys { align-self: center; color: var(--text-faint); font-size: 12px; background: none; }
+.chat-input { display: flex; gap: 10px; padding-top: 12px; border-top: 1px solid var(--hair); }
+.chat-input textarea { flex: 1; resize: none; min-height: 46px; max-height: 160px; }
+.typing { align-self: flex-start; color: var(--text-faint); font-size: 13px; padding: 4px 8px; }
+
+/* labs / github card */
+.lab-card { display: flex; align-items: center; gap: 14px; padding: 16px; background: var(--surface-2);
+  border: 1px solid var(--border-soft); border-radius: var(--r); }
+.lab-card svg { flex-shrink: 0; }
+
+/* updates / hyperspace */
+#hyper { position: fixed; inset: 0; z-index: 999; background: #000; display: none; }
+#hyper.on { display: block; }
+.commit { padding: 12px 14px; border-left: 2px solid var(--border); margin-left: 6px; }
+.commit .h { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--link); }
+.commit .m { font-size: 14px; margin-top: 3px; }
+
 /* empty state */
 .empty { text-align: center; color: var(--text-faint); padding: 54px 20px; font-size: 14px; }
 
@@ -295,8 +401,9 @@ def page(title: str, body: str, *, nav: bool = True, active: str = "") -> str:
         navhtml = (
             '<nav>'
             f'{navlink("/admin", "Plugins", "plugins")}'
+            f'{navlink("/admin/chat", "Chat", "chat")}'
+            f'{navlink("/admin/system", "System", "system")}'
             f'{navlink("/admin/settings", "Einstellungen", "settings")}'
-            f'{navlink("/dashboard", "Status", "status")}'
             '<form method="post" action="/admin/logout" style="display:inline;margin-left:4px">'
             '<button class="btn ghost sm" type="submit">Logout</button></form>'
             '</nav>'
@@ -306,7 +413,7 @@ def page(title: str, body: str, *, nav: bool = True, active: str = "") -> str:
 <title>{esc(title)} · ASTRA</title>{favicon_link()}
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;550;600;650;700;800&display=swap" rel="stylesheet">
+{_font_head()}
 <style>{_CSS}</style></head><body>
 <header class="topbar"><a class="brand" href="/admin"><img src="{LOGO_LONG}" alt="ASTRA"></a>{navhtml}</header>
 <main>{body}</main></body></html>"""
