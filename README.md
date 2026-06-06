@@ -146,13 +146,13 @@ Suchen, Filtern nach Kategorie, Favoriten (★), Ein/Aus-Schalter, Config-Formul
 **live, ohne Container-Neustart**.
 
 ```
-http://127.0.0.1:8088/admin
+http://<server-ip>:8088/admin     # z. B. http://192.168.178.189:8088/admin
 ```
 
-**Zugriff (Standard: nicht öffentlich)** per SSH-Tunnel:
-```bash
-ssh -L 8088:127.0.0.1:8088 root@<server>     # dann im Browser: http://localhost:8088/admin
-```
+Standardmäßig im **lokalen Netzwerk** erreichbar (cortex bindet auf `0.0.0.0:8088`;
+geschützt durch bcrypt-Login + Session-Cookie + Rate-Limit). Für reinen Localhost-Zugriff
+den Port in `docker-compose.yml` auf `127.0.0.1:8088:8000` zurücksetzen und per
+SSH-Tunnel zugreifen. **Nicht** ungeschützt ins Internet exponieren.
 
 - **Erstes Öffnen → Setup-Wizard:** du legst ein Admin-Passwort fest (oder vorab via
   `ASTRA_ADMIN_PASSWORD`). Danach Login mit signiertem Session-Cookie.
@@ -163,10 +163,19 @@ ssh -L 8088:127.0.0.1:8088 root@<server>     # dann im Browser: http://localhost
 - **Sicherheit:** Secrets at-rest verschlüsselt; jede Änderung + Login landet im
   `audit_log`; persönliche Plugin-Tools bleiben **owner-only** (Dritte sehen sie nie).
 
-### Mitgelieferte Plugins (Phase 1)
-🚆 **RMV** · 🏠 **Home Assistant** · 🏫 **EduPage** · ✅ **Google Tasks** — weitere
-Kategorien (Kalender/CalDAV, Deutsche Bahn, Wetter, Medien, Proxmox …) folgen nach
-demselben Muster.
+### Mitgelieferte Plugins (65 in 7 Kategorien)
+Über **65 Integrationen** im Katalog, davon ~59 voll funktionsfähig:
+
+- 🚆 **Transport:** RMV, Deutsche Bahn, BVG Berlin, Google Maps · *(HVV bald)*
+- 🏠 **Smart Home:** Home Assistant, Philips Hue, Shelly, Tasmota, WLED, HomeKit · *(MQTT, Zigbee2MQTT bald)*
+- 🏫 **Schule:** EduPage, Moodle · *(IServ bald)*
+- ✅ **Produktivität:** Google Tasks/Kalender, GitHub, GitLab, Gitea, Todoist, Trello, Linear, Notion, Obsidian, Nextcloud, Mealie, Paperless-NGX, Bring!, Krypto · *(CalDAV bald)*
+- 🎧 **Medien:** Wetter, RSS/News, Spotify, Jellyfin, Plex, YouTube, Last.fm, Pocket Casts, Readwise, Immich, Sonarr, Radarr
+- 🧩 **Infra & KI:** Proxmox, Docker, Portainer, Uptime Kuma, Netdata, Grafana, Pi-hole, AdGuard, qBittorrent, Ollama, n8n · *(Vaultwarden bald)*
+- 💬 **Kommunikation:** Telegram (Kern), Slack, Discord, Matrix, Mastodon, Gmail, IMAP, ntfy, Pushover, Gotify
+
+Plugins mit „bald" sind im Katalog gelistet, aber noch nicht implementiert — sag ASTRA,
+welches du priorisiert haben möchtest. Jedes neue = eine Datei (s. u.).
 
 ### Neues Plugin hinzufügen (für Entwickler)
 Eine Datei in `cortex/app/plugins/builtin/` mit einer `Plugin`-Subklasse: `slug`,
