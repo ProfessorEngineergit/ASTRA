@@ -237,4 +237,4 @@ Prüfen, dass die Datei wirklich im Image liegt: `docker compose run --rm cortex
 
 ---
 
-*Made with ❤️ for Bahrian — still building the future.*
+*Made with ❤️ from Bahrian — still building the future.*
