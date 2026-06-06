@@ -1,14 +1,22 @@
-"""Vaultwarden/Bitwarden — stub."""
+"""Vaultwarden/Bitwarden — stub (vault decryption needs the BW crypto stack).
+
+Reading secrets requires the full Bitwarden key-derivation + decryption flow; a
+safe implementation is planned. Until then this stays a catalog placeholder.
+"""
 from ..base import ConfigField, HealthState, HealthStatus, Plugin, PluginCategory
 
 
 class VaultwardenPlugin(Plugin):
     slug = "vaultwarden"
-    name = "Vaultwarden/Bitwarden"
-    description = "Passwörter und Notizen aus Vaultwarden abrufen."
+    name = "Vaultwarden"
+    description = "Passwörter & Notizen aus Vaultwarden/Bitwarden abrufen."
     category = PluginCategory.INFRA_AI
     icon = "🔐"
-    config_fields = [ConfigField("placeholder", "Noch nicht konfigurierbar")]
+    coming_soon = True
+    config_fields = [
+        ConfigField("base_url", "Server-URL"),
+    ]
 
     async def health_check(self) -> HealthStatus:
-        return HealthStatus(HealthState.NOT_CONFIGURED, "Kommt bald — noch nicht implementiert.")
+        return HealthStatus(HealthState.NOT_CONFIGURED,
+                            "Sichere Vault-Entschlüsselung kommt bald.")
