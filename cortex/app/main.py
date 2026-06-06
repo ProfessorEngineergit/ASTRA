@@ -222,13 +222,19 @@ async def lifespan(app: FastAPI):
     # Load plugins → register their tools + start their background tasks.
     await get_manager().rebuild()
 
-    # Apply web-configured preferences (chat model override + UI font) live.
+    # Give ASTRA control over its own setup (owner-only core tools).
+    from .admin_tools import register_admin_tools
+    register_admin_tools()
+
+    # Apply web-configured preferences (model override, UI font, autonomy) live.
     try:
         appset = await db.get_setting("app_settings", {}) or {}
+        from .brain import set_autonomy
         from .models import set_model_override
         from .web.templates import set_font
         set_model_override(appset.get("ai_model"))
         set_font(appset.get("font"))
+        set_autonomy(appset.get("autonomy", "ask"))
     except Exception:  # noqa: BLE001
         log.warning("Could not apply saved app_settings.", exc_info=True)
 

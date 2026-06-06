@@ -24,6 +24,22 @@ from .state import Act, Signal, ThreadState, next_state
 
 log = logging.getLogger("astra.brain")
 
+# Autonomy level set from the web settings (DB): how independently ASTRA acts.
+#   "ask"       → default policy (asks the owner for sensitive third-party replies)
+#   "confident" → no DEFER waiting (acts immediately), still ASKs when sensitive
+#   "full"      → acts autonomously: ASK and DEFER are escalated to AUTO
+_AUTONOMY = "ask"
+
+
+def set_autonomy(level: str | None) -> None:
+    global _AUTONOMY
+    if level in ("ask", "confident", "full"):
+        _AUTONOMY = level
+
+
+def get_autonomy() -> str:
+    return _AUTONOMY
+
 
 def _as_mode(v: str) -> Mode:
     try:
@@ -143,7 +159,16 @@ async def handle_inbound(
     )
     _remember(contact, text, owner=False)
 
-    if decision.mode == Mode.AUTO:
+    # Autonomy override: a confident/full owner lets ASTRA skip waiting/asking.
+    mode = decision.mode
+    auto = get_autonomy()
+    if auto == "full" and mode in (Mode.DEFER, Mode.ASK):
+        mode = Mode.AUTO
+        log.info("Autonomy=full → %s escalated to AUTO for %s", decision.mode.value, thread_id)
+    elif auto == "confident" and mode == Mode.DEFER:
+        mode = Mode.AUTO
+
+    if mode == Mode.AUTO:
         reply = await generate_reply(
             register=Register.THIRD, contact=contact, thread_id=thread_id, channel=channel,
             history=history, summary=thread.get("summary") or "",
@@ -154,7 +179,7 @@ async def handle_inbound(
         if cur and cur["state"] != ThreadState.AWAITING_APPROVAL.value:  # a tool may have asked
             await db.set_thread_state(thread_id, ThreadState.ANSWERED.value)
 
-    elif decision.mode == Mode.DEFER:
+    elif mode == Mode.DEFER:
         defer_until = datetime.now(timezone.utc) + timedelta(seconds=s.astra_defer_seconds)
         await db.set_thread_state(thread_id, ThreadState.DEFERRED.value, defer_until=defer_until)
         await db.merge_thread_meta(thread_id, {"max_sensitivity": decision.max_sensitivity.value})

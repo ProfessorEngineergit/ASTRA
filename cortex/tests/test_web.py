@@ -54,6 +54,7 @@ def test_setup_then_catalog_and_logout(memdb):
     assert r.status_code == 200
     assert "RMV" in r.text and "Home Assistant" in r.text
     assert "durchsuchen" in r.text             # search box present
+    assert "nur in meinem Gebiet" in r.text    # regional catalog filter present
 
     # Logout clears the session; /admin redirects back to login.
     c.post("/admin/logout", follow_redirects=False)
@@ -68,3 +69,62 @@ def test_login_required_for_plugin_config(memdb):
     c = TestClient(_app())
     r = c.get("/admin/plugin/rmv", follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/admin/login"
+
+
+def test_settings_labs_and_region_save(memdb):
+    _prime_manager()
+    c = TestClient(_app())
+    r = c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+
+    r = c.get("/admin/settings")
+    assert r.status_code == 200
+    assert "github-capsule" in r.text
+    assert "Experimental Console" in r.text
+    assert "lab_density" in r.text
+    assert "addrresults" in r.text
+    assert 'name="country_code"' in r.text
+
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    r = c.post("/admin/settings", data={
+        "csrf": csrf,
+        "owner_name": "Bahrian",
+        "timezone": "Europe/Berlin",
+        "units": "metric",
+        "language": "de",
+        "ai_model": "gpt-4o",
+        "autonomy": "confident",
+        "allow_self_config": "on",
+        "lab_font": "orbitron",
+        "lab_density": "dense",
+        "lab_motion": "hyperspace",
+        "lab_event_horizon": "deep",
+        "lab_surface_glow": "cinematic",
+        "lab_accent": "ion",
+        "lab_catalog_view": "compact",
+        "lab_map_style": "transit",
+        "lab_diagnostics": "on",
+        "lab_save_effect": "on",
+        "address": "Frankfurt am Main",
+        "city": "Frankfurt am Main",
+        "lat": "50.1109",
+        "lon": "8.6821",
+        "country_code": "de",
+        "country": "Deutschland",
+        "state": "Hessen",
+        "county": "Frankfurt am Main",
+        "postcode": "60311",
+    }, follow_redirects=False)
+    assert r.status_code == 303
+
+    saved = memdb["app_settings"]
+    assert saved["autonomy"] == "confident"
+    assert saved["allow_self_config"] is True
+    assert saved["font"] == "orbitron"
+    assert saved["labs"]["density"] == "dense"
+    assert saved["labs"]["catalog_view"] == "compact"
+    assert saved["location"]["country_code"] == "de"
+    assert saved["location"]["state"] == "Hessen"
+    assert saved["location"]["county"] == "Frankfurt am Main"
