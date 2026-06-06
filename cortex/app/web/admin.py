@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -1251,52 +1253,267 @@ async def system_page(request: Request, _: bool = Depends(auth.require_admin)):
     return HTMLResponse(page("System", body, active="system"))
 
 
-# ─── Chat: talk to ASTRA from the web (full owner agent) ──────────────────────
-async def _chat_history() -> list[dict]:
-    return await db.get_setting("web_chat", []) or []
+# ─── Chat: multi-thread owner agent ────────────────────────────────────────────
+CHAT_KEY = "web_chats_v2"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _msg(role: str, content: str, **extra) -> dict:
+    return {"id": f"m_{uuid4().hex[:10]}", "role": role, "content": content, "ts": _now_iso(), **extra}
+
+
+def _new_chat(title: str = "Neuer Chat", *, messages: list[dict] | None = None) -> dict:
+    now = _now_iso()
+    return {
+        "id": f"c_{uuid4().hex[:10]}",
+        "title": title,
+        "archived": False,
+        "permission_mode": "ask",
+        "messages": messages or [],
+        "pending_action": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def _title_from(text: str) -> str:
+    text = " ".join((text or "").split())
+    return text[:38] + ("…" if len(text) > 38 else "") if text else "Neuer Chat"
+
+
+def _normalize_chat(c: dict) -> dict:
+    out = _new_chat(c.get("title") or "Neuer Chat")
+    out.update({k: c.get(k, out[k]) for k in out})
+    out["messages"] = [
+        {**_msg(m.get("role", "assistant"), m.get("content", "")), **m}
+        for m in (c.get("messages") or [])
+    ]
+    return out
+
+
+async def _chat_store() -> dict:
+    store = await db.get_setting(CHAT_KEY, None)
+    if isinstance(store, dict) and isinstance(store.get("chats"), list):
+        chats = [_normalize_chat(c) for c in store["chats"]]
+        if not chats:
+            chats = [_new_chat()]
+        active = store.get("active_id") or chats[0]["id"]
+        if not any(c["id"] == active and not c.get("archived") for c in chats):
+            active = next((c["id"] for c in chats if not c.get("archived")), chats[0]["id"])
+        return {"active_id": active, "chats": chats}
+
+    legacy = await db.get_setting("web_chat", []) or []
+    messages = [
+        _msg("user" if m.get("role") == "user" else "assistant", m.get("content", ""))
+        for m in legacy if isinstance(m, dict)
+    ]
+    chat = _new_chat(_title_from(messages[0]["content"]) if messages else "Neuer Chat", messages=messages)
+    return {"active_id": chat["id"], "chats": [chat]}
+
+
+async def _save_chat_store(store: dict) -> None:
+    await db.set_setting(CHAT_KEY, store)
+
+
+def _get_chat(store: dict, chat_id: str | None = None) -> dict:
+    cid = chat_id or store.get("active_id")
+    for chat in store["chats"]:
+        if chat["id"] == cid:
+            store["active_id"] = chat["id"]
+            return chat
+    return store["chats"][0]
+
+
+def _chat_messages_for_agent(chat: dict) -> list[dict]:
+    return [
+        {"role": m["role"], "content": m["content"]}
+        for m in chat.get("messages", [])
+        if m.get("role") in ("user", "assistant")
+    ][-40:]
+
+
+def _mode_label(mode: str) -> str:
+    return {
+        "ask": "jedes Mal fragen",
+        "auto": "Automodus",
+        "bypass": "Berechtigungen umgehen",
+    }.get(mode, "Automodus")
+
+
+def _render_chat_list(store: dict, active_id: str) -> str:
+    rows = []
+    for c in store["chats"]:
+        if c.get("archived"):
+            continue
+        active = " active" if c["id"] == active_id else ""
+        rows.append(
+            f'<a class="thread{active}" href="/admin/chat?chat={esc(c["id"])}">'
+            f'<span>{esc(c.get("title") or "Neuer Chat")}</span>'
+            f'<small>{len(c.get("messages", []))} Nachrichten · {esc(_mode_label(c.get("permission_mode", "ask")))}</small>'
+            '</a>'
+        )
+    archived = sum(1 for c in store["chats"] if c.get("archived"))
+    rows.append(f'<div class="arch-note">{archived} archiviert</div>' if archived else "")
+    return "".join(rows)
+
+
+def _render_messages(chat: dict) -> str:
+    msgs = []
+    for m in chat.get("messages", []):
+        role = m.get("role", "assistant")
+        cls = "user" if role == "user" else "bot" if role == "assistant" else "sys"
+        actions = ""
+        if role == "user":
+            actions = (
+                f'<button data-edit="{esc(m["id"])}">Bearbeiten</button>'
+                f'<button data-branch="{esc(m["id"])}">Branch</button>'
+            )
+        elif role == "assistant":
+            actions = f'<button data-branch="{esc(m["id"])}">Branch</button>'
+        pending = ""
+        if m.get("pending_action"):
+            p = m["pending_action"]
+            pending = (
+                '<div class="action-card">'
+                f'<div><b>Agentenaktion</b><span>{esc(p.get("tool"))}</span></div>'
+                f'<pre>{esc(json.dumps(p.get("args", {}), ensure_ascii=False, indent=2))}</pre>'
+                '<div class="row">'
+                f'<button class="btn sm" data-run-action="{esc(m["id"])}">Ausführen</button>'
+                f'<button class="btn ghost sm" data-deny-action="{esc(m["id"])}">Ablehnen</button>'
+                '</div></div>'
+            )
+        msgs.append(
+            f'<div class="msg-row {cls}" data-mid="{esc(m["id"])}">'
+            f'<div class="msg {cls}">{esc(m.get("content", ""))}{pending}</div>'
+            f'<div class="msg-actions">{actions}</div></div>'
+        )
+    if not msgs:
+        return '<div class="msg sys">Sag Hallo zu ASTRA. Dieser Thread gehört nur dir.</div>'
+    return "".join(msgs)
 
 
 @router.get("/admin/chat", response_class=HTMLResponse)
-async def chat_page(request: Request, _: bool = Depends(auth.require_admin)):
-    hist = await _chat_history()
-    bubbles = "".join(
-        f'<div class="msg {"user" if m["role"] == "user" else "bot"}">{esc(m["content"])}</div>'
-        for m in hist) or '<div class="msg sys">Sag Hallo zu ASTRA — alles wie in Telegram, nur hier.</div>'
+async def chat_page(request: Request, _: bool = Depends(auth.require_admin), chat: str = ""):
+    store = await _chat_store()
+    active = _get_chat(store, chat or None)
+    await _save_chat_store(store)
+    appset = await _app_settings()
+    autonomy = appset.get("autonomy", "ask")
+    mode = active.get("permission_mode", "ask")
     body = f"""
-    <div class="chat-wrap">
-      <div class="chat-log" id="log">{bubbles}</div>
-      <div class="chat-input">
-        <textarea id="inp" placeholder="Nachricht oder Aufgabe an ASTRA…" rows="1"></textarea>
-        <button class="btn" id="send">Senden</button>
-        <button class="btn ghost sm" id="clear" title="Verlauf leeren">Leeren</button>
-      </div>
+    <div class="chat-shell" data-chat="{esc(active['id'])}">
+      <aside class="chat-side">
+        <div class="side-head"><b>ASTRA Chat</b><button class="btn sm" id="newchat">Neu</button></div>
+        <div class="threads">{_render_chat_list(store, active['id'])}</div>
+        <div class="perm-box">
+          <label>Ausführung</label>
+          <select id="perm">
+            <option value="ask" {"selected" if mode == "ask" else ""}>Jedes Mal fragen</option>
+            <option value="auto" {"selected" if mode == "auto" else ""}>Automodus</option>
+            <option value="bypass" {"selected" if mode == "bypass" else ""}>Berechtigungen umgehen</option>
+          </select>
+          <label>Autonomielevel</label>
+          <select id="autonomy">
+            <option value="ask" {"selected" if autonomy == "ask" else ""}>ask</option>
+            <option value="confident" {"selected" if autonomy == "confident" else ""}>confident</option>
+            <option value="full" {"selected" if autonomy == "full" else ""}>full</option>
+          </select>
+          <p>Ask pausiert riskante Toolcalls. Bypass gilt nur hier im Owner-Webchat.</p>
+        </div>
+        <button class="btn ghost sm" id="archivechat">Archivieren</button>
+      </aside>
+      <section class="chat-main">
+        <div class="chat-title">
+          <div><span>Thread</span><h1>{esc(active.get("title") or "Neuer Chat")}</h1></div>
+          <button class="btn ghost sm" id="branchchat">Branch</button>
+        </div>
+        <div class="chat-log" id="log">{_render_messages(active)}</div>
+        <div class="chat-input">
+          <textarea id="inp" placeholder="Nachricht oder Aufgabe an ASTRA…" rows="1"></textarea>
+          <button class="btn" id="send">Senden</button>
+          <button class="btn ghost sm" id="clear" title="Verlauf leeren">Leeren</button>
+        </div>
+      </section>
     </div>
     <script>
+      const root=document.querySelector('.chat-shell'), chatId=root.dataset.chat;
       const log=document.getElementById('log'), inp=document.getElementById('inp');
+      const perm=document.getElementById('perm'), autonomy=document.getElementById('autonomy');
       const scroll=()=>log.scrollTop=log.scrollHeight; scroll();
-      function add(cls,txt){{const d=document.createElement('div');d.className='msg '+cls;d.textContent=txt;log.appendChild(d);scroll();return d;}}
-      inp.addEventListener('input',()=>{{inp.style.height='auto';inp.style.height=Math.min(inp.scrollHeight,160)+'px';}});
+      function add(role,txt){{const r=document.createElement('div');r.className='msg-row '+role;
+        const b=document.createElement('div');b.className='msg '+role;b.textContent=txt;r.appendChild(b);log.appendChild(r);scroll();return r;}}
+      async function post(url, data){{const r=await fetch(url,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(data||{{}})}});return await r.json();}}
+      async function saveSettings(){{await post('/admin/chat/settings',{{chat_id:chatId,permission_mode:perm.value,autonomy:autonomy.value}});}}
+      perm.onchange=saveSettings; autonomy.onchange=saveSettings;
+      inp.addEventListener('input',()=>{{inp.style.height='auto';inp.style.height=Math.min(inp.scrollHeight,180)+'px';}});
       inp.addEventListener('keydown',e=>{{if(e.key==='Enter'&&!e.shiftKey){{e.preventDefault();go();}}}});
       document.getElementById('send').onclick=go;
       async function go(){{
         const t=inp.value.trim(); if(!t) return; inp.value=''; inp.style.height='auto';
-        add('user',t); const typing=add('typing','ASTRA tippt…');
+        add('user',t); const typing=add('typing','ASTRA arbeitet…');
         try{{
-          const r=await fetch('/admin/chat/send',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{message:t}})}});
-          const d=await r.json(); typing.remove(); add('bot', d.reply||'(keine Antwort)');
+          await saveSettings();
+          const d=await post('/admin/chat/send',{{chat_id:chatId,message:t,permission_mode:perm.value}});
+          typing.remove(); location.href='/admin/chat?chat='+encodeURIComponent(d.chat_id||chatId);
         }}catch(e){{ typing.remove(); add('bot','Fehler: '+e); }}
       }}
-      document.getElementById('clear').onclick=async()=>{{
-        await fetch('/admin/chat/clear',{{method:'POST'}}); log.innerHTML='';
-        add('sys','Verlauf geleert.');
+      document.getElementById('newchat').onclick=async()=>{{const d=await post('/admin/chat/new',{{}}); location.href='/admin/chat?chat='+d.chat_id;}};
+      document.getElementById('archivechat').onclick=async()=>{{await post('/admin/chat/archive',{{chat_id:chatId}}); location.href='/admin/chat';}};
+      document.getElementById('branchchat').onclick=async()=>{{const d=await post('/admin/chat/branch',{{chat_id:chatId}}); location.href='/admin/chat?chat='+d.chat_id;}};
+      document.getElementById('clear').onclick=async()=>{{await post('/admin/chat/clear',{{chat_id:chatId}}); location.reload();}};
+      log.onclick=async e=>{{
+        const edit=e.target.closest('[data-edit]'), branch=e.target.closest('[data-branch]');
+        const run=e.target.closest('[data-run-action]'), deny=e.target.closest('[data-deny-action]');
+        if(edit){{const current=edit.closest('.msg-row').querySelector('.msg').childNodes[0].textContent;
+          const text=prompt('Nachricht bearbeiten. Alles danach wird abgeschnitten:', current);
+          if(text!==null){{await post('/admin/chat/edit',{{chat_id:chatId,message_id:edit.dataset.edit,content:text}}); location.reload();}}}}
+        if(branch){{const d=await post('/admin/chat/branch',{{chat_id:chatId,message_id:branch.dataset.branch}}); location.href='/admin/chat?chat='+d.chat_id;}}
+        if(run){{await post('/admin/chat/action',{{chat_id:chatId,message_id:run.dataset.runAction,decision:'run'}}); location.reload();}}
+        if(deny){{await post('/admin/chat/action',{{chat_id:chatId,message_id:deny.dataset.denyAction,decision:'deny'}}); location.reload();}}
       }};
     </script>"""
     return HTMLResponse(page("Chat", body, active="chat"))
 
 
+@router.post("/admin/chat/settings")
+async def chat_settings(request: Request, _: bool = Depends(auth.require_admin)):
+    from ..brain import set_autonomy
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001
+        data = {}
+    store = await _chat_store()
+    chat = _get_chat(store, data.get("chat_id"))
+    mode = data.get("permission_mode")
+    if mode in ("ask", "auto", "bypass"):
+        chat["permission_mode"] = mode
+    appset = await _app_settings()
+    autonomy = data.get("autonomy")
+    if autonomy in ("ask", "confident", "full"):
+        appset["autonomy"] = autonomy
+        set_autonomy(autonomy)
+        await db.set_setting("app_settings", appset)
+    chat["updated_at"] = _now_iso()
+    await _save_chat_store(store)
+    return JSONResponse({"ok": True})
+
+
+@router.post("/admin/chat/new")
+async def chat_new(request: Request, _: bool = Depends(auth.require_admin)):
+    store = await _chat_store()
+    chat = _new_chat()
+    store["chats"].insert(0, chat)
+    store["active_id"] = chat["id"]
+    await _save_chat_store(store)
+    return JSONResponse({"chat_id": chat["id"]})
+
+
 @router.post("/admin/chat/send")
 async def chat_send(request: Request, _: bool = Depends(auth.require_admin)):
-    from ..agent import generate_reply
+    from ..agent import generate_reply_meta
     from ..persona import Register
     try:
         data = await request.json()
@@ -1306,90 +1523,710 @@ async def chat_send(request: Request, _: bool = Depends(auth.require_admin)):
     if not msg:
         return JSONResponse({"reply": "(leer)"})
     st = get_settings()
-    hist = await _chat_history()
-    hist.append({"role": "user", "content": msg})
+    store = await _chat_store()
+    chat = _get_chat(store, data.get("chat_id"))
+    if data.get("permission_mode") in ("ask", "auto", "bypass"):
+        chat["permission_mode"] = data["permission_mode"]
+    user_msg = _msg("user", msg)
+    chat["messages"].append(user_msg)
+    if len([m for m in chat["messages"] if m["role"] == "user"]) == 1:
+        chat["title"] = _title_from(msg)
     try:
-        reply = await generate_reply(
+        result = await generate_reply_meta(
             register=Register.OWNER,
             contact={"id": "owner", "name": st.astra_owner_name, "is_owner": True},
-            thread_id="web-owner", channel="web", history=hist,
+            thread_id=f"web-owner:{chat['id']}", channel="web",
+            history=_chat_messages_for_agent(chat),
+            permission_mode=chat.get("permission_mode", "ask"),
         )
     except Exception as e:  # noqa: BLE001
         log.exception("web chat failed")
-        return JSONResponse({"reply": f"Fehler: {e}"})
-    hist.append({"role": "assistant", "content": reply})
-    await db.set_setting("web_chat", hist[-40:])
-    await db.audit("web_chat", actor="owner", detail={"len": len(msg)})
-    return JSONResponse({"reply": reply})
+        result = {"reply": f"Fehler: {e}"}
+    bot_msg = _msg("assistant", result.get("reply") or "(keine Antwort)")
+    if result.get("pending_action"):
+        bot_msg["pending_action"] = result["pending_action"]
+        chat["pending_action"] = {"message_id": bot_msg["id"], **result["pending_action"]}
+    chat["messages"].append(bot_msg)
+    chat["updated_at"] = _now_iso()
+    chat["messages"] = chat["messages"][-80:]
+    await _save_chat_store(store)
+    await db.audit("web_chat", actor="owner", detail={"len": len(msg), "chat_id": chat["id"]})
+    return JSONResponse({"reply": bot_msg["content"], "chat_id": chat["id"]})
+
+
+@router.post("/admin/chat/action")
+async def chat_action(request: Request, _: bool = Depends(auth.require_admin)):
+    from ..tools import ToolContext, dispatch
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001
+        data = {}
+    store = await _chat_store()
+    chat = _get_chat(store, data.get("chat_id"))
+    target = next((m for m in chat["messages"] if m["id"] == data.get("message_id")), None)
+    pending = (target or {}).get("pending_action")
+    if not target or not pending:
+        return JSONResponse({"ok": False, "error": "Keine offene Aktion."})
+    if data.get("decision") == "deny":
+        target.pop("pending_action", None)
+        chat["pending_action"] = None
+        chat["messages"].append(_msg("assistant", "Aktion abgelehnt. Ich habe nichts ausgeführt."))
+        await _save_chat_store(store)
+        return JSONResponse({"ok": True})
+    ctx = ToolContext(
+        thread_id=f"web-owner:{chat['id']}", channel="web",
+        contact={"id": "owner", "is_owner": True}, is_owner=True,
+        permission_mode="bypass",
+    )
+    result = await dispatch(pending["tool"], pending.get("args") or {}, ctx)
+    target.pop("pending_action", None)
+    chat["pending_action"] = None
+    chat["messages"].append(_msg("assistant", f"Ausgeführt: {pending['tool']}\n\n{result}"))
+    chat["updated_at"] = _now_iso()
+    await _save_chat_store(store)
+    return JSONResponse({"ok": True})
+
+
+@router.post("/admin/chat/edit")
+async def chat_edit(request: Request, _: bool = Depends(auth.require_admin)):
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001
+        data = {}
+    store = await _chat_store()
+    chat = _get_chat(store, data.get("chat_id"))
+    mid = data.get("message_id")
+    for i, m in enumerate(chat["messages"]):
+        if m["id"] == mid and m["role"] == "user":
+            m["content"] = (data.get("content") or "").strip()
+            m["edited_at"] = _now_iso()
+            chat["messages"] = chat["messages"][: i + 1]
+            chat["pending_action"] = None
+            chat["updated_at"] = _now_iso()
+            await _save_chat_store(store)
+            return JSONResponse({"ok": True})
+    return JSONResponse({"ok": False})
+
+
+@router.post("/admin/chat/branch")
+async def chat_branch(request: Request, _: bool = Depends(auth.require_admin)):
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001
+        data = {}
+    store = await _chat_store()
+    chat = _get_chat(store, data.get("chat_id"))
+    messages = chat["messages"]
+    mid = data.get("message_id")
+    if mid:
+        for i, m in enumerate(messages):
+            if m["id"] == mid:
+                messages = messages[: i + 1]
+                break
+    copied = [{**m, "id": f"m_{uuid4().hex[:10]}", "pending_action": None} for m in messages]
+    child = _new_chat(f"{chat.get('title', 'Chat')} / Branch", messages=copied)
+    child["permission_mode"] = chat.get("permission_mode", "ask")
+    store["chats"].insert(0, child)
+    store["active_id"] = child["id"]
+    await _save_chat_store(store)
+    return JSONResponse({"chat_id": child["id"]})
+
+
+@router.post("/admin/chat/archive")
+async def chat_archive(request: Request, _: bool = Depends(auth.require_admin)):
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001
+        data = {}
+    store = await _chat_store()
+    chat = _get_chat(store, data.get("chat_id"))
+    chat["archived"] = True
+    store["active_id"] = next((c["id"] for c in store["chats"] if not c.get("archived")), chat["id"])
+    await _save_chat_store(store)
+    return JSONResponse({"ok": True})
 
 
 @router.post("/admin/chat/clear")
 async def chat_clear(request: Request, _: bool = Depends(auth.require_admin)):
-    await db.set_setting("web_chat", [])
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001
+        data = {}
+    store = await _chat_store()
+    chat = _get_chat(store, data.get("chat_id"))
+    chat["messages"] = []
+    chat["pending_action"] = None
+    chat["updated_at"] = _now_iso()
+    await _save_chat_store(store)
     return JSONResponse({"ok": True})
 
 
 # ─── Updates: release notes + hyperspace + GitHub links ───────────────────────
-@router.get("/admin/updates", response_class=HTMLResponse)
+@router.get("/admin/update", response_class=HTMLResponse)
 async def updates_page(request: Request, _: bool = Depends(auth.require_admin)):
-    import httpx
-    commits_html = '<p class="note">Konnte GitHub gerade nicht erreichen.</p>'
-    try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get("https://api.github.com/repos/ProfessorEngineergit/ASTRA/commits",
-                            params={"per_page": 12}, headers={"Accept": "application/vnd.github+json"})
-        if r.status_code == 200:
-            rows = []
-            for cm in r.json():
-                sha = cm.get("sha", "")[:7]
-                msg = (cm.get("commit", {}).get("message", "") or "").split("\n")[0]
-                url = cm.get("html_url", "#")
-                rows.append(f'<div class="commit"><a class="h" href="{esc(url)}" target="_blank" '
-                            f'rel="noopener">{esc(sha)} ↗</a><div class="m">{esc(msg)}</div></div>')
-            commits_html = "".join(rows)
-    except Exception:  # noqa: BLE001
-        pass
-
     body = f"""
-    <div id="hyper"><canvas id="hsc"></canvas></div>
-    <div class="hero"><h1>Updates</h1>
-      <p>Neueste Änderungen aus dem Repository. Prüfe auf Updates und sieh dir die Notes an.</p></div>
-    <div class="row" style="margin-bottom:20px">
-      <button class="btn" id="check">Auf Updates prüfen</button>
-      <a class="btn secondary" target="_blank" rel="noopener"
-         href="https://github.com/ProfessorEngineergit/ASTRA/commits/main">Alle Commits ↗</a>
-      <a class="btn ghost" target="_blank" rel="noopener"
-         href="https://github.com/ProfessorEngineergit/ASTRA/releases">Releases ↗</a>
+    <style>
+        .astra-module-container {{
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            margin-top: 1rem;
+        }}
+
+        /* --- DIE UPDATE KARTE --- */
+        .astra-card {{
+            position: relative;
+            width: 100%;
+            min-height: 160px;
+            background: var(--bg-1, rgba(10, 11, 16, 0.6));
+            border: 1px solid var(--border, rgba(0, 210, 255, 0.15));
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5), inset 0 0 30px rgba(0, 210, 255, 0.04);
+            display: flex;
+            align-items: center;
+            transition: all 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+            z-index: 1;
+        }}
+
+        .hyperspace-canvas {{
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 0;
+            opacity: 0.85;
+            transition: opacity 0.5s ease;
+        }}
+
+        .card-inner {{
+            position: relative;
+            z-index: 2;
+            width: 100%;
+            padding: 32px 40px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 24px;
+            transition: opacity 0.4s ease, transform 0.4s ease;
+        }}
+
+        /* Gruppierung für die linke Seite (Version + Info) */
+        .card-left-group {{
+            display: flex;
+            align-items: center;
+            gap: 36px;
+        }}
+
+        /* DIE FETTE VERSIONSNUMMER LINKS (Analog zum Progress Counter) */
+        .big-version {{
+            display: none;
+            font-size: 64px;
+            font-weight: 900;
+            font-variant-numeric: tabular-nums;
+            letter-spacing: -2px;
+            line-height: 1;
+            background: linear-gradient(to bottom, #ffffff, #a2b4c7);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            filter: drop-shadow(0 0 30px rgba(0, 210, 255, 0.4));
+        }}
+
+        /* Aktivierungs-Klasse nach dem Update-Prozess */
+        .astra-card.has-updated .big-version {{
+            display: block;
+            animation: slideInLeft 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }}
+
+        .card-info {{
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }}
+
+        .card-title {{
+            font-size: 24px;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            text-shadow: 0 0 20px rgba(255, 255, 255, 0.2);
+            transition: color 0.4s ease;
+            margin: 0;
+        }}
+
+        .card-subtitle {{
+            font-size: 14px;
+            color: var(--text-dim, #8e94a6);
+            font-weight: 400;
+            transition: color 0.4s ease;
+            margin: 0;
+        }}
+
+        .card-actions {{
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }}
+
+        /* --- BUTTONS & LINKS --- */
+        .card-actions .btn-primary {{
+            background: linear-gradient(135deg, #00f0ff 0%, #0072ff 100%);
+            color: #000;
+            border: none;
+            padding: 12px 28px;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            box-shadow: 0 0 20px rgba(0, 240, 255, 0.3);
+            transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+        }}
+
+        .card-actions .btn-primary:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 0 30px rgba(0, 240, 255, 0.6);
+            background: linear-gradient(135deg, #55f5ff 0%, #338cff 100%);
+        }}
+
+        .card-actions .btn-primary:active {{
+            transform: translateY(0);
+        }}
+
+        .card-actions .link-secondary {{
+            color: var(--text-dim, #8e94a6);
+            font-size: 14px;
+            text-decoration: none;
+            cursor: pointer;
+            transition: color 0.2s ease;
+            background: none;
+            border: none;
+            font-family: inherit;
+        }}
+
+        .card-actions .link-secondary:hover {{
+            color: var(--text, #ffffff);
+        }}
+
+        /* --- ZUSTAND: CONFIRMATION --- */
+        .confirm-wrapper {{
+            display: none;
+            gap: 12px;
+            align-items: center;
+            animation: fadeIn 0.3s ease forwards;
+        }}
+
+        .confirm-text {{
+            font-size: 14px;
+            color: #00d2ff;
+            font-weight: 500;
+            margin-right: 8px;
+        }}
+
+        .card-actions .btn-danger {{
+            background: transparent;
+            color: #ff4a4a;
+            border: 1px solid rgba(255, 74, 74, 0.3);
+            padding: 10px 18px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }}
+
+        .card-actions .btn-danger:hover {{
+            background: rgba(255, 74, 74, 0.1);
+            border-color: rgba(255, 74, 74, 0.6);
+        }}
+
+        /* --- ZUSTAND: UPDATING SCREEN --- */
+        .progress-overlay {{
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 3;
+            opacity: 0;
+            pointer-events: none;
+            transform: scale(0.95);
+            transition: all 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+        }}
+
+        .progress-counter {{
+            font-size: 72px;
+            font-weight: 900;
+            font-variant-numeric: tabular-nums;
+            letter-spacing: -3px;
+            background: linear-gradient(to bottom, #ffffff, #a2b4c7);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            filter: drop-shadow(0 0 30px rgba(0, 210, 255, 0.4));
+        }}
+
+        /* --- RELEASE NOTES AREA --- */
+        .release-notes-wrapper {{
+            display: grid;
+            grid-template-rows: 0fr;
+            transition: grid-template-rows 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+        }}
+
+        .release-notes-wrapper.is-open {{
+            grid-template-rows: 1fr;
+        }}
+
+        .release-notes-content {{
+            overflow: hidden;
+        }}
+
+        .release-notes-card {{
+            background: var(--bg-2, rgba(10, 11, 16, 0.3));
+            border: 1px solid var(--border, rgba(255, 255, 255, 0.04));
+            border-radius: 12px;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            margin-bottom: 4px;
+        }}
+
+        .notes-header {{
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: #00d2ff;
+            font-weight: 700;
+        }}
+
+        .commit-list {{
+            list-style: none;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            padding: 0;
+            margin: 0;
+        }}
+
+        .commit-item {{
+            font-family: 'JetBrains Mono', Consolas, Menlo, monospace;
+            font-size: 13px;
+            color: var(--text-dim, #8e94a6);
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            line-height: 1.5;
+        }}
+
+        .commit-item::before {{
+            content: "•";
+            color: #00d2ff;
+            font-weight: bold;
+        }}
+
+        .commit-item span.feat {{ color: #50e3c2; }}
+        .commit-item span.fix {{ color: #ff4a4a; }}
+        .commit-item span.chore {{ color: #a2b4c7; }}
+
+        .astra-card.is-updating .card-inner {{
+            opacity: 0;
+            transform: scale(0.95);
+            pointer-events: none;
+        }}
+
+        .astra-card.is-updating .progress-overlay {{
+            opacity: 1;
+            transform: scale(1);
+            pointer-events: auto;
+        }}
+
+        @keyframes fadeIn {{
+            from {{ opacity: 0; transform: translateX(10px); }}
+            to {{ opacity: 1; transform: translateX(0); }}
+        }}
+
+        @keyframes slideInLeft {{
+            from {{ opacity: 0; transform: translateX(-20px); }}
+            to {{ opacity: 1; transform: translateX(0); }}
+        }}
+
+        @media (max-width: 768px) {{
+            .card-inner {{ flex-direction: column; align-items: flex-start; padding: 24px; gap: 20px; }}
+            .card-left-group {{ flex-direction: column; align-items: flex-start; gap: 16px; width: 100%; }}
+            .card-actions {{ width: 100%; flex-direction: column-reverse; align-items: stretch; gap: 16px; }}
+            .confirm-wrapper {{ flex-direction: column; align-items: stretch; }}
+            .confirm-text {{ text-align: center; margin-bottom: 4px; }}
+            .card-actions .btn-primary, .card-actions .link-secondary, .card-actions .btn-danger {{ text-align: center; width: 100%; padding: 14px; }}
+            .progress-counter {{ font-size: 54px; }}
+            .big-version {{ font-size: 52px; }}
+        }}
+    </style>
+
+    <div class="hero" style="margin-bottom:0px">
+      <h1>Updates</h1>
+      <p>Neueste Änderungen aus dem Repository holen.</p>
     </div>
-    <div class="panel" style="margin-bottom:18px">
-      <h2 style="margin:0 0 6px;font-size:15px">So aktualisierst du</h2>
-      <p class="note" style="margin:0 0 8px">Auf dem Server ausführen — Code holen &amp; neu bauen:</p>
-      <pre style="background:var(--bg-2);border:1px solid var(--border);border-radius:var(--r-sm);
-        padding:12px 14px;font-family:'JetBrains Mono',monospace;font-size:13px;overflow-x:auto">cd /opt/astra &amp;&amp; git pull origin main &amp;&amp; docker compose up -d --build cortex</pre>
+
+    <div class="astra-module-container">
+        
+        <div class="astra-card" id="astraCard">
+            <canvas class="hyperspace-canvas" id="spaceCanvas"></canvas>
+            
+            <div class="card-inner" id="cardInner">
+                <div class="card-left-group">
+                    <div class="big-version" id="bigVersion"></div>
+                    <div class="card-info">
+                        <h2 class="card-title" id="cardTitle">Update verfügbar</h2>
+                        <p class="card-subtitle" id="cardSubtitle">Verbindung zu GitHub wird aufgebaut...</p>
+                    </div>
+                </div>
+                
+                <div class="card-actions">
+                    <button class="link-secondary" id="toggleNotesBtn" onclick="toggleReleaseNotes()">Versionshinweise lesen</button>
+                    <button class="btn-primary" id="mainUpdateBtn" onclick="showConfirmation()">Update starten</button>
+                    
+                    <div class="confirm-wrapper" id="confirmWrapper">
+                        <span class="confirm-text">Sicher updaten?</span>
+                        <button class="btn-danger" onclick="cancelUpdate()">Abbrechen</button>
+                        <button class="btn-primary" onclick="startUpdateProcess()">Updaten</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="progress-overlay" id="progressOverlay">
+                <div class="progress-counter" id="progressNumber">0%</div>
+            </div>
+        </div>
+
+        <div class="release-notes-wrapper" id="releaseNotesWrapper">
+            <div class="release-notes-content">
+                <div class="release-notes-card">
+                    <div class="notes-header">Changelog / Neueste GitHub Commits</div>
+                    <ul class="commit-list" id="commitList">
+                        <li class="commit-item"><span class="chore">Lade...</span> Commits werden abgerufen...</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" style="margin-top:20px">
+          <h2 style="margin:0 0 6px;font-size:15px">Manuelles Update</h2>
+          <p class="note" style="margin:0 0 8px">Auf dem Server im Terminal ausführen:</p>
+          <pre style="background:var(--bg-2);border:1px solid var(--border);border-radius:var(--r-sm);
+            padding:12px 14px;font-family:'JetBrains Mono',monospace;font-size:13px;overflow-x:auto;margin:0">cd /opt/astra &amp;&amp; git pull origin main &amp;&amp; docker compose up -d --build cortex</pre>
+        </div>
+
     </div>
-    <h2 style="font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-dim);margin:0 0 12px">Was ist neu</h2>
-    <div id="notes">{commits_html}</div>
+
     <script>
-      const hyper=document.getElementById('hyper'), cv=document.getElementById('hsc');
-      function hyperspace(ms){{
-        hyper.classList.add('on'); const ctx=cv.getContext('2d');
-        cv.width=innerWidth; cv.height=innerHeight;
-        const cx=cv.width/2, cy=cv.height/2, N=320, stars=[];
-        for(let i=0;i<N;i++) stars.push({{x:(Math.random()-0.5)*cv.width,y:(Math.random()-0.5)*cv.height,z:Math.random()*cv.width}});
-        let t0=performance.now(), raf;
-        (function frame(t){{
-          ctx.fillStyle='rgba(0,0,0,.35)'; ctx.fillRect(0,0,cv.width,cv.height);
-          ctx.strokeStyle='#cfe0ff'; ctx.lineWidth=2;
-          for(const s of stars){{
-            s.z-=18; if(s.z<1){{s.z=cv.width;s.x=(Math.random()-0.5)*cv.width;s.y=(Math.random()-0.5)*cv.height;}}
-            const k=128/s.z, x=cx+s.x*k, y=cy+s.y*k, k2=128/(s.z+18), px=cx+s.x*k2, py=cy+s.y*k2;
-            ctx.beginPath(); ctx.moveTo(px,py); ctx.lineTo(x,y); ctx.stroke();
-          }}
-          if(t-t0<ms) raf=requestAnimationFrame(frame);
-          else {{ cancelAnimationFrame(raf); hyper.classList.remove('on'); }}
-        }})(t0);
-      }}
-      document.getElementById('check').onclick=()=>{{ hyperspace(1800);
-        setTimeout(()=>document.getElementById('notes').scrollIntoView({{behavior:'smooth'}}),1400); }};
-    </script>"""
-    return HTMLResponse(page("Updates", body, active="updates"))
+        const GITHUB_REPO = 'ProfessorEngineergit/ASTRA'; 
+        let TARGET_VERSION = 'Latest'; 
+
+        const canvas = document.getElementById('spaceCanvas');
+        const ctx = canvas.getContext('2d');
+        let animationFrameId;
+        let stars = [];
+        const numStars = 180;
+        let speedSettings = {{ current: 0.8, target: 0.8, normal: 0.8, hyper: 22 }};
+
+        function resizeCanvas() {{
+            const rect = canvas.getBoundingClientRect();
+            if(!rect.width) return;
+            canvas.width = rect.width * (window.devicePixelRatio || 1);
+            canvas.height = rect.height * (window.devicePixelRatio || 1);
+            ctx.scale(window.devicePixelRatio || 1, window.devicePixelRatio || 1);
+            initStars();
+        }}
+
+        function initStars() {{
+            stars = [];
+            const dpr = window.devicePixelRatio || 1;
+            const w = canvas.width / dpr;
+            const h = canvas.height / dpr;
+            for (let i = 0; i < numStars; i++) {{
+                stars.push({{
+                    x: (Math.random() - 0.5) * w * 2,
+                    y: (Math.random() - 0.5) * h * 2,
+                    z: Math.random() * w,
+                    ox: 0, oy: 0
+                }});
+            }}
+        }}
+
+        function updateAndDrawStars() {{
+            const dpr = window.devicePixelRatio || 1;
+            const w = canvas.width / dpr;
+            const h = canvas.height / dpr;
+            const cx = w / 2; const cy = h / 2;
+
+            ctx.fillStyle = `rgba(10, 11, 16, ${{speedSettings.current > 5 ? 0.22 : 0.45}})`;
+            ctx.fillRect(0, 0, w, h);
+            speedSettings.current += (speedSettings.target - speedSettings.current) * 0.04;
+
+            for (let i = 0; i < stars.length; i++) {{
+                let s = stars[i];
+                let k = 128 / s.z;
+                let px = s.x * k + cx; let py = s.y * k + cy;
+                s.z -= speedSettings.current;
+
+                if (s.z <= 0 || px < 0 || px > w || py < 0 || py > h) {{
+                    s.z = w;
+                    s.x = (Math.random() - 0.5) * w * 2;
+                    s.y = (Math.random() - 0.5) * h * 2;
+                    px = s.ox = s.x * (128 / s.z) + cx;
+                    py = s.oy = s.y * (128 / s.z) + cy;
+                }}
+
+                let k2 = 128 / s.z;
+                let nx = s.x * k2 + cx; let ny = s.y * k2 + cy;
+
+                if (s.ox !== 0) {{
+                    ctx.beginPath();
+                    if (speedSettings.current > 5) {{
+                        ctx.strokeStyle = `rgba(160, 230, 255, ${{Math.min(1, (w - s.z) / w)}})`;
+                        ctx.lineWidth = Math.min(2.5, (1 - s.z / w) * 3);
+                    }} else {{
+                        ctx.strokeStyle = `rgba(180, 210, 255, ${{Math.min(0.6, (w - s.z) / w)}})`;
+                        ctx.lineWidth = 1;
+                    }}
+                    ctx.moveTo(px, py); ctx.lineTo(nx, ny);
+                    ctx.stroke();
+                }}
+                s.ox = nx; s.oy = ny;
+            }}
+            animationFrameId = requestAnimationFrame(updateAndDrawStars);
+        }}
+
+        window.addEventListener('resize', resizeCanvas);
+        setTimeout(resizeCanvas, 100);
+        updateAndDrawStars();
+
+        /* --- COMMITS FETCH --- */
+        async function fetchGitHubCommits() {{
+            const subtitleEl = document.getElementById('cardSubtitle');
+            const commitListEl = document.getElementById('commitList');
+
+            try {{
+                const response = await fetch(`https://api.github.com/repos/${{GITHUB_REPO}}/commits?per_page=6`);
+                if (response.ok) {{
+                    const commits = await response.json();
+                    commitListEl.innerHTML = '';
+                    const latestSha = commits[0].sha.substring(0, 7);
+                    TARGET_VERSION = latestSha;
+                    subtitleEl.innerHTML = `Mit GitHub verbunden.<br>Neueste Änderung: <b>${{latestSha}}</b>.`;
+
+                    commits.forEach(item => {{
+                        const firstLine = item.commit.message.split('\n')[0];
+                        const li = document.createElement('li');
+                        li.className = 'commit-item';
+
+                        if (firstLine.startsWith('feat')) {{
+                            li.innerHTML = `<span class="feat">feat:</span> ${{firstLine.replace(/^feat(\(.*\))?:/, '').trim()}}`;
+                        }} else if (firstLine.startsWith('fix')) {{
+                            li.innerHTML = `<span class="fix">fix:</span> ${{firstLine.replace(/^fix(\(.*\))?:/, '').trim()}}`;
+                        }} else if (firstLine.startsWith('chore')) {{
+                            li.innerHTML = `<span class="chore">chore:</span> ${{firstLine.replace(/^chore(\(.*\))?:/, '').trim()}}`;
+                        }} else {{
+                            li.innerHTML = `<span class="chore">push:</span> ${{firstLine}}`;
+                        }}
+                        commitListEl.appendChild(li);
+                    }});
+                }}
+            }} catch (error) {{
+                console.error("GitHub-Abfrage fehlgeschlagen", error);
+                subtitleEl.textContent = "Verbindung zu GitHub fehlgeschlagen.";
+            }}
+        }}
+
+        document.addEventListener('DOMContentLoaded', fetchGitHubCommits);
+
+        const card = document.getElementById('astraCard');
+        const mainUpdateBtn = document.getElementById('mainUpdateBtn');
+        const confirmWrapper = document.getElementById('confirmWrapper');
+        const releaseNotesWrapper = document.getElementById('releaseNotesWrapper');
+        const progressOverlay = document.getElementById('progressOverlay');
+        const progressNumber = document.getElementById('progressNumber');
+        const cardTitle = document.getElementById('cardTitle');
+        const cardSubtitle = document.getElementById('cardSubtitle');
+        const toggleNotesBtn = document.getElementById('toggleNotesBtn');
+        const bigVersion = document.getElementById('bigVersion');
+
+        let isNotesOpen = false;
+
+        function toggleReleaseNotes() {{
+            isNotesOpen = !isNotesOpen;
+            if (isNotesOpen) {{
+                releaseNotesWrapper.classList.add('is-open');
+                toggleNotesBtn.textContent = "Versionshinweise schließen";
+            }} else {{
+                releaseNotesWrapper.classList.remove('is-open');
+                toggleNotesBtn.textContent = "Versionshinweise lesen";
+            }}
+        }}
+
+        function showConfirmation() {{
+            mainUpdateBtn.style.display = 'none';
+            confirmWrapper.style.display = 'flex';
+        }}
+
+        function cancelUpdate() {{
+            confirmWrapper.style.display = 'none';
+            mainUpdateBtn.style.display = 'block';
+        }}
+
+        function startUpdateProcess() {{
+            if (isNotesOpen) toggleReleaseNotes();
+            toggleNotesBtn.style.display = 'none';
+
+            speedSettings.target = speedSettings.hyper;
+            card.classList.add('is-updating');
+
+            // Optionally call a python API here to run the actual update command
+            // fetch('/admin/api/do_update', {{method: 'POST'}});
+
+            let currentPercent = 0;
+            function simulateProgress() {{
+                let increment = Math.floor(Math.random() * 3) + 1;
+                if (currentPercent > 75) increment = Math.random() > 0.4 ? 1 : 0;
+                if (currentPercent > 92) increment = Math.random() > 0.7 ? 1 : 0;
+
+                currentPercent += increment;
+
+                if (currentPercent >= 100) {{
+                    currentPercent = 100;
+                    progressNumber.textContent = `${{currentPercent}}%`;
+                    showReloadState();
+                }} else {{
+                    progressNumber.textContent = `${{currentPercent}}%`;
+                    setTimeout(simulateProgress, Math.random() * 80 + 40);
+                }}
+            }}
+            setTimeout(simulateProgress, 800);
+        }}
+
+        function showReloadState() {{
+            speedSettings.target = speedSettings.normal;
+
+            setTimeout(() => {{
+                confirmWrapper.style.display = 'none';
+                mainUpdateBtn.textContent = "Seite neu laden";
+                mainUpdateBtn.setAttribute('onclick', 'location.reload()');
+                mainUpdateBtn.style.display = 'block';
+                
+                card.classList.remove('is-updating');
+                cardTitle.textContent = "Update bereitgestellt";
+                cardSubtitle.textContent = "Neu geladen wird...";
+                
+                bigVersion.textContent = TARGET_VERSION;
+                card.classList.add('has-updated');
+                
+            }}, 600);
+        }}
+    </script>
+    """
+    return HTMLResponse(page("Updates", body, active="update"))
+

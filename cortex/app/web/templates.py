@@ -356,16 +356,56 @@ hr { border: none; border-top: 1px solid var(--hair); margin: 20px 0; }
 .svc .dot.up { background: var(--ok); } .svc .dot.down { background: var(--err); }
 
 /* chat */
-.chat-wrap { display: flex; flex-direction: column; height: calc(100vh - 60px - 100px); max-width: 820px; margin: 0 auto; }
-.chat-log { flex: 1; overflow-y: auto; padding: 8px 2px 16px; display: flex; flex-direction: column; gap: 12px; }
-.msg { max-width: 78%; padding: 11px 15px; border-radius: 16px; font-size: 14.5px; line-height: 1.5;
-  white-space: pre-wrap; word-wrap: break-word; }
-.msg.user { align-self: flex-end; background: var(--accent); color: var(--accent-ink); border-bottom-right-radius: 5px; }
-.msg.bot { align-self: flex-start; background: var(--surface-2); border: 1px solid var(--border); border-bottom-left-radius: 5px; }
-.msg.sys { align-self: center; color: var(--text-faint); font-size: 12px; background: none; }
-.chat-input { display: flex; gap: 10px; padding-top: 12px; border-top: 1px solid var(--hair); }
-.chat-input textarea { flex: 1; resize: none; min-height: 46px; max-height: 160px; }
-.typing { align-self: flex-start; color: var(--text-faint); font-size: 13px; padding: 4px 8px; }
+.chat-shell { display: grid; grid-template-columns: 292px minmax(0,1fr); gap: 18px;
+  height: calc(100vh - 60px - 72px); min-height: 620px; }
+.chat-side { display: flex; flex-direction: column; gap: 14px; min-height: 0; padding: 14px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg); }
+.side-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.threads { display: flex; flex-direction: column; gap: 6px; min-height: 0; overflow: auto; }
+.thread { display: grid; gap: 4px; padding: 10px 11px; border-radius: var(--r-sm); color: var(--text-dim);
+  border: 1px solid transparent; }
+.thread:hover { background: rgba(255,255,255,.045); color: var(--text); }
+.thread.active { background: var(--surface-2); border-color: var(--border); color: var(--text); }
+.thread span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; font-weight: 600; }
+.thread small, .arch-note { color: var(--text-faint); font-size: 11px; }
+.perm-box { margin-top: auto; display: grid; gap: 8px; padding: 12px; background: var(--surface-2);
+  border: 1px solid var(--border-soft); border-radius: var(--r); }
+.perm-box label { font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .06em; }
+.perm-box p { margin: 2px 0 0; color: var(--text-faint); font-size: 11.5px; line-height: 1.4; }
+.chat-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--r-lg); overflow: hidden; }
+.chat-title { display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  padding: 15px 18px; border-bottom: 1px solid var(--hair); background: rgba(255,255,255,.018); }
+.chat-title span { display: block; color: var(--text-faint); font-size: 11px; text-transform: uppercase; letter-spacing: .07em; }
+.chat-title h1 { margin: 2px 0 0; font-size: 17px; }
+.chat-log { flex: 1; overflow-y: auto; padding: 22px; display: flex; flex-direction: column; gap: 16px; }
+.msg-row { display: flex; flex-direction: column; gap: 6px; max-width: min(760px, 88%); }
+.msg-row.user { align-self: flex-end; align-items: flex-end; }
+.msg-row.bot, .msg-row.typing { align-self: flex-start; align-items: flex-start; }
+.msg-row.sys { align-self: center; }
+.msg { padding: 12px 15px; border-radius: 15px; font-size: 14.5px; line-height: 1.52;
+  white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg.user { background: var(--accent); color: var(--accent-ink); border-bottom-right-radius: 5px; }
+.msg.bot { background: var(--surface-2); border: 1px solid var(--border); border-bottom-left-radius: 5px; }
+.msg.sys { color: var(--text-faint); font-size: 12px; background: none; }
+.msg.typing { color: var(--text-faint); background: transparent; border: 1px solid var(--border-soft); }
+.msg-actions { display: flex; gap: 6px; opacity: 0; transition: opacity .14s; }
+.msg-row:hover .msg-actions { opacity: 1; }
+.msg-actions button { border: 1px solid var(--border); color: var(--text-faint); background: var(--surface);
+  border-radius: 7px; padding: 4px 7px; font: 11px inherit; cursor: pointer; }
+.msg-actions button:hover { color: var(--text); background: var(--surface-2); }
+.action-card { display: grid; gap: 10px; margin-top: 12px; padding: 12px; background: #050507;
+  border: 1px solid rgba(245,196,81,.28); border-radius: var(--r); }
+.action-card div:first-child { display: flex; justify-content: space-between; gap: 12px; color: var(--warn); }
+.action-card span { color: var(--text-dim); font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+.action-card pre { margin: 0; max-height: 180px; overflow: auto; color: var(--text-dim);
+  font: 12px/1.45 'JetBrains Mono', monospace; white-space: pre-wrap; }
+.chat-input { display: flex; gap: 10px; align-items: flex-end; padding: 14px 18px; border-top: 1px solid var(--hair);
+  background: rgba(255,255,255,.018); }
+.chat-input textarea { flex: 1; resize: none; min-height: 46px; max-height: 180px;
+  background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: var(--r);
+  padding: 12px 13px; font: inherit; }
+.chat-input textarea:focus { outline: none; border-color: #34343f; box-shadow: 0 0 0 3px rgba(170,180,214,.12); }
 
 /* settings / labs */
 .settings-hero { display: flex; align-items: flex-start; justify-content: space-between;
@@ -464,6 +504,7 @@ def page(title: str, body: str, *, nav: bool = True, active: str = "") -> str:
             f'{navlink("/admin/chat", "Chat", "chat")}'
             f'{navlink("/admin/system", "System", "system")}'
             f'{navlink("/admin/settings", "Einstellungen", "settings")}'
+            f'{navlink("/admin/update", "Update", "update")}'
             '<form method="post" action="/admin/logout" style="display:inline;margin-left:4px">'
             '<button class="btn ghost sm" type="submit">Logout</button></form>'
             '</nav>'
