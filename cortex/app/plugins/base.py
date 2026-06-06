@@ -117,6 +117,8 @@ class Plugin(ABC):
     category: PluginCategory = PluginCategory.INFRA_AI
     icon: str = "🔌"
     config_fields: list[ConfigField] = []
+    # Catalog placeholder — shown with a "bald" badge, not yet implemented.
+    coming_soon: bool = False
     # If True, the plugin's tools are personal-assistant tools and must never be
     # exposed to third parties (the Tool objects it returns are owner_only).
     owner_only: bool = True

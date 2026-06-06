@@ -11,7 +11,7 @@ from ..config_store import SECRET_SENTINEL, get_config_store
 from ..plugins.base import CATEGORY_LABELS, FieldType
 from ..plugins.registry import get_manager
 from . import auth
-from .templates import esc, page
+from .templates import astra_mark, esc, page
 
 log = logging.getLogger("astra.web.admin")
 router = APIRouter()
@@ -47,17 +47,20 @@ async def setup_form(request: Request):
         return RedirectResponse("/admin/login", status_code=303)
     token = await auth.issue_csrf()
     body = f"""<div class="center">
-      <h2>Willkommen bei ASTRA 👋</h2>
-      <p class="note">Lege ein Admin-Passwort für die Weboberfläche fest. Du kannst dasselbe
-      wie dein Server-Passwort nehmen — empfohlen ist aber ein eigenes.</p>
-      <form method="post" action="/admin/setup">
-        <input type="hidden" name="csrf" value="{esc(token)}">
-        <div class="field"><label>Passwort (min. 8 Zeichen)</label>
-          <input type="password" name="password" required minlength="8"></div>
-        <div class="field"><label>Passwort wiederholen</label>
-          <input type="password" name="confirm" required></div>
-        <button class="btn" type="submit">Passwort setzen &amp; loslegen</button>
-      </form></div>"""
+      <div class="auth-logo">{astra_mark(52)}<span class="word">ASTRA</span></div>
+      <div class="panel">
+        <h2>Willkommen 👋</h2>
+        <p class="note" style="text-align:center;margin:-6px 0 20px">Lege ein Admin-Passwort für
+          die Weboberfläche fest.</p>
+        <form method="post" action="/admin/setup">
+          <input type="hidden" name="csrf" value="{esc(token)}">
+          <div class="field"><label>Passwort (min. 8 Zeichen)</label>
+            <input type="password" name="password" required minlength="8" autofocus></div>
+          <div class="field"><label>Passwort wiederholen</label>
+            <input type="password" name="confirm" required></div>
+          <button class="btn block" type="submit">Passwort setzen &amp; loslegen</button>
+        </form>
+      </div></div>"""
     return _html_with_csrf(page("Setup", body, nav=False), token)
 
 
@@ -85,13 +88,17 @@ async def login_form(request: Request, error: str = ""):
         return RedirectResponse("/admin/setup", status_code=303)
     token = await auth.issue_csrf()
     err = f'<div class="flash err">{esc(error)}</div>' if error else ""
-    body = f"""<div class="center"><h2>🔐 Anmeldung</h2>{err}
-      <form method="post" action="/admin/login">
-        <input type="hidden" name="csrf" value="{esc(token)}">
-        <div class="field"><label>Admin-Passwort</label>
-          <input type="password" name="password" required autofocus></div>
-        <button class="btn" type="submit">Anmelden</button>
-      </form></div>"""
+    body = f"""<div class="center">
+      <div class="auth-logo">{astra_mark(52)}<span class="word">ASTRA</span></div>
+      <div class="panel">
+        <h2>Anmeldung</h2>{err}
+        <form method="post" action="/admin/login">
+          <input type="hidden" name="csrf" value="{esc(token)}">
+          <div class="field"><label>Admin-Passwort</label>
+            <input type="password" name="password" required autofocus></div>
+          <button class="btn block" type="submit">Anmelden</button>
+        </form>
+      </div></div>"""
     return _html_with_csrf(page("Login", body, nav=False), token)
 
 
@@ -124,25 +131,27 @@ async def _favorites() -> list[str]:
     return await db.get_setting("favorites", []) or []
 
 
-@router.get("/admin", response_class=HTMLResponse)
-async def catalog(request: Request, _: bool = Depends(auth.require_admin)):
-    mgr = get_manager()
-    favs = set(await _favorites())
-    cats = {p.category for p in mgr.all()}
-    chips = '<span class="chip active" data-cat="all">Alle</span>' + "".join(
-        f'<span class="chip" data-cat="{c.value}">{esc(CATEGORY_LABELS.get(c, c.value))}</span>'
-        for c in sorted(cats, key=lambda x: x.value)
-    )
-    cards = []
-    for p in mgr.all():
-        configured = p.has_required
-        badge = ('<span class="badge b-ok">aktiv</span>' if p.enabled
-                 else '<span class="badge b-off">aus</span>' if configured
-                 else '<span class="badge b-off">nicht konfiguriert</span>')
-        cat_label = esc(CATEGORY_LABELS.get(p.category, p.category.value))
-        is_fav = p.slug in favs
-        cards.append(f"""
-        <div class="card" data-name="{esc((p.name + ' ' + p.description).lower())}"
+def _card_html(p, is_fav: bool) -> str:
+    if getattr(p, "coming_soon", False):
+        badge = '<span class="badge b-soon">bald</span>'
+        action = ('<a class="btn ghost sm" style="margin-left:auto" '
+                  f'href="/admin/plugin/{esc(p.slug)}">Details</a>')
+    elif p.enabled:
+        badge = '<span class="badge b-ok">aktiv</span>'
+        action = (f'<a class="btn secondary sm" style="margin-left:auto" '
+                  f'href="/admin/plugin/{esc(p.slug)}">Verwalten</a>')
+    elif p.has_required:
+        badge = '<span class="badge b-off">bereit</span>'
+        action = (f'<a class="btn sm" style="margin-left:auto" '
+                  f'href="/admin/plugin/{esc(p.slug)}">Aktivieren →</a>')
+    else:
+        badge = '<span class="badge b-off">nicht konfiguriert</span>'
+        action = (f'<a class="btn secondary sm" style="margin-left:auto" '
+                  f'href="/admin/plugin/{esc(p.slug)}">Einrichten →</a>')
+    cat_label = esc(CATEGORY_LABELS.get(p.category, p.category.value))
+    return f"""
+        <div class="card {'on' if p.enabled else ''}"
+             data-name="{esc((p.name + ' ' + p.description).lower())}"
              data-cat="{p.category.value}" data-fav="{'1' if is_fav else '0'}">
           <div class="top">
             <span class="icon">{esc(p.icon)}</span>
@@ -154,30 +163,80 @@ async def catalog(request: Request, _: bool = Depends(auth.require_admin)):
                     title="Favorit">★</button>
           </div>
           <p>{esc(p.description)}</p>
-          <div class="row">{badge}
-            <a class="btn secondary sm" style="margin-left:auto"
-               href="/admin/plugin/{esc(p.slug)}">Einrichten →</a>
+          <div class="row">{badge}{action}</div>
+        </div>"""
+
+
+@router.get("/admin", response_class=HTMLResponse)
+async def catalog(request: Request, _: bool = Depends(auth.require_admin)):
+    mgr = get_manager()
+    favs = set(await _favorites())
+    plugins = mgr.all()
+    n_active = sum(1 for p in plugins if p.enabled)
+    n_ready = sum(1 for p in plugins if p.has_required and not p.enabled
+                  and not getattr(p, "coming_soon", False))
+
+    # Category chips (ordered by the canonical CATEGORY_LABELS order).
+    cat_order = [c for c in CATEGORY_LABELS if any(p.category == c for p in plugins)]
+    chips = '<span class="chip active" data-cat="all">Alle</span>' + "".join(
+        f'<span class="chip" data-cat="{c.value}">{esc(CATEGORY_LABELS.get(c, c.value))}</span>'
+        for c in cat_order
+    )
+
+    # Cards grouped into category sections.
+    sections = []
+    for c in cat_order:
+        members = [p for p in plugins if p.category == c]
+        cards = "".join(_card_html(p, p.slug in favs) for p in members)
+        sections.append(f"""
+        <div class="section" data-section="{c.value}">
+          <div class="section-head">
+            <h2>{esc(CATEGORY_LABELS.get(c, c.value))}</h2>
+            <span class="count">{len(members)}</span>
           </div>
+          <div class="grid">{cards}</div>
         </div>""")
 
+    search_icon = ('<svg width="17" height="17" viewBox="0 0 24 24" fill="none" '
+                   'stroke="currentColor" stroke-width="2" stroke-linecap="round">'
+                   '<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>')
+
     body = f"""
-    <div class="toolbar">
-      <input class="search" id="q" type="text" placeholder="🔍 Plugins suchen…">
-      <label class="note"><input type="checkbox" id="favonly"> nur Favoriten</label>
+    <div class="hero">
+      <h1>Deine <span class="grad">Integrationen</span></h1>
+      <p>Verbinde ASTRA mit deiner Welt — Verkehr, Smart Home, Server, Messenger und mehr.</p>
+      <div class="stats">
+        <div class="stat"><span class="dot" style="background:var(--ok)"></span><b>{n_active}</b> aktiv</div>
+        <div class="stat"><span class="dot" style="background:var(--aurora-1)"></span><b>{n_ready}</b> startklar</div>
+        <div class="stat"><span class="dot" style="background:var(--text-faint)"></span><b>{len(plugins)}</b> insgesamt</div>
+      </div>
     </div>
-    <div class="toolbar" id="chips">{chips}</div>
-    <div class="grid" id="grid">{''.join(cards)}</div>
+    <div class="toolbar">
+      <div class="searchwrap">{search_icon}
+        <input class="search" id="q" type="text" placeholder="Plugins durchsuchen…"></div>
+      <label class="switch"><input type="checkbox" id="favonly" class="toggle"
+        style="width:40px;height:23px"> nur Favoriten</label>
+    </div>
+    <div class="chips" id="chips">{chips}</div>
+    <div id="sections">{''.join(sections)}</div>
+    <div class="empty" id="empty" style="display:none">Keine Plugins gefunden.</div>
     <script>
       const q=document.getElementById('q'), favonly=document.getElementById('favonly');
       let cat='all';
       function apply() {{
-        const term=q.value.toLowerCase();
-        document.querySelectorAll('.card').forEach(c=>{{
-          const okQ=c.dataset.name.includes(term);
-          const okC=cat==='all'||c.dataset.cat===cat;
-          const okF=!favonly.checked||c.dataset.fav==='1';
-          c.style.display=(okQ&&okC&&okF)?'':'none';
+        const term=q.value.toLowerCase(); let anyVisible=false;
+        document.querySelectorAll('.section').forEach(sec=>{{
+          let shown=0;
+          sec.querySelectorAll('.card').forEach(c=>{{
+            const okQ=c.dataset.name.includes(term);
+            const okC=cat==='all'||c.dataset.cat===cat;
+            const okF=!favonly.checked||c.dataset.fav==='1';
+            const ok=okQ&&okC&&okF;
+            c.style.display=ok?'':'none'; if(ok) shown++;
+          }});
+          sec.style.display=shown?'':'none'; if(shown) anyVisible=true;
         }});
+        document.getElementById('empty').style.display=anyVisible?'none':'';
       }}
       q.oninput=apply; favonly.onchange=apply;
       document.querySelectorAll('#chips .chip').forEach(ch=>ch.onclick=()=>{{
@@ -190,7 +249,7 @@ async def catalog(request: Request, _: bool = Depends(auth.require_admin)):
         s.closest('.card').dataset.fav=d.favorite?'1':'0'; apply();
       }});
     </script>"""
-    return HTMLResponse(page("Plugins", body))
+    return HTMLResponse(page("Plugins", body, active="plugins"))
 
 
 # ─── Plugin config form ───────────────────────────────────────────────────────
@@ -226,27 +285,21 @@ async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.requir
     for f in cls.config_fields:
         val = "" if f.secret else inst.get(f.key, f.default)
         help_ = f'<div class="help">{esc(f.help)}</div>' if f.help else ""
-        req = ' <span style="color:#f87171">*</span>' if f.required else ""
+        req = ' <span class="req">*</span>' if f.required else ""
         fields_html += (f'<div class="field"><label>{esc(f.label)}{req}</label>'
                         f'{_field_input(f, val, meta.get(f.key, False))}{help_}</div>')
 
+    soon = getattr(cls, "coming_soon", False)
+    soon_banner = ('<div class="flash err">🚧 Dieses Plugin ist im Katalog gelistet, aber noch '
+                   'nicht implementiert. Sag ASTRA, wenn du es priorisiert haben möchtest.</div>'
+                   if soon else "")
+    cat_label = esc(CATEGORY_LABELS.get(cls.category, cls.category.value))
     toggled = "checked" if inst.is_toggled_on else ""
-    body = f"""
-    <p><a href="/admin">← Alle Plugins</a></p>
-    <h2>{esc(cls.icon)} {esc(cls.name)}</h2>
-    <p class="note">{esc(cls.description)}</p>{flash}
-    <form method="post" action="/admin/plugin/{esc(slug)}">
-      <input type="hidden" name="csrf" value="{esc(token)}">
-      <div class="field"><label class="row">
-        <input class="toggle" type="checkbox" name="__enabled" {toggled}>
-        <span style="margin-left:10px">Plugin aktiviert</span></label></div>
-      {fields_html}
-      <div class="row">
-        <button class="btn" type="submit">Speichern</button>
-        <button class="btn secondary" type="button" id="testbtn">Verbindung testen</button>
-        <span id="testresult" class="note"></span>
-      </div>
-    </form>
+    test_btn = ('' if soon else
+                '<button class="btn secondary" type="button" id="testbtn">Verbindung testen</button>'
+                '<span id="testresult" class="note"></span>')
+    save_btn = ('' if soon else '<button class="btn" type="submit">Speichern</button>')
+    test_script = '' if soon else f"""
     <script>
       document.getElementById('testbtn').onclick=async()=>{{
         const out=document.getElementById('testresult'); out.textContent='Teste…';
@@ -256,7 +309,31 @@ async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.requir
         out.textContent=(d.state==='ok'?'✅ ':d.state==='error'?'❌ ':'• ')+d.message;
       }};
     </script>"""
-    return _html_with_csrf(page(cls.name, body), token)
+
+    body = f"""
+    <div class="crumb"><a href="/admin">← Alle Plugins</a> · {cat_label}</div>
+    <div class="hero" style="display:flex;align-items:center;gap:16px;margin-bottom:20px">
+      <span class="icon" style="font-size:34px;width:60px;height:60px;display:grid;
+        place-items:center;background:var(--surface-2);border:1px solid var(--border-soft);
+        border-radius:var(--r-lg)">{esc(cls.icon)}</span>
+      <div><h1 style="font-size:24px;margin:0 0 4px">{esc(cls.name)}</h1>
+        <p style="margin:0">{esc(cls.description)}</p></div>
+    </div>
+    {soon_banner}{flash}
+    <form method="post" action="/admin/plugin/{esc(slug)}">
+      <input type="hidden" name="csrf" value="{esc(token)}">
+      <div class="panel">
+        <div class="toggle-row" style="margin-bottom:20px">
+          <input class="toggle" type="checkbox" name="__enabled" {toggled}>
+          <div><div style="font-weight:600;font-size:14px">Plugin aktiviert</div>
+            <div class="note" style="font-size:12px">Tools werden sofort scharf geschaltet — ohne Neustart.</div></div>
+        </div>
+        {fields_html or '<p class="note">Keine Konfiguration nötig.</p>'}
+        <hr>
+        <div class="row">{save_btn}{test_btn}</div>
+      </div>
+    </form>{test_script}"""
+    return _html_with_csrf(page(cls.name, body, active="plugins"), token)
 
 
 def _values_from_form(cls, form) -> dict:

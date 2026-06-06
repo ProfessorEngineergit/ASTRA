@@ -53,7 +53,7 @@ def test_setup_then_catalog_and_logout(memdb):
     r = c.get("/admin")
     assert r.status_code == 200
     assert "RMV" in r.text and "Home Assistant" in r.text
-    assert "Plugins suchen" in r.text          # search box present
+    assert "durchsuchen" in r.text             # search box present
 
     # Logout clears the session; /admin redirects back to login.
     c.post("/admin/logout", follow_redirects=False)
