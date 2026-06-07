@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from pathlib import Path
 
 from . import db, sysinfo
 from .config_store import SECRET_SENTINEL, get_config_store
 from .models import set_model_override
 from .plugins.base import CATEGORY_LABELS
 from .plugins.registry import get_manager
+from .plugins import extended_catalog
 from .tools import REGISTRY, Tool, ToolContext, capability_manifest, dispatch, register
 
 log = logging.getLogger("astra.admin_tools")
@@ -80,6 +83,19 @@ async def _integration_details(args: dict, ctx: ToolContext) -> str:
     return "\n".join(lines)
 
 
+async def _integration_installations(args: dict, ctx: ToolContext) -> str:
+    mgr = get_manager()
+    slug = args.get("slug", "")
+    cls = mgr.plugin_class(slug)
+    if not cls:
+        return f"Unbekannte Integration '{slug}'."
+    rows = []
+    for p in mgr.installations(slug):
+        state = "aktiv" if p.enabled else "aus" if p.has_required else "unvollständig"
+        rows.append(f"• {p.installation_id} — {p.installation_name} [{state}] → {p.runtime_slug}")
+    return "\n".join(rows) if rows else "Keine Installationen."
+
+
 async def _configure_integration(args: dict, ctx: ToolContext) -> str:
     if not await _writes_allowed(ctx):
         return "Selbst-Konfiguration ist deaktiviert (Einstellungen → allow_self_config)."
@@ -120,7 +136,8 @@ async def _configure_integration(args: dict, ctx: ToolContext) -> str:
 
 
 async def _test_integration(args: dict, ctx: ToolContext) -> str:
-    inst = get_manager().get(args.get("slug", ""))
+    slug = args.get("runtime_slug") or args.get("slug", "")
+    inst = get_manager().get(slug)
     if not inst:
         return "Unbekannte Integration."
     try:
@@ -128,6 +145,47 @@ async def _test_integration(args: dict, ctx: ToolContext) -> str:
         return f"{hs.state.value} — {hs.message}"
     except Exception as e:  # noqa: BLE001
         return f"Fehler: {e}"
+
+
+async def _list_plugin_catalog(args: dict, ctx: ToolContext) -> str:
+    q = (args.get("query") or "").lower()
+    native = []
+    for p in get_manager().all():
+        if q and q not in (p.slug + " " + p.name + " " + p.description).lower():
+            continue
+        native.append(f"• nativ:{p.slug} — {p.name} [{CATEGORY_LABELS.get(p.category, '')}]")
+    catalog = []
+    for e in extended_catalog.all_entries():
+        if q and q not in (e.slug + " " + e.name + " " + e.description).lower():
+            continue
+        catalog.append(f"• katalog:{e.slug} — {e.name} [{CATEGORY_LABELS.get(e.category, '')}]")
+    rows = (native + catalog)[:100]
+    return f"{len(rows)} passende Plugin-Einträge:\n" + "\n".join(rows) if rows else "Keine passenden Plugin-Einträge."
+
+
+async def _create_plugin_stub(args: dict, ctx: ToolContext) -> str:
+    if not await _writes_allowed(ctx):
+        return "Selbst-Konfiguration ist deaktiviert (Einstellungen → allow_self_config)."
+    slug = str(args.get("slug") or "").strip().lower().replace("-", "_")
+    if not re.fullmatch(r"[a-z][a-z0-9_]{2,40}", slug):
+        return "Ungültiger slug. Erlaubt: a-z, 0-9, _, beginnt mit Buchstabe."
+    name = str(args.get("name") or slug.replace("_", " ").title()).strip()
+    description = str(args.get("description") or "Neue ASTRA-Integration.").strip()
+    category_raw = str(args.get("category") or "productivity").strip()
+    category = next((c for c in CATEGORY_LABELS if c.value == category_raw), None)
+    if category is None:
+        return "Ungültige Kategorie. Nutze: " + ", ".join(c.value for c in CATEGORY_LABELS)
+    root = Path(__file__).resolve().parent / "plugins" / "builtin"
+    target = root / f"{slug}.py"
+    if target.exists():
+        return f"Plugin-Datei existiert bereits: {target}"
+    class_name = "".join(part.capitalize() for part in slug.split("_")) + "Plugin"
+    target.write_text(
+        f'''""" {name} — generated ASTRA plugin stub. """\nfrom __future__ import annotations\n\nfrom ...tools import Tool, ToolContext, tool_result\nfrom ..base import ConfigField, HealthStatus, Plugin, PluginCategory\n\n\nclass {class_name}(Plugin):\n    slug = "{slug}"\n    name = "{name}"\n    description = "{description}"\n    category = PluginCategory.{category.name}\n    icon = "🔌"\n    config_fields = [\n        ConfigField("base_url", "Basis-URL", required=False),\n    ]\n\n    async def health_check(self) -> HealthStatus:\n        if not self.is_toggled_on:\n            return HealthStatus.disabled()\n        return HealthStatus.ok("Plugin-Stub ist installiert. Implementierung fehlt noch.")\n\n    def tools(self) -> list[Tool]:\n        async def _status(args: dict, ctx: ToolContext) -> str:\n            return tool_result(ok=True, summary="{name} ist als Stub installiert.", source=self.slug)\n\n        return [Tool(\n            name="{slug}_status",\n            description="Status der {name}-Integration.",\n            parameters={{"type": "object", "properties": {{}}}},\n            handler=_status,\n            owner_only=True,\n            source=self.slug,\n            safety="private_read",\n            intents=["status"],\n        )]\n''',
+        encoding="utf-8",
+    )
+    await db.audit("plugin_stub_created", actor="astra", detail={"slug": slug, "path": str(target)})
+    return f"Plugin-Stub angelegt: {target}. Danach Tests laufen lassen und PluginManager neu laden."
 
 
 async def _list_capabilities(args: dict, ctx: ToolContext) -> str:
@@ -244,6 +302,9 @@ def register_admin_tools() -> None:
         ("astra_integration_details", "Zeige Konfigfelder + Status einer Integration (Secrets maskiert).",
          {"type": "object", "properties": {"slug": {"type": "string"}}, "required": ["slug"]},
          _integration_details),
+        ("astra_integration_installations", "Liste Installationen einer Integration mit runtime_slug.",
+         {"type": "object", "properties": {"slug": {"type": "string"}}, "required": ["slug"]},
+         _integration_installations),
         ("astra_configure_integration",
          "Konfiguriere & (de)aktiviere eine eigene Integration. 'config' = Objekt aus Feld→Wert.",
          {"type": "object", "properties": {
@@ -252,8 +313,19 @@ def register_admin_tools() -> None:
              "config": {"type": "object", "description": "Feld→Wert, z. B. {\"api_key\":\"…\"}"}},
           "required": ["slug"]}, _configure_integration),
         ("astra_test_integration", "Teste die Verbindung einer Integration (health_check).",
-         {"type": "object", "properties": {"slug": {"type": "string"}}, "required": ["slug"]},
+         {"type": "object", "properties": {"slug": {"type": "string"}, "runtime_slug": {"type": "string"}},
+          "required": ["slug"]},
          _test_integration),
+        ("astra_list_plugin_catalog", "Liste native und katalogisierte Plugins, die ASTRA einrichten oder priorisieren kann.",
+         {"type": "object", "properties": {"query": {"type": "string"}}}, _list_plugin_catalog),
+        ("astra_create_plugin_stub",
+         "Lege eine neue native Plugin-Datei als Stub an. Mutiert den Quellcode und braucht Freigabe im Ask-Modus.",
+         {"type": "object", "properties": {
+             "slug": {"type": "string"},
+             "name": {"type": "string"},
+             "description": {"type": "string"},
+             "category": {"type": "string"}},
+          "required": ["slug", "name", "category"]}, _create_plugin_stub),
         ("astra_get_settings", "Zeige ASTRAs aktuelle Einstellungen (Modell, Autonomie, Standort …).",
          {"type": "object", "properties": {}}, _get_settings),
         ("astra_update_settings",
@@ -277,7 +349,8 @@ def register_admin_tools() -> None:
     ]
     for name, desc, params, handler in defs:
         safety = "mutation" if name in {
-            "astra_configure_integration", "astra_update_settings", "astra_test_capability"
+            "astra_configure_integration", "astra_update_settings", "astra_test_capability",
+            "astra_create_plugin_stub"
         } else "private_read"
         intents = ["status", "list"] if "list" in name or "status" in name else ["control"] if safety == "mutation" else ["status"]
         register(Tool(name=name, description=desc, parameters=params, handler=handler,

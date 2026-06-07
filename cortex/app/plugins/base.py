@@ -137,6 +137,10 @@ class Plugin(ABC):
     def __init__(self, cfg: Mapping[str, Any]):
         # cfg is already merged (DB > .env > default) and type-coerced.
         self.cfg: dict[str, Any] = dict(cfg)
+        self.installation_id = str(self.cfg.get("__installation_id") or "default")
+        self.installation_name = str(self.cfg.get("__installation_name") or "Standard")
+        self.base_slug = str(self.cfg.get("__base_slug") or self.slug)
+        self.runtime_slug = str(self.cfg.get("__runtime_slug") or self.slug)
 
     # ── config helpers ───────────────────────────────────────────────────────
     def get(self, key: str, default: Any = None) -> Any:

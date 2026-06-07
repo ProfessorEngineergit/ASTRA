@@ -12,6 +12,7 @@ import asyncio
 import importlib
 import logging
 import pkgutil
+import re
 
 from .. import tools
 from ..config_store import get_config_store
@@ -43,6 +44,13 @@ class PluginManager:
         self._instances: dict[str, Plugin] = {}
         self._bg_tasks: dict[str, list[asyncio.Task]] = {}
 
+    @staticmethod
+    def _tool_name_for_installation(tool_name: str, install_id: str) -> str:
+        if install_id == "default":
+            return tool_name
+        suffix = re.sub(r"[^a-zA-Z0-9_]", "_", install_id).strip("_") or "extra"
+        return f"{tool_name}__{suffix}"[:64]
+
     # ── loading ──────────────────────────────────────────────────────────────
     async def load_all(self) -> None:
         """(Re)instantiate every plugin from current config."""
@@ -52,8 +60,9 @@ class PluginManager:
         self._instances = {}
         for cls in self._classes:
             try:
-                cfg = await store.load(cls)
-                self._instances[cls.slug] = cls(cfg)
+                for cfg in await store.load_installations(cls):
+                    key = str(cfg.get("__runtime_slug") or cls.slug)
+                    self._instances[key] = cls(cfg)
             except Exception:  # noqa: BLE001 — one bad plugin must not break the rest
                 log.exception("Failed to load plugin %s", getattr(cls, "slug", "?"))
 
@@ -67,7 +76,16 @@ class PluginManager:
         return None
 
     def all(self) -> list[Plugin]:
-        return sorted(self._instances.values(), key=lambda p: (p.category.value, p.name))
+        return sorted(
+            [p for p in self._instances.values() if p.installation_id == "default"],
+            key=lambda p: (p.category.value, p.name),
+        )
+
+    def installations(self, slug: str) -> list[Plugin]:
+        return sorted(
+            [p for p in self._instances.values() if p.base_slug == slug],
+            key=lambda p: (p.installation_id != "default", p.installation_name.lower()),
+        )
 
     def enabled(self) -> list[Plugin]:
         return [p for p in self._instances.values() if p.enabled]
@@ -78,14 +96,17 @@ class PluginManager:
         for p in self.enabled():
             try:
                 for t in p.tools():
-                    t.source = p.slug
+                    t.name = self._tool_name_for_installation(t.name, p.installation_id)
+                    t.source = p.runtime_slug
+                    if p.installation_id != "default":
+                        t.description = f"{t.description} Installation: {p.installation_name}."
                     tools.register(t)
             except Exception:  # noqa: BLE001
-                log.exception("Tool registration failed for plugin %s", p.slug)
+                log.exception("Tool registration failed for plugin %s", p.runtime_slug)
 
     # ── background tasks ─────────────────────────────────────────────────────
     def _sync_background_tasks(self) -> None:
-        enabled_slugs = {p.slug for p in self.enabled()}
+        enabled_slugs = {p.runtime_slug for p in self.enabled()}
         # cancel tasks of plugins no longer enabled
         for slug in list(self._bg_tasks):
             if slug not in enabled_slugs:
@@ -93,14 +114,14 @@ class PluginManager:
                     t.cancel()
         # start tasks for newly enabled plugins
         for p in self.enabled():
-            if p.slug in self._bg_tasks:
+            if p.runtime_slug in self._bg_tasks:
                 continue
             coros = p.background_tasks()
             if coros:
-                self._bg_tasks[p.slug] = [
-                    asyncio.create_task(c, name=f"plugin:{p.slug}") for c in coros
+                self._bg_tasks[p.runtime_slug] = [
+                    asyncio.create_task(c, name=f"plugin:{p.runtime_slug}") for c in coros
                 ]
-                log.info("Started %d background task(s) for plugin %s", len(coros), p.slug)
+                log.info("Started %d background task(s) for plugin %s", len(coros), p.runtime_slug)
 
     async def rebuild(self) -> None:
         """Reload config, re-register tools, resync background tasks."""
@@ -108,7 +129,7 @@ class PluginManager:
         self._register_tools()
         self._sync_background_tasks()
         log.info("Plugins rebuilt — enabled: %s",
-                 ", ".join(p.slug for p in self.enabled()) or "(none)")
+                 ", ".join(p.runtime_slug for p in self.enabled()) or "(none)")
 
     # ── aggregation for other subsystems ─────────────────────────────────────
     async def briefing_sections(self) -> list[str]:

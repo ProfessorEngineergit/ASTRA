@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -28,6 +29,8 @@ log = logging.getLogger("astra.config_store")
 # Placeholder the admin form shows for an already-set secret; submitting it back
 # unchanged means "keep the existing value".
 SECRET_SENTINEL = "__keep__"
+INSTALLATIONS_KEY = "__installations"
+DEFAULT_INSTALLATION_ID = "default"
 
 
 class ConfigStore:
@@ -124,6 +127,132 @@ class ConfigStore:
             else:
                 meta[f.key] = False
         return meta
+
+    def _installation_slug(self, plugin_cls: type, install_id: str) -> str:
+        return plugin_cls.slug if install_id == DEFAULT_INSTALLATION_ID else f"{plugin_cls.slug}:{install_id}"
+
+    def _installation_label(self, plugin_cls: type, raw: dict, index: int) -> str:
+        return str(raw.get("name") or raw.get("label") or f"Installation {index + 1}").strip()
+
+    def _serialize_secret(self, value: Any) -> str:
+        return self.encrypt(str(value))
+
+    def _deserialize_secret(self, value: Any) -> str:
+        return self.decrypt(str(value)) if value else ""
+
+    async def load_installations(self, plugin_cls: type) -> list[dict[str, Any]]:
+        """Return every configured installation for one plugin.
+
+        The default installation reuses the historical flat plugin_config rows.
+        Extra installations are stored as one JSON document so old deployments do
+        not need a schema migration.
+        """
+        base = await self.load(plugin_cls)
+        base.update({
+            "__base_slug": plugin_cls.slug,
+            "__runtime_slug": plugin_cls.slug,
+            "__installation_id": DEFAULT_INSTALLATION_ID,
+            "__installation_name": "Standard",
+            "__master_enabled": bool(base.get("__enabled")),
+        })
+        stored = await db.plugin_config_all(plugin_cls.slug)
+        raw_items = stored.get(INSTALLATIONS_KEY, {}).get("value") or []
+        installs = [base]
+        if not isinstance(raw_items, list):
+            raw_items = []
+        master_enabled = bool(base.get("__enabled"))
+        for i, item in enumerate(raw_items):
+            if not isinstance(item, dict):
+                continue
+            install_id = str(item.get("id") or uuid4().hex[:8]).strip()
+            cfg: dict[str, Any] = {}
+            values = item.get("values") if isinstance(item.get("values"), dict) else {}
+            secrets = item.get("secrets") if isinstance(item.get("secrets"), dict) else {}
+            for f in plugin_cls.config_fields:
+                if f.secret:
+                    raw = self._deserialize_secret(secrets.get(f.key))
+                    if raw in (None, ""):
+                        raw = f.default
+                else:
+                    raw = values.get(f.key, f.default)
+                cfg[f.key] = f.coerce(raw)
+            enabled = bool(item.get("enabled", False)) and master_enabled
+            cfg.update({
+                "__enabled": enabled,
+                "__instance_enabled": bool(item.get("enabled", False)),
+                "__master_enabled": master_enabled,
+                "__base_slug": plugin_cls.slug,
+                "__runtime_slug": self._installation_slug(plugin_cls, install_id),
+                "__installation_id": install_id,
+                "__installation_name": self._installation_label(plugin_cls, item, i),
+            })
+            installs.append(cfg)
+        return installs
+
+    async def installation_meta(self, plugin_cls: type, install_id: str) -> dict[str, bool]:
+        if install_id == DEFAULT_INSTALLATION_ID:
+            return await self.stored_meta(plugin_cls)
+        stored = await db.plugin_config_all(plugin_cls.slug)
+        raw_items = stored.get(INSTALLATIONS_KEY, {}).get("value") or []
+        item = next((x for x in raw_items if isinstance(x, dict) and str(x.get("id")) == install_id), {})
+        values = item.get("values") if isinstance(item.get("values"), dict) else {}
+        secrets = item.get("secrets") if isinstance(item.get("secrets"), dict) else {}
+        return {f.key: bool((secrets if f.secret else values).get(f.key)) for f in plugin_cls.config_fields}
+
+    async def save_installation(
+        self,
+        plugin_cls: type,
+        install_id: str,
+        values: dict[str, Any],
+        enabled: bool,
+        *,
+        name: str = "",
+    ) -> str:
+        if install_id in ("", DEFAULT_INSTALLATION_ID):
+            await self.save(plugin_cls, values, enabled)
+            return DEFAULT_INSTALLATION_ID
+        stored = await db.plugin_config_all(plugin_cls.slug)
+        raw_items = stored.get(INSTALLATIONS_KEY, {}).get("value") or []
+        if not isinstance(raw_items, list):
+            raw_items = []
+        if install_id == "__new__":
+            install_id = uuid4().hex[:8]
+            raw_items.append({"id": install_id, "name": name or "Neue Installation", "enabled": enabled})
+        item = next((x for x in raw_items if isinstance(x, dict) and str(x.get("id")) == install_id), None)
+        if item is None:
+            item = {"id": install_id}
+            raw_items.append(item)
+        item["name"] = (name or item.get("name") or "Installation").strip()
+        item["enabled"] = bool(enabled)
+        item.setdefault("values", {})
+        item.setdefault("secrets", {})
+        for f in plugin_cls.config_fields:
+            submitted = values.get(f.key)
+            if f.secret:
+                if submitted in (None, "", SECRET_SENTINEL):
+                    continue
+                item["secrets"][f.key] = self._serialize_secret(submitted)
+            else:
+                item["values"][f.key] = f.coerce(submitted)
+        await db.plugin_config_set(plugin_cls.slug, INSTALLATIONS_KEY, raw_items, False)
+        try:
+            await db.audit(
+                "config_change", actor="owner",
+                detail={"plugin": plugin_cls.slug, "installation": install_id, "enabled": bool(enabled)},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return install_id
+
+    async def delete_installation(self, plugin_cls: type, install_id: str) -> None:
+        if install_id == DEFAULT_INSTALLATION_ID:
+            return
+        stored = await db.plugin_config_all(plugin_cls.slug)
+        raw_items = stored.get(INSTALLATIONS_KEY, {}).get("value") or []
+        if not isinstance(raw_items, list):
+            return
+        raw_items = [x for x in raw_items if not (isinstance(x, dict) and str(x.get("id")) == install_id)]
+        await db.plugin_config_set(plugin_cls.slug, INSTALLATIONS_KEY, raw_items, False)
 
     async def save(self, plugin_cls: type, values: dict[str, Any], enabled: bool) -> None:
         """Persist submitted form values. Empty secret + SECRET_SENTINEL = unchanged."""

@@ -439,6 +439,12 @@ main:has(.chat-shell) { max-width: 1680px; padding: 18px 18px 44px; }
 .chat-input textarea:focus { outline: none; border-color: #34343f; box-shadow: 0 0 0 3px rgba(170,180,214,.12); }
 .chat-input.archived { justify-content: space-between; align-items: center; }
 .chat-input.archived p { margin: 0; color: var(--text-dim); font-size: 13px; }
+.upload-btn { flex: 0 0 auto; margin-bottom: 4px; }
+.attachments { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.attachment { display: inline-flex; align-items: center; gap: 7px; max-width: 260px; padding: 7px 9px;
+  border: 1px solid var(--hair); border-radius: 8px; background: rgba(255,255,255,.035); color: var(--text); text-decoration: none; }
+.attachment b { font-size: 10px; color: var(--text-faint); text-transform: uppercase; }
+.attachment span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 
 /* settings / labs */
 .settings-hero { display: flex; align-items: flex-start; justify-content: space-between;

@@ -62,3 +62,23 @@ def test_no_required_fields_defaults_off(memdb):
     cfg = asyncio.run(get_config_store().load(_NoRequired))
     assert cfg["__enabled"] is False           # no required fields → must opt in
     assert cfg["list"] == "@default"
+
+
+def test_extra_installation_keeps_own_secret_and_toggle(memdb):
+    cs = get_config_store()
+    install_id = asyncio.run(cs.save_installation(
+        _Demo,
+        "__new__",
+        {"api_key": "K2", "region": "server2"},
+        True,
+        name="Server 2",
+    ))
+
+    installs = asyncio.run(cs.load_installations(_Demo))
+    extra = next(i for i in installs if i["__installation_id"] == install_id)
+
+    assert extra["__installation_name"] == "Server 2"
+    assert extra["api_key"] == "K2"
+    assert extra["region"] == "server2"
+    assert extra["__instance_enabled"] is True
+    assert extra["__enabled"] is False         # master/default is still off

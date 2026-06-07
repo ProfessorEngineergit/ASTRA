@@ -11,7 +11,7 @@ from shutil import which
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
 from .. import __version__ as ASTRA_VERSION
 from .. import db, sysinfo
@@ -566,7 +566,7 @@ def _lab_tile(title: str, eyebrow: str, body: str, control: str) -> str:
     )
 
 
-def _card_html(p, is_fav: bool) -> str:
+def _card_html(p, is_fav: bool, installation_count: int = 1) -> str:
     if getattr(p, "coming_soon", False):
         badge = '<span class="badge b-soon">bald</span>'
         action = ('<a class="btn ghost sm" style="margin-left:auto" '
@@ -584,6 +584,10 @@ def _card_html(p, is_fav: bool) -> str:
         action = (f'<a class="btn secondary sm" style="margin-left:auto" '
                   f'href="/admin/plugin/{esc(p.slug)}">Einrichten →</a>')
     cat_label = esc(CATEGORY_LABELS.get(p.category, p.category.value))
+    install_tag = (
+        f'<span class="badge b-off">{installation_count} Installationen</span>'
+        if installation_count > 1 else ""
+    )
     return f"""
         <div class="card {'on' if p.enabled else ''}"
              data-slug="{esc(p.slug)}"
@@ -600,7 +604,7 @@ def _card_html(p, is_fav: bool) -> str:
                     title="Favorit">★</button>
           </div>
           <p>{esc(p.description)}</p>
-          <div class="row">{badge}{action}</div>
+          <div class="row">{badge}{install_tag}{action}</div>
         </div>"""
 
 
@@ -666,7 +670,7 @@ async def catalog(request: Request, _: bool = Depends(auth.require_admin)):
         entries = [e for e in cat_entries if e.category == c]
         if not members and not entries:
             continue
-        cards = "".join(_card_html(p, p.slug in favs) for p in members)
+        cards = "".join(_card_html(p, p.slug in favs, len(mgr.installations(p.slug))) for p in members)
         cards += "".join(_catalog_card_html(e) for e in entries)
         sections.append(f"""
         <div class="section" data-section="{c.value}">
@@ -805,20 +809,22 @@ def _field_input(f, value, is_set: bool) -> str:
 
 @router.get("/admin/plugin/{slug}", response_class=HTMLResponse)
 async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.require_admin),
-                      saved: str = ""):
+                      saved: str = "", installation: str = "default"):
     mgr = get_manager()
     cls = mgr.plugin_class(slug)
     inst = mgr.get(slug)
     if not cls or not inst:
         return HTMLResponse(page("?", '<div class="flash err">Unbekanntes Plugin.</div>'), 404)
     store = get_config_store()
-    meta = await store.stored_meta(cls)
+    installations = mgr.installations(slug)
+    active_inst = next((p for p in installations if p.installation_id == installation), installations[0])
+    meta = await store.installation_meta(cls, active_inst.installation_id)
     token = await auth.issue_csrf()
     flash = '<div class="flash ok">Gespeichert.</div>' if saved else ""
 
     fields_html = ""
     for f in cls.config_fields:
-        val = "" if f.secret else inst.get(f.key, f.default)
+        val = "" if f.secret else active_inst.get(f.key, f.default)
         help_ = f'<div class="help">{esc(f.help)}</div>' if f.help else ""
         req = ' <span class="req">*</span>' if f.required else ""
         fields_html += (f'<div class="field"><label>{esc(f.label)}{req}</label>'
@@ -830,6 +836,17 @@ async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.requir
                    if soon else "")
     cat_label = esc(CATEGORY_LABELS.get(cls.category, cls.category.value))
     toggled = "checked" if inst.is_toggled_on else ""
+    install_rows = []
+    for p in installations:
+        selected = " active" if p.installation_id == active_inst.installation_id else ""
+        state = "aktiv" if p.enabled else "aus" if p.has_required else "unvollständig"
+        href = f"/admin/plugin/{esc(slug)}?installation={esc(p.installation_id)}"
+        install_rows.append(
+            f'<a class="install-card{selected}" href="{href}">'
+            f'<strong>{esc(p.installation_name)}</strong>'
+            f'<span>{esc(state)} · {esc(p.runtime_slug)}</span></a>'
+        )
+    create_href = f"/admin/plugin/{esc(slug)}/installation/new"
     test_btn = ('' if soon else
                 '<button class="btn secondary" type="button" id="testbtn">Verbindung testen</button>'
                 '<span id="testresult" class="note"></span>')
@@ -839,6 +856,7 @@ async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.requir
       document.getElementById('testbtn').onclick=async()=>{{
         const out=document.getElementById('testresult'); out.textContent='Teste…';
         const fd=new FormData(document.querySelector('form'));
+        fd.set('installation_id','{esc(active_inst.installation_id)}');
         const r=await fetch('/admin/plugin/{esc(slug)}/test',{{method:'POST',body:fd}});
         const d=await r.json();
         out.textContent=(d.state==='ok'?'✅ ':d.state==='error'?'❌ ':'• ')+d.message;
@@ -846,6 +864,13 @@ async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.requir
     </script>"""
 
     body = f"""
+    <style>
+      .install-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin:14px 0 18px}}
+      .install-card{{display:flex;flex-direction:column;gap:4px;padding:12px 13px;border:1px solid var(--border-soft);
+        border-radius:8px;background:var(--surface-2);text-decoration:none;color:var(--text)}}
+      .install-card.active{{border-color:var(--link);box-shadow:0 0 0 3px var(--ring)}}
+      .install-card span{{font-size:12px;color:var(--text-dim)}}
+    </style>
     <div class="crumb"><a href="/admin">← Alle Plugins</a> · {cat_label}</div>
     <div class="hero" style="display:flex;align-items:center;gap:16px;margin-bottom:20px">
       <span class="icon" style="font-size:34px;width:60px;height:60px;display:grid;
@@ -855,13 +880,38 @@ async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.requir
         <p style="margin:0">{esc(cls.description)}</p></div>
     </div>
     {soon_banner}{flash}
-    <form method="post" action="/admin/plugin/{esc(slug)}">
+    <form method="post" action="/admin/plugin/{esc(slug)}/master">
       <input type="hidden" name="csrf" value="{esc(token)}">
       <div class="panel">
         <div class="toggle-row" style="margin-bottom:20px">
           <input class="toggle" type="checkbox" name="__enabled" {toggled}>
           <div><div style="font-weight:600;font-size:14px">Plugin aktiviert</div>
-            <div class="note" style="font-size:12px">Tools werden sofort scharf geschaltet — ohne Neustart.</div></div>
+            <div class="note" style="font-size:12px">Master-Schalter für alle Installationen.</div></div>
+        </div>
+        <button class="btn secondary sm" type="submit">Master speichern</button>
+      </div>
+    </form>
+    <div class="panel" style="margin-top:14px">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <div><h2 style="margin:0;font-size:16px">Installationen</h2>
+          <div class="note">Jede Installation hat eigene Zugangsdaten und kann separat an/aus sein.</div></div>
+        <form method="post" action="{create_href}">
+          <input type="hidden" name="csrf" value="{esc(token)}">
+          <button class="btn sm" type="submit">+ Installation</button>
+        </form>
+      </div>
+      <div class="install-grid">{''.join(install_rows)}</div>
+    </div>
+    <form method="post" action="/admin/plugin/{esc(slug)}">
+      <input type="hidden" name="csrf" value="{esc(token)}">
+      <input type="hidden" name="installation_id" value="{esc(active_inst.installation_id)}">
+      <div class="panel" style="margin-top:14px">
+        <div class="field"><label>Name der Installation</label>
+          <input type="text" name="__installation_name" value="{esc(active_inst.installation_name)}"></div>
+        <div class="toggle-row" style="margin-bottom:20px">
+          <input class="toggle" type="checkbox" name="__instance_enabled" {"checked" if active_inst.cfg.get("__instance_enabled", active_inst.is_toggled_on) else ""}>
+          <div><div style="font-weight:600;font-size:14px">Installation eingeschaltet</div>
+            <div class="note" style="font-size:12px">Wirkt nur, wenn der Master-Schalter oben aktiv ist.</div></div>
         </div>
         {fields_html or '<p class="note">Keine Konfiguration nötig.</p>'}
         <hr>
@@ -891,10 +941,44 @@ async def plugin_save(slug: str, request: Request, _: bool = Depends(auth.requir
     if not await _check_csrf(request, form):
         return RedirectResponse(f"/admin/plugin/{slug}", status_code=303)
     values = _values_from_form(cls, form)
-    enabled = "__enabled" in form
-    await get_config_store().save(cls, values, enabled)
+    install_id = str(form.get("installation_id") or "default")
+    enabled = "__instance_enabled" in form
+    name = str(form.get("__installation_name") or "").strip()
+    saved_id = await get_config_store().save_installation(cls, install_id, values, enabled, name=name)
+    await mgr.rebuild()
+    return RedirectResponse(f"/admin/plugin/{slug}?installation={saved_id}&saved=1", status_code=303)
+
+
+@router.post("/admin/plugin/{slug}/master")
+async def plugin_master_save(slug: str, request: Request, _: bool = Depends(auth.require_admin)):
+    mgr = get_manager()
+    cls = mgr.plugin_class(slug)
+    if not cls:
+        return RedirectResponse("/admin", status_code=303)
+    form = await request.form()
+    if not await _check_csrf(request, form):
+        return RedirectResponse(f"/admin/plugin/{slug}", status_code=303)
+    cfg = await get_config_store().load(cls)
+    await get_config_store().save(cls, cfg, "__enabled" in form)
     await mgr.rebuild()
     return RedirectResponse(f"/admin/plugin/{slug}?saved=1", status_code=303)
+
+
+@router.post("/admin/plugin/{slug}/installation/new")
+async def plugin_installation_new(slug: str, request: Request, _: bool = Depends(auth.require_admin)):
+    mgr = get_manager()
+    cls = mgr.plugin_class(slug)
+    if not cls:
+        return RedirectResponse("/admin", status_code=303)
+    form = await request.form()
+    if not await _check_csrf(request, form):
+        return RedirectResponse(f"/admin/plugin/{slug}", status_code=303)
+    defaults = {f.key: f.default for f in cls.config_fields}
+    install_id = await get_config_store().save_installation(
+        cls, "__new__", defaults, False, name="Neue Installation"
+    )
+    await mgr.rebuild()
+    return RedirectResponse(f"/admin/plugin/{slug}?installation={install_id}&saved=1", status_code=303)
 
 
 @router.post("/admin/plugin/{slug}/test")
@@ -907,6 +991,10 @@ async def plugin_test(slug: str, request: Request, _: bool = Depends(auth.requir
     form = await request.form()
     # Build a temp config: stored values, overlaid with submitted non-empty ones.
     cfg = await store.load(cls)
+    install_id = str(form.get("installation_id") or "default")
+    if install_id != "default":
+        installs = await store.load_installations(cls)
+        cfg = next((i for i in installs if i.get("__installation_id") == install_id), cfg)
     for f in cls.config_fields:
         if f.type is FieldType.BOOL:
             cfg[f.key] = f.key in form
@@ -1547,6 +1635,43 @@ def _msg(role: str, content: str, **extra) -> dict:
     return {"id": f"m_{uuid4().hex[:10]}", "role": role, "content": content, "ts": _now_iso(), **extra}
 
 
+def _upload_dir() -> Path:
+    path = Path(get_settings().brain_data_dir) / "uploads" / "web_chat"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+async def _save_uploads(form) -> list[dict]:
+    allowed_prefixes = ("image/", "video/", "audio/")
+    attachments = []
+    for upload in form.getlist("files"):
+        filename = getattr(upload, "filename", "") or ""
+        content_type = getattr(upload, "content_type", "") or "application/octet-stream"
+        if not filename or not any(content_type.startswith(p) for p in allowed_prefixes):
+            continue
+        ext = Path(filename).suffix[:12]
+        stored = f"{uuid4().hex}{ext}"
+        target = _upload_dir() / stored
+        size = 0
+        with target.open("wb") as f:
+            while chunk := await upload.read(1024 * 1024):
+                size += len(chunk)
+                if size > 50 * 1024 * 1024:
+                    target.unlink(missing_ok=True)
+                    break
+                f.write(chunk)
+        if target.exists():
+            attachments.append({
+                "id": stored,
+                "name": filename,
+                "content_type": content_type,
+                "size": size,
+                "path": str(target),
+                "url": f"/admin/uploads/{stored}",
+            })
+    return attachments
+
+
 def _chat_icon(name: str) -> str:
     icons = {
         "edit": (
@@ -1670,11 +1795,19 @@ def _select_chat(store: dict, chat_id: str | None = None, *, archived: bool = Fa
 
 
 def _chat_messages_for_agent(chat: dict) -> list[dict]:
-    return [
-        {"role": m["role"], "content": m["content"]}
-        for m in chat.get("messages", [])
-        if m.get("role") in ("user", "assistant")
-    ][-40:]
+    messages = []
+    for m in chat.get("messages", []):
+        if m.get("role") not in ("user", "assistant"):
+            continue
+        content = m.get("content", "")
+        if m.get("attachments"):
+            refs = [
+                f"- {a.get('name')} ({a.get('content_type')}, {a.get('path')})"
+                for a in m.get("attachments", [])
+            ]
+            content = f"{content}\n\nAnhänge:\n" + "\n".join(refs)
+        messages.append({"role": m["role"], "content": content})
+    return messages[-40:]
 
 
 async def _refresh_agent_tools() -> None:
@@ -1763,9 +1896,19 @@ def _render_messages(chat: dict) -> str:
                     f'<pre>{esc(json.dumps(call, ensure_ascii=False, indent=2))}</pre></details>'
                 )
             tool_cards = '<div class="tool-cards">' + "".join(cards) + '</div>'
+        attachments = ""
+        if m.get("attachments"):
+            items = []
+            for a in m.get("attachments", []):
+                kind = str(a.get("content_type", "")).split("/", 1)[0]
+                items.append(
+                    f'<a class="attachment" href="{esc(a.get("url", "#"))}" target="_blank" rel="noopener">'
+                    f'<b>{esc(kind or "file")}</b><span>{esc(a.get("name", "Anhang"))}</span></a>'
+                )
+            attachments = '<div class="attachments">' + "".join(items) + '</div>'
         msgs.append(
             f'<div class="msg-row {cls}" data-mid="{esc(m["id"])}">'
-            f'<div class="msg {cls}"><span class="msg-content">{esc(m.get("content", ""))}</span>{tool_cards}{pending}</div>'
+            f'<div class="msg {cls}"><span class="msg-content">{esc(m.get("content", ""))}</span>{attachments}{tool_cards}{pending}</div>'
             f'<div class="msg-actions">{actions}</div></div>'
         )
     if not msgs:
@@ -1809,6 +1952,10 @@ async def chat_page(
         '<button class="btn sm" id="restorebottom">Wiederherstellen</button></div>'
         if archive_view and active else
         '<div class="chat-input">'
+        '<label class="icon-btn upload-btn" title="Foto, Video oder Audio anhängen">'
+        '<input id="files" type="file" accept="image/*,video/*,audio/*" multiple hidden>'
+        '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21.4 11.6 12 21a6 6 0 0 1-8.5-8.5l9.7-9.7a4 4 0 0 1 5.7 5.7L9.2 18.2a2 2 0 1 1-2.8-2.8l8.8-8.8"/></svg>'
+        '</label>'
         '<textarea id="inp" placeholder="Nachricht oder Aufgabe an ASTRA…" rows="1"></textarea>'
         '<button class="btn" id="send">Senden</button>'
         '<button class="btn ghost sm" id="clear" title="Verlauf leeren">Leeren</button>'
@@ -1852,12 +1999,13 @@ async def chat_page(
     </div>
     <script>
       const root=document.querySelector('.chat-shell'), chatId=root.dataset.chat, archiveView=root.dataset.view==='archive';
-      const log=document.getElementById('log'), inp=document.getElementById('inp');
+      const log=document.getElementById('log'), inp=document.getElementById('inp'), files=document.getElementById('files');
       const perm=document.getElementById('perm'), autonomy=document.getElementById('autonomy');
       const scroll=()=>log.scrollTop=log.scrollHeight; scroll();
       function add(role,txt){{const r=document.createElement('div');r.className='msg-row '+role;
         const b=document.createElement('div');b.className='msg '+role;b.textContent=txt;r.appendChild(b);log.appendChild(r);scroll();return r;}}
       async function post(url, data){{const r=await fetch(url,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(data||{{}})}});return await r.json();}}
+      async function postForm(url, fd){{const r=await fetch(url,{{method:'POST',body:fd}});return await r.json();}}
       async function restore(id){{const d=await post('/admin/chat/restore',{{chat_id:id||chatId}}); location.href='/admin/chat?chat='+encodeURIComponent(d.chat_id||id||chatId);}}
       async function copyText(text, btn){{
         try {{
@@ -1875,11 +2023,13 @@ async def chat_page(
         document.getElementById('send').onclick=go;
       }}
       async function go(){{
-        const t=inp.value.trim(); if(!t) return; inp.value=''; inp.style.height='auto';
+        const t=inp.value.trim(); const hasFiles=files&&files.files.length; if(!t&&!hasFiles) return; inp.value=''; inp.style.height='auto';
         add('user',t); const typing=add('typing','ASTRA arbeitet…');
         try{{
           await saveSettings();
-          const d=await post('/admin/chat/send',{{chat_id:chatId,message:t,permission_mode:perm.value}});
+          const fd=new FormData(); fd.set('chat_id',chatId); fd.set('message',t); fd.set('permission_mode',perm.value);
+          if(files){{[...files.files].forEach(f=>fd.append('files',f)); files.value='';}}
+          const d=await postForm('/admin/chat/send',fd);
           typing.remove(); location.href='/admin/chat?chat='+encodeURIComponent(d.chat_id||chatId);
         }}catch(e){{ typing.remove(); add('bot','Fehler: '+e); }}
       }}
@@ -1954,19 +2104,25 @@ async def chat_new(request: Request, _: bool = Depends(auth.require_admin)):
 async def chat_send(request: Request, _: bool = Depends(auth.require_admin)):
     from ..agent import generate_reply_meta
     from ..persona import Register
-    try:
-        data = await request.json()
-    except Exception:  # noqa: BLE001
-        data = {}
+    attachments = []
+    if request.headers.get("content-type", "").startswith("multipart/form-data"):
+        form = await request.form()
+        data = dict(form)
+        attachments = await _save_uploads(form)
+    else:
+        try:
+            data = await request.json()
+        except Exception:  # noqa: BLE001
+            data = {}
     msg = (data.get("message") or "").strip()
-    if not msg:
+    if not msg and not attachments:
         return JSONResponse({"reply": "(leer)"})
     st = get_settings()
     store = await _chat_store()
     chat = _get_chat(store, data.get("chat_id"))
     if data.get("permission_mode") in ("ask", "auto", "bypass"):
         chat["permission_mode"] = data["permission_mode"]
-    user_msg = _msg("user", msg)
+    user_msg = _msg("user", msg or "Anhang", attachments=attachments)
     chat["messages"].append(user_msg)
     if len([m for m in chat["messages"] if m["role"] == "user"]) == 1:
         chat["title"] = _title_from(msg)
@@ -1994,6 +2150,16 @@ async def chat_send(request: Request, _: bool = Depends(auth.require_admin)):
     await _save_chat_store(store)
     await db.audit("web_chat", actor="owner", detail={"len": len(msg), "chat_id": chat["id"]})
     return JSONResponse({"reply": bot_msg["content"], "chat_id": chat["id"]})
+
+
+@router.get("/admin/uploads/{filename}")
+async def chat_upload(filename: str, _: bool = Depends(auth.require_admin)):
+    if "/" in filename or "\\" in filename:
+        return JSONResponse({"error": "bad filename"}, status_code=400)
+    path = _upload_dir() / filename
+    if not path.exists():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return FileResponse(path)
 
 
 @router.post("/admin/chat/action")

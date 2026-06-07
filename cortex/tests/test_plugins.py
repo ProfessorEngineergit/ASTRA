@@ -52,6 +52,28 @@ def test_rebuild_registers_enabled_plugin_tools(memdb):
     assert tools.REGISTRY["recall_memory"].source == "core"
 
 
+def test_rebuild_registers_extra_installation_tools(memdb):
+    cs = get_config_store()
+    rmv_cls = next(c for c in _discover_classes() if c.slug == "rmv")
+    asyncio.run(cs.save(rmv_cls, {"api_key": "k1", "home_stop_id": "3000001"}, enabled=True))
+    install_id = asyncio.run(cs.save_installation(
+        rmv_cls,
+        "__new__",
+        {"api_key": "k2", "home_stop_id": "3000002"},
+        True,
+        name="Server 2",
+    ))
+
+    mgr = get_manager()
+    asyncio.run(mgr.rebuild())
+
+    extra_name = f"get_departures__{install_id}"
+    assert "get_departures" in tools.REGISTRY
+    assert extra_name in tools.REGISTRY
+    assert tools.REGISTRY[extra_name].source == f"rmv:{install_id}"
+    assert "Server 2" in tools.REGISTRY[extra_name].description
+
+
 def test_clear_all_plugin_tools_keeps_core(memdb):
     tools.clear_all_plugin_tools()
     names = set(tools.REGISTRY)

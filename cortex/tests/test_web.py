@@ -5,6 +5,8 @@ fixture, and a manager pre-populated without touching Postgres.
 """
 from __future__ import annotations
 
+from io import BytesIO
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -283,3 +285,34 @@ def test_chat_renders_tool_call_cards(memdb):
     assert r.status_code == 200
     assert "tool-card warn" in r.text
     assert "edupage_get_timetable" in r.text
+
+
+def test_chat_accepts_media_uploads(memdb, monkeypatch):
+    _prime_manager()
+
+    async def fake_reply(**kwargs):
+        return {"reply": "Anhang gesehen."}
+
+    monkeypatch.setattr("app.agent.generate_reply_meta", fake_reply)
+    c = TestClient(_app())
+    r = c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+
+    created = c.post("/admin/chat/new", json={}).json()
+    chat_id = created["chat_id"]
+    r = c.post(
+        "/admin/chat/send",
+        data={"chat_id": chat_id, "message": "Sieh dir das an", "permission_mode": "ask"},
+        files={"files": ("bild.png", BytesIO(b"fakepng"), "image/png")},
+    )
+
+    assert r.status_code == 200
+    chat = next(ch for ch in memdb[web_admin.CHAT_KEY]["chats"] if ch["id"] == chat_id)
+    assert chat["messages"][0]["attachments"][0]["name"] == "bild.png"
+
+    r = c.get(f"/admin/chat?chat={chat_id}")
+    assert r.status_code == 200
+    assert "attachment" in r.text
+    assert "bild.png" in r.text
