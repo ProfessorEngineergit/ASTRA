@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+import types
+from datetime import time
 
 from app import tools
 from app.config_store import get_config_store
@@ -111,3 +114,81 @@ def test_edupage_auto_scans_for_next_lesson(monkeypatch):
 
     assert "Mathe" in result
     assert len(calls) == 2
+
+
+def test_edupage_fetch_uses_current_get_my_timetable_signature(monkeypatch):
+    calls = []
+
+    class FakeEdupage:
+        def login(self, username, password, subdomain):
+            calls.append(("login", username, subdomain))
+
+        def get_my_timetable(self, day):
+            calls.append(("my", day.isoformat()))
+            lesson = types.SimpleNamespace(
+                period=1,
+                subject=types.SimpleNamespace(name="Deutsch"),
+                teachers=[types.SimpleNamespace(name="Herr D")],
+                classrooms=[types.SimpleNamespace(name="B204")],
+                classes=[],
+                groups=["B"],
+                start_time=time(8, 0),
+                end_time=time(8, 45),
+                curriculum="Epochal",
+                online_lesson_link=None,
+                is_cancelled=False,
+                is_event=False,
+            )
+            return types.SimpleNamespace(lessons=[lesson])
+
+        def get_timetable(self, *_args):
+            raise AssertionError("old get_timetable(day) path must not be used first")
+
+    fake_mod = types.SimpleNamespace(Edupage=FakeEdupage)
+    monkeypatch.setitem(sys.modules, "edupage_api", fake_mod)
+
+    plugin = EduPagePlugin({"__enabled": True, "subdomain": "school", "username": "u", "password": "p"})
+    lessons = plugin._fetch_sync(__import__("datetime").date(2026, 6, 8))
+
+    assert calls[0] == ("login", "u", "school")
+    assert calls[1] == ("my", "2026-06-08")
+    assert lessons[0]["subject"] == "Deutsch"
+    assert lessons[0]["groups"] == ["B"]
+    assert lessons[0]["curriculum"] == "Epochal"
+
+
+def test_edupage_group_filter_and_substitutions(monkeypatch):
+    plugin = EduPagePlugin({
+        "__enabled": True,
+        "subdomain": "school",
+        "username": "u",
+        "password": "p",
+        "preferred_group": "B",
+    })
+
+    async def fake_timetable(day):
+        return [
+            {"period": "1", "subject": "Physik", "teacher": "Frau P", "classroom": "P1",
+             "groups": ["A"], "start": "08:00", "end": "08:45"},
+            {"period": "2", "subject": "Mathe", "teacher": "Herr M", "classroom": "M2",
+             "groups": ["B"], "start": "08:50", "end": "09:35", "curriculum": "Epoch"},
+            {"period": "3", "subject": "Deutsch", "teacher": "Frau D", "classroom": "D3",
+             "groups": [], "start": "09:50", "end": "10:35"},
+        ]
+
+    async def fake_changes(day):
+        return [{"class": "10B", "lesson": "2", "title": "Mathe in M4", "action": "change"}]
+
+    monkeypatch.setattr(plugin, "timetable", fake_timetable)
+    monkeypatch.setattr(plugin, "timetable_changes", fake_changes)
+    timetable = next(t for t in plugin.tools() if t.name == "get_timetable")
+    ctx = ToolContext(thread_id="web-owner:test", channel="web", contact={"id": "owner"}, is_owner=True)
+
+    result = asyncio.run(timetable.handler({"day": "tomorrow"}, ctx))
+
+    assert "Gruppe B" in result
+    assert "Mathe" in result
+    assert "Epoch" in result
+    assert "Deutsch" in result
+    assert "Physik" not in result
+    assert "Vertretungen" in result
