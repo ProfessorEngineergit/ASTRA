@@ -155,6 +155,7 @@ def test_update_page_and_status(memdb):
     data = r.json()
     assert "current_version" in data or "message" in data
     assert "app_version" in data
+    assert "repo_root" in data
 
 
 def test_chat_archive_restore_tabs(memdb):

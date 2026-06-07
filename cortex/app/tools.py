@@ -118,6 +118,7 @@ _SAFE_TOOL_NAMES = {
     "astra_test_integration",
     "astra_get_settings",
     "astra_system_status",
+    "home_assistant_state",
 }
 _SAFE_PREFIXES = (
     "get_",

@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 
 from app.plugins.registry import _discover_classes
-from app.tools import REGISTRY, Tool, ToolContext, clear_source, dispatch, openai_tools, register
+from app.tools import (
+    REGISTRY, Tool, ToolContext, clear_source, dispatch, needs_confirmation, openai_tools, register,
+)
 
 CORE_ALWAYS = {"recall_memory", "request_owner_approval"}
 
@@ -46,6 +48,23 @@ def test_dispatch_blocks_owner_tool_for_third_party():
         assert "nur für Bahrian" in res
     finally:
         clear_source("test")
+
+
+def test_home_assistant_read_state_does_not_pause_in_ask_mode():
+    prior = {name: REGISTRY.get(name) for name in ("home_assistant_state", "home_assistant_call")}
+    register(Tool(name="home_assistant_state", description="x", parameters={"type": "object", "properties": {}},
+                  handler=lambda a, c: _async("ok"), owner_only=True, source="test"))
+    register(Tool(name="home_assistant_call", description="x", parameters={"type": "object", "properties": {}},
+                  handler=lambda a, c: _async("ok"), owner_only=True, source="test"))
+    try:
+        assert needs_confirmation("home_assistant_state") is False
+        assert needs_confirmation("home_assistant_call") is True
+    finally:
+        for name, tool in prior.items():
+            if tool is None:
+                REGISTRY.pop(name, None)
+            else:
+                REGISTRY[name] = tool
 
 
 async def _async(v):

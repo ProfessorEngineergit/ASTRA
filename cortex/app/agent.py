@@ -36,6 +36,27 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
     return out
 
 
+def _tool_context_hint(tools: list[dict]) -> str:
+    rows = []
+    for tool in tools[:60]:
+        fn = tool.get("function") or {}
+        name = fn.get("name", "")
+        desc = " ".join(str(fn.get("description", "")).split())
+        if name:
+            rows.append(f"- {name}: {desc[:160]}")
+    if not rows:
+        return ""
+    return (
+        "Verfügbare Agentenfähigkeiten in diesem Gespräch:\n"
+        + "\n".join(rows)
+        + "\n\nWenn Bahrian nach aktuellen Integrationsdaten fragt (z. B. Stundenplan, "
+        "Home-Assistant-Räume, Sensoren, Entitäten, Systemstatus), nutze das passende "
+        "Werkzeug, statt aus Erinnerung zu antworten. Sage nur dann, dass du keinen "
+        "Zugriff hast, wenn kein passendes Werkzeug verfügbar ist oder das Werkzeug "
+        "konkret fehlschlägt."
+    )
+
+
 async def generate_reply(
     *,
     register: Register,
@@ -79,6 +100,8 @@ async def generate_reply_meta(
     if not gw.enabled:
         return {"reply": "(ASTRA: kein OpenAI-Key konfiguriert — Antwort übersprungen.)"}
 
+    is_owner = register == Register.OWNER
+    tools = openai_tools(is_owner=is_owner)
     sys = system_prompt(
         register, owner=s.astra_owner_name, now=_now_str(s.astra_timezone), tz=s.astra_timezone
     )
@@ -89,6 +112,9 @@ async def generate_reply_meta(
             messages.append(
                 {"role": "system", "content": f"Dauerhaftes Wissen über {s.astra_owner_name}:\n{kb}"}
             )
+        tool_hint = _tool_context_hint(tools)
+        if tool_hint:
+            messages.append({"role": "system", "content": tool_hint})
     if summary:
         messages.append({"role": "system", "content": f"Bisheriger Gesprächskontext: {summary}"})
     if register == Register.THIRD:
@@ -116,12 +142,10 @@ async def generate_reply_meta(
         })
     messages += _history_to_messages(history)
 
-    is_owner = register == Register.OWNER
     ctx = ToolContext(
         thread_id=thread_id, channel=channel, contact=contact, max_sensitivity=max_sensitivity,
         is_owner=is_owner, permission_mode=permission_mode,
     )
-    tools = openai_tools(is_owner=is_owner)
 
     for _ in range(MAX_TOOL_ITERS):
         msg = await gw.chat(messages, tools=tools)

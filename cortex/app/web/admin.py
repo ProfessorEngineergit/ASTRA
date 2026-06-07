@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from shutil import which
@@ -27,7 +28,7 @@ from .templates import (
 
 GH_REPO = "https://github.com/ProfessorEngineergit/ASTRA"
 GH_OWNER_REPO = "ProfessorEngineergit/ASTRA"
-REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[3]
 UPDATE_PULL_COMMAND = ["git", "pull", "--ff-only", "origin", "main"]
 UPDATE_REBUILD_COMMAND = "docker compose up -d --build cortex"
 _GH_SVG = ('<svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor">'
@@ -63,14 +64,50 @@ def _redirect_with_session(url: str, token: str) -> RedirectResponse:
     return resp
 
 
-async def _run_update_cmd(args: list[str], *, timeout: float = 12) -> dict:
+def _repo_root_candidates() -> list[Path]:
+    paths: list[Path] = []
+
+    def add(raw: str | os.PathLike | None) -> None:
+        if not raw:
+            return
+        try:
+            path = Path(raw).expanduser().resolve()
+        except Exception:  # noqa: BLE001
+            path = Path(raw).expanduser()
+        if path not in paths:
+            paths.append(path)
+
+    add(os.getenv("ASTRA_UPDATE_REPO_ROOT"))
+    add(os.getenv("ASTRA_REPO_ROOT"))
+    add(DEFAULT_REPO_ROOT)
+    add(Path.cwd())
+    for parent in Path(__file__).resolve().parents:
+        add(parent)
+    for common in ("/opt/astra", "/srv/astra", "/workspace", "/app", "/srv"):
+        add(common)
+    return paths
+
+
+def _repo_root() -> Path:
+    candidates = _repo_root_candidates()
+    for path in candidates:
+        if (path / ".git").exists():
+            return path
+    return candidates[0] if candidates else DEFAULT_REPO_ROOT
+
+
+async def _run_update_cmd(args: list[str], *, timeout: float = 12, cwd: Path | None = None) -> dict:
     """Run a fixed maintenance command from the repo root."""
     if args and args[0] == "git" and not which("git"):
         return {"ok": False, "code": 127, "out": "", "err": "git ist auf diesem Server nicht installiert."}
+    workdir = cwd or _repo_root()
+    run_args = list(args)
+    if run_args and run_args[0] == "git":
+        run_args = ["git", "-c", f"safe.directory={workdir}", *run_args[1:]]
     try:
         proc = await asyncio.create_subprocess_exec(
-            *args,
-            cwd=REPO_ROOT,
+            *run_args,
+            cwd=workdir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -92,33 +129,79 @@ async def _git_text(args: list[str], *, timeout: float = 8) -> str:
 
 
 async def _git_update_status(*, fetch: bool = False) -> dict:
-    repo_check = await _run_update_cmd(["git", "rev-parse", "--git-dir"], timeout=5)
+    repo_root = _repo_root()
+    candidates = [str(p) for p in _repo_root_candidates()]
+    if not which("git"):
+        return {
+            "ok": False,
+            "git_available": False,
+            "repo_root": str(repo_root),
+            "repo_candidates": candidates,
+            "app_version": ASTRA_VERSION,
+            "message": "git ist im ASTRA-Container nicht installiert. Das neue Image installiert git automatisch.",
+        }
+
+    repo_check = await _run_update_cmd(["git", "rev-parse", "--show-toplevel"], timeout=5, cwd=repo_root)
     if not repo_check["ok"]:
         return {
             "ok": False,
-            "git_available": bool(which("git")),
-            "repo_root": str(REPO_ROOT),
+            "git_available": True,
+            "repo_root": str(repo_root),
+            "repo_candidates": candidates,
             "app_version": ASTRA_VERSION,
-            "message": "ASTRA läuft hier nicht aus einem Git-Checkout. Pull ist deshalb nicht möglich.",
+            "git_error": repo_check.get("err") or repo_check.get("out"),
+            "message": (
+                "ASTRA findet im Container keinen Git-Checkout. Mount den Server-Checkout nach "
+                "/opt/astra oder setze ASTRA_UPDATE_REPO_ROOT auf den Repo-Pfad."
+            ),
         }
+    repo_root = Path(repo_check["out"] or repo_root)
 
     fetch_result = None
     if fetch:
-        fetch_result = await _run_update_cmd(["git", "fetch", "--tags", "origin", "main"], timeout=35)
+        fetch_result = await _run_update_cmd(
+            ["git", "fetch", "--tags", "origin", "main"], timeout=35, cwd=repo_root
+        )
 
-    local_full = await _git_text(["git", "rev-parse", "HEAD"])
-    remote_full = await _git_text(["git", "rev-parse", "origin/main"])
-    local_short = await _git_text(["git", "rev-parse", "--short", "HEAD"])
-    remote_short = await _git_text(["git", "rev-parse", "--short", "origin/main"])
-    local_tag = await _git_text(["git", "describe", "--tags", "--exact-match", "HEAD"])
-    latest_tag = await _git_text(["git", "describe", "--tags", "--abbrev=0", "origin/main"])
-    ahead_behind = await _git_text(["git", "rev-list", "--left-right", "--count", "HEAD...origin/main"])
-    tracked_status = await _git_text(["git", "status", "--short", "--untracked-files=no"])
-    untracked_status = await _git_text(["git", "ls-files", "--others", "--exclude-standard"])
+    local_full = (
+        await _run_update_cmd(["git", "rev-parse", "HEAD"], timeout=8, cwd=repo_root)
+    )["out"].strip()
+    remote_full = (
+        await _run_update_cmd(["git", "rev-parse", "origin/main"], timeout=8, cwd=repo_root)
+    )["out"].strip()
+    local_short = (
+        await _run_update_cmd(["git", "rev-parse", "--short", "HEAD"], timeout=8, cwd=repo_root)
+    )["out"].strip()
+    remote_short = (
+        await _run_update_cmd(["git", "rev-parse", "--short", "origin/main"], timeout=8, cwd=repo_root)
+    )["out"].strip()
+    local_tag = (
+        await _run_update_cmd(["git", "describe", "--tags", "--exact-match", "HEAD"], timeout=8, cwd=repo_root)
+    )["out"].strip()
+    latest_tag = (
+        await _run_update_cmd(["git", "describe", "--tags", "--abbrev=0", "origin/main"], timeout=8, cwd=repo_root)
+    )["out"].strip()
+    ahead_behind = (
+        await _run_update_cmd(
+            ["git", "rev-list", "--left-right", "--count", "HEAD...origin/main"],
+            timeout=8,
+            cwd=repo_root,
+        )
+    )["out"].strip()
+    tracked_status = (
+        await _run_update_cmd(["git", "status", "--short", "--untracked-files=no"], timeout=8, cwd=repo_root)
+    )["out"].strip()
+    untracked_status = (
+        await _run_update_cmd(["git", "ls-files", "--others", "--exclude-standard"], timeout=8, cwd=repo_root)
+    )["out"].strip()
     dirty = bool(tracked_status)
-    commit_lines = await _git_text(
-        ["git", "log", "--oneline", "--no-decorate", "--max-count=6", "HEAD..origin/main"]
-    )
+    commit_lines = (
+        await _run_update_cmd(
+            ["git", "log", "--oneline", "--no-decorate", "--max-count=6", "HEAD..origin/main"],
+            timeout=8,
+            cwd=repo_root,
+        )
+    )["out"].strip()
     ahead = behind = 0
     if ahead_behind:
         parts = ahead_behind.split()
@@ -129,7 +212,8 @@ async def _git_update_status(*, fetch: bool = False) -> dict:
     data = {
         "ok": True,
         "git_available": True,
-        "repo_root": str(REPO_ROOT),
+        "repo_root": str(repo_root),
+        "repo_candidates": candidates,
         "repo": GH_OWNER_REPO,
         "app_version": ASTRA_VERSION,
         "current_sha": local_short,
@@ -170,7 +254,7 @@ async def _git_pull_update() -> dict:
             "ok": False,
             "message": "Lokale Git-Änderungen blockieren den Pull. Erst committen, stashen oder bewusst aufräumen.",
         }
-    result = await _run_update_cmd(UPDATE_PULL_COMMAND, timeout=75)
+    result = await _run_update_cmd(UPDATE_PULL_COMMAND, timeout=75, cwd=Path(before["repo_root"]))
     after = await _git_update_status(fetch=False)
     payload = {
         **after,
@@ -1531,6 +1615,15 @@ def _chat_messages_for_agent(chat: dict) -> list[dict]:
     ][-40:]
 
 
+async def _refresh_agent_tools() -> None:
+    try:
+        from ..admin_tools import register_admin_tools
+        await get_manager().rebuild()
+        register_admin_tools()
+    except Exception:  # noqa: BLE001
+        log.warning("Could not refresh agent tools before web chat.", exc_info=True)
+
+
 def _mode_label(mode: str) -> str:
     return {
         "ask": "jedes Mal fragen",
@@ -1803,6 +1896,7 @@ async def chat_send(request: Request, _: bool = Depends(auth.require_admin)):
     if len([m for m in chat["messages"] if m["role"] == "user"]) == 1:
         chat["title"] = _title_from(msg)
     try:
+        await _refresh_agent_tools()
         result = await generate_reply_meta(
             register=Register.OWNER,
             contact={"id": "owner", "name": st.astra_owner_name, "is_owner": True},
@@ -1849,6 +1943,7 @@ async def chat_action(request: Request, _: bool = Depends(auth.require_admin)):
         contact={"id": "owner", "is_owner": True}, is_owner=True,
         permission_mode="bypass",
     )
+    await _refresh_agent_tools()
     result = await dispatch(pending["tool"], pending.get("args") or {}, ctx)
     target.pop("pending_action", None)
     chat["pending_action"] = None

@@ -67,21 +67,38 @@ class EduPagePlugin(Plugin):
 
     def tools(self) -> list[Tool]:
         async def _get_timetable(args: dict, ctx: ToolContext) -> str:
-            day = date_cls.today()
-            if (args.get("day") or "today").lower() in ("tomorrow", "morgen"):
-                day = day + timedelta(days=1)
-            lessons = await self.timetable(day)
-            if not lessons:
-                return f"Kein Stundenplan für {day.isoformat()} (oder unterrichtsfrei)."
-            lines = [f"{l['period']}. {l['subject']} {l['start']}-{l['end']} "
-                     f"({l['classroom']}, {l['teacher']})".strip() for l in lessons]
-            return f"Stundenplan {day.isoformat()}:\n- " + "\n- ".join(lines)
+            today = date_cls.today()
+            raw_day = str(args.get("day") or "auto").strip().lower()
+            if raw_day in ("today", "heute"):
+                days = [today]
+            elif raw_day in ("tomorrow", "morgen"):
+                days = [today + timedelta(days=1)]
+            elif raw_day in ("auto", "next", "next_school_day", "nächster schultag", "naechster schultag"):
+                days = [today + timedelta(days=i) for i in range(0, 8)]
+            else:
+                try:
+                    days = [date_cls.fromisoformat(raw_day)]
+                except ValueError:
+                    days = [today + timedelta(days=i) for i in range(0, 8)]
+
+            checked: list[str] = []
+            for day in days:
+                checked.append(day.isoformat())
+                lessons = await self.timetable(day)
+                if lessons:
+                    lines = [f"{l['period']}. {l['subject']} {l['start']}-{l['end']} "
+                             f"({l['classroom']}, {l['teacher']})".strip() for l in lessons]
+                    return f"Stundenplan {day.isoformat()}:\n- " + "\n- ".join(lines)
+            return f"Kein Stundenplan gefunden. Geprüft: {', '.join(checked)}."
 
         return [Tool(
             name="get_timetable",
-            description="Hole Bahrians Schul-Stundenplan (EduPage) für heute oder morgen.",
+            description=(
+                "Hole Bahrians Schul-Stundenplan (EduPage). Ohne day sucht ASTRA den nächsten "
+                "Tag mit Unterricht; explizit möglich: today, tomorrow, next_school_day oder YYYY-MM-DD."
+            ),
             parameters={"type": "object", "properties": {
-                "day": {"type": "string", "enum": ["today", "tomorrow"]}}},
+                "day": {"type": "string", "description": "today, tomorrow, next_school_day/auto oder YYYY-MM-DD"}}},
             handler=_get_timetable, owner_only=True, source=self.slug,
         )]
 

@@ -85,8 +85,10 @@ services:
       WAHA_BASE_URL: http://waha:3000
       SIGNAL_BASE_URL: http://signal-cli:8080
       BRAIN_DATA_DIR: /srv/data          # durable, editable knowledge (volume below)
+      ASTRA_UPDATE_REPO_ROOT: /opt/astra # host checkout mounted below for web updates
     volumes:
       - brain_data:/srv/data             # persona/facts/routines markdown — survives updates
+      - .:/opt/astra
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
