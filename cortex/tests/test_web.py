@@ -189,3 +189,53 @@ def test_chat_archive_restore_tabs(memdb):
     r = c.get(f"/admin/chat?chat={chat_id}")
     assert r.status_code == 200
     assert "Archiv <span>0</span>" in r.text
+
+
+def test_chat_icon_actions_delete_and_merge(memdb):
+    _prime_manager()
+    c = TestClient(_app())
+    r = c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+
+    created = c.post("/admin/chat/new", json={}).json()
+    chat_id = created["chat_id"]
+    store = memdb[web_admin.CHAT_KEY]
+    chat = next(ch for ch in store["chats"] if ch["id"] == chat_id)
+    msg = web_admin._msg("user", "Bitte testen")
+    chat["messages"].append(msg)
+    memdb[web_admin.CHAT_KEY] = store
+
+    r = c.get(f"/admin/chat?chat={chat_id}")
+    assert r.status_code == 200
+    assert "data-edit" in r.text
+    assert "data-branch" in r.text
+    assert "data-copy" in r.text
+    assert "data-delete" in r.text
+    assert ">Bearbeiten<" not in r.text
+
+    branch = c.post("/admin/chat/branch", json={"chat_id": chat_id, "message_id": msg["id"]}).json()
+    branch_id = branch["chat_id"]
+    store = memdb[web_admin.CHAT_KEY]
+    child = next(ch for ch in store["chats"] if ch["id"] == branch_id)
+    child["messages"].append(web_admin._msg("assistant", "Neue Branch-Antwort"))
+    memdb[web_admin.CHAT_KEY] = store
+
+    r = c.get(f"/admin/chat?chat={branch_id}")
+    assert r.status_code == 200
+    assert "mergechat" in r.text
+    assert "In Ursprung mergen" in r.text
+
+    r = c.post("/admin/chat/merge", json={"chat_id": branch_id})
+    assert r.status_code == 200
+    assert r.json()["chat_id"] == chat_id
+    parent = next(ch for ch in memdb[web_admin.CHAT_KEY]["chats"] if ch["id"] == chat_id)
+    assert any(m["content"] == "Neue Branch-Antwort" for m in parent["messages"])
+
+    target = parent["messages"][0]["id"]
+    r = c.post("/admin/chat/delete_message", json={"chat_id": chat_id, "message_id": target})
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+    parent = next(ch for ch in memdb[web_admin.CHAT_KEY]["chats"] if ch["id"] == chat_id)
+    assert all(m["id"] != target for m in parent["messages"])

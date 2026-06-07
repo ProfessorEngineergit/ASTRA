@@ -405,9 +405,17 @@ main:has(.chat-shell) { max-width: 1680px; padding: 18px 18px 44px; }
 .msg.typing { color: var(--text-faint); background: transparent; border: 1px solid var(--border-soft); }
 .msg-actions { display: flex; gap: 6px; opacity: 0; transition: opacity .14s; }
 .msg-row:hover .msg-actions { opacity: 1; }
-.msg-actions button { border: 1px solid var(--border); color: var(--text-faint); background: var(--surface);
-  border-radius: 7px; padding: 4px 7px; font: 11px inherit; cursor: pointer; }
-.msg-actions button:hover { color: var(--text); background: var(--surface-2); }
+.icon-btn { width: 30px; height: 30px; display: inline-grid; place-items: center; flex: 0 0 auto;
+  border: 1px solid var(--border); color: var(--text-faint); background: var(--surface);
+  border-radius: 8px; padding: 0; cursor: pointer; transition: color .14s, background .14s, border-color .14s, transform .1s; }
+.icon-btn svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round; }
+.icon-btn:hover { color: var(--text); background: var(--surface-2); border-color: #30303a; }
+.icon-btn:active { transform: translateY(1px); }
+.icon-btn.copied { color: var(--ok); border-color: rgba(54,211,153,.36); background: var(--ok-bg); }
+.icon-btn[data-delete]:hover { color: var(--err); border-color: rgba(251,113,133,.34); background: var(--err-bg); }
+.title-icon { width: 34px; height: 34px; }
+.title-icon svg { width: 17px; height: 17px; }
 .action-card { display: grid; gap: 10px; margin-top: 12px; padding: 12px; background: #050507;
   border: 1px solid rgba(245,196,81,.28); border-radius: var(--r); }
 .action-card div:first-child { display: flex; justify-content: space-between; gap: 12px; color: var(--warn); }

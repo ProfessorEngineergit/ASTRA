@@ -1401,12 +1401,50 @@ def _msg(role: str, content: str, **extra) -> dict:
     return {"id": f"m_{uuid4().hex[:10]}", "role": role, "content": content, "ts": _now_iso(), **extra}
 
 
+def _chat_icon(name: str) -> str:
+    icons = {
+        "edit": (
+            '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20h9"/>'
+            '<path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>'
+        ),
+        "branch": (
+            '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="3"/>'
+            '<circle cx="18" cy="18" r="3"/><path d="M6 9v3a6 6 0 0 0 6 6h3"/>'
+            '<path d="M6 12a6 6 0 0 1 6-6h3"/></svg>'
+        ),
+        "merge": (
+            '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="18" r="3"/>'
+            '<circle cx="6" cy="6" r="3"/><path d="M6 9v3a6 6 0 0 0 6 6h3"/>'
+            '<path d="M18 15V6"/><path d="m15 9 3-3 3 3"/></svg>'
+        ),
+        "copy": (
+            '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/>'
+            '<path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>'
+        ),
+        "delete": (
+            '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18"/>'
+            '<path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/>'
+            '<path d="M10 11v5M14 11v5"/></svg>'
+        ),
+    }
+    return icons[name]
+
+
+def _icon_button(action: str, mid: str, label: str) -> str:
+    return (
+        f'<button class="icon-btn" data-{action}="{esc(mid)}" '
+        f'title="{esc(label)}" aria-label="{esc(label)}">{_chat_icon(action)}</button>'
+    )
+
+
 def _new_chat(title: str = "Neuer Chat", *, messages: list[dict] | None = None) -> dict:
     now = _now_iso()
     return {
         "id": f"c_{uuid4().hex[:10]}",
         "title": title,
         "archived": False,
+        "parent_id": None,
+        "branch_base_count": 0,
         "permission_mode": "ask",
         "messages": messages or [],
         "pending_action": None,
@@ -1534,11 +1572,17 @@ def _render_messages(chat: dict) -> str:
         actions = ""
         if role == "user":
             actions = (
-                f'<button data-edit="{esc(m["id"])}">Bearbeiten</button>'
-                f'<button data-branch="{esc(m["id"])}">Branch</button>'
+                _icon_button("edit", m["id"], "Bearbeiten")
+                + _icon_button("branch", m["id"], "Branch erstellen")
+                + _icon_button("copy", m["id"], "Kopieren")
+                + _icon_button("delete", m["id"], "Löschen")
             )
         elif role == "assistant":
-            actions = f'<button data-branch="{esc(m["id"])}">Branch</button>'
+            actions = (
+                _icon_button("branch", m["id"], "Branch erstellen")
+                + _icon_button("copy", m["id"], "Kopieren")
+                + _icon_button("delete", m["id"], "Löschen")
+            )
         pending = ""
         if m.get("pending_action"):
             p = m["pending_action"]
@@ -1553,7 +1597,7 @@ def _render_messages(chat: dict) -> str:
             )
         msgs.append(
             f'<div class="msg-row {cls}" data-mid="{esc(m["id"])}">'
-            f'<div class="msg {cls}">{esc(m.get("content", ""))}{pending}</div>'
+            f'<div class="msg {cls}"><span class="msg-content">{esc(m.get("content", ""))}</span>{pending}</div>'
             f'<div class="msg-actions">{actions}</div></div>'
         )
     if not msgs:
@@ -1579,10 +1623,17 @@ async def chat_page(
     title = (active or {}).get("title") or "Archiv"
     active_count = sum(1 for c in store["chats"] if not c.get("archived"))
     archived_count = sum(1 for c in store["chats"] if c.get("archived"))
+    can_merge = bool(active and active.get("parent_id") and not archive_view)
     title_actions = (
         f'<button class="btn sm" id="restorechat">Wiederherstellen</button>'
         if archive_view and active else
-        '<button class="btn ghost sm" id="branchchat">Branch</button>'
+        (
+            '<button class="icon-btn title-icon" id="mergechat" title="In Ursprung mergen" '
+            f'aria-label="In Ursprung mergen">{_chat_icon("merge")}</button>'
+            if can_merge else ""
+        )
+        + '<button class="icon-btn title-icon" id="branchchat" title="Branch erstellen" '
+        f'aria-label="Branch erstellen">{_chat_icon("branch")}</button>'
     )
     archive_button = "" if archive_view else '<button class="btn ghost sm" id="archivechat">Archivieren</button>'
     input_html = (
@@ -1640,6 +1691,14 @@ async def chat_page(
         const b=document.createElement('div');b.className='msg '+role;b.textContent=txt;r.appendChild(b);log.appendChild(r);scroll();return r;}}
       async function post(url, data){{const r=await fetch(url,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(data||{{}})}});return await r.json();}}
       async function restore(id){{const d=await post('/admin/chat/restore',{{chat_id:id||chatId}}); location.href='/admin/chat?chat='+encodeURIComponent(d.chat_id||id||chatId);}}
+      async function copyText(text, btn){{
+        try {{
+          await navigator.clipboard.writeText(text);
+          btn.classList.add('copied'); setTimeout(()=>btn.classList.remove('copied'), 900);
+        }} catch(e) {{
+          prompt('Text kopieren:', text);
+        }}
+      }}
       async function saveSettings(){{if(!archiveView&&chatId) await post('/admin/chat/settings',{{chat_id:chatId,permission_mode:perm.value,autonomy:autonomy.value}});}}
       if(perm) perm.onchange=saveSettings; if(autonomy) autonomy.onchange=saveSettings;
       if(inp) {{
@@ -1658,21 +1717,31 @@ async def chat_page(
       }}
       document.getElementById('newchat').onclick=async()=>{{const d=await post('/admin/chat/new',{{}}); location.href='/admin/chat?chat='+d.chat_id;}};
       const archiveBtn=document.getElementById('archivechat'), branchBtn=document.getElementById('branchchat');
+      const mergeBtn=document.getElementById('mergechat');
       const clearBtn=document.getElementById('clear'), restoreBtn=document.getElementById('restorechat');
       const restoreBottom=document.getElementById('restorebottom');
       if(archiveBtn) archiveBtn.onclick=async()=>{{await post('/admin/chat/archive',{{chat_id:chatId}}); location.href='/admin/chat?view=archive&chat='+encodeURIComponent(chatId);}};
       if(branchBtn) branchBtn.onclick=async()=>{{const d=await post('/admin/chat/branch',{{chat_id:chatId}}); location.href='/admin/chat?chat='+d.chat_id;}};
+      if(mergeBtn) mergeBtn.onclick=async()=>{{
+        if(!confirm('Neue Nachrichten aus diesem Branch in den Ursprung mergen?')) return;
+        const d=await post('/admin/chat/merge',{{chat_id:chatId}});
+        location.href='/admin/chat?chat='+encodeURIComponent(d.chat_id||chatId);
+      }};
       if(clearBtn) clearBtn.onclick=async()=>{{await post('/admin/chat/clear',{{chat_id:chatId}}); location.reload();}};
       if(restoreBtn) restoreBtn.onclick=()=>restore(chatId);
       if(restoreBottom) restoreBottom.onclick=()=>restore(chatId);
       document.querySelectorAll('[data-restore-chat]').forEach(b=>b.onclick=()=>restore(b.dataset.restoreChat));
       log.onclick=async e=>{{
         const edit=e.target.closest('[data-edit]'), branch=e.target.closest('[data-branch]');
+        const copy=e.target.closest('[data-copy]'), del=e.target.closest('[data-delete]');
         const run=e.target.closest('[data-run-action]'), deny=e.target.closest('[data-deny-action]');
         if(edit){{const current=edit.closest('.msg-row').querySelector('.msg').childNodes[0].textContent;
           const text=prompt('Nachricht bearbeiten. Alles danach wird abgeschnitten:', current);
           if(text!==null){{await post('/admin/chat/edit',{{chat_id:chatId,message_id:edit.dataset.edit,content:text}}); location.reload();}}}}
         if(branch){{const d=await post('/admin/chat/branch',{{chat_id:chatId,message_id:branch.dataset.branch}}); location.href='/admin/chat?chat='+d.chat_id;}}
+        if(copy){{const row=copy.closest('.msg-row'); const text=row.querySelector('.msg-content')?.textContent||''; await copyText(text, copy);}}
+        if(del){{if(!confirm('Diese Nachricht wirklich löschen?')) return;
+          await post('/admin/chat/delete_message',{{chat_id:chatId,message_id:del.dataset.delete}}); location.reload();}}
         if(run){{await post('/admin/chat/action',{{chat_id:chatId,message_id:run.dataset.runAction,decision:'run'}}); location.reload();}}
         if(deny){{await post('/admin/chat/action',{{chat_id:chatId,message_id:deny.dataset.denyAction,decision:'deny'}}); location.reload();}}
       }};
@@ -1828,10 +1897,60 @@ async def chat_branch(request: Request, _: bool = Depends(auth.require_admin)):
     copied = [{**m, "id": f"m_{uuid4().hex[:10]}", "pending_action": None} for m in messages]
     child = _new_chat(f"{chat.get('title', 'Chat')} / Branch", messages=copied)
     child["permission_mode"] = chat.get("permission_mode", "ask")
+    child["parent_id"] = chat["id"]
+    child["branch_base_count"] = len(copied)
     store["chats"].insert(0, child)
     store["active_id"] = child["id"]
     await _save_chat_store(store)
     return JSONResponse({"chat_id": child["id"]})
+
+
+@router.post("/admin/chat/merge")
+async def chat_merge(request: Request, _: bool = Depends(auth.require_admin)):
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001
+        data = {}
+    store = await _chat_store()
+    chat = _get_chat(store, data.get("chat_id"))
+    parent_id = chat.get("parent_id")
+    parent = next((c for c in store["chats"] if c["id"] == parent_id), None)
+    if not parent:
+        return JSONResponse({"ok": False, "error": "Kein Ursprung für diesen Branch.", "chat_id": chat["id"]})
+    base = int(chat.get("branch_base_count") or 0)
+    additions = []
+    for m in chat.get("messages", [])[base:]:
+        if m.get("pending_action"):
+            continue
+        additions.append({**m, "id": f"m_{uuid4().hex[:10]}", "merged_from": chat["id"]})
+    if additions:
+        parent["messages"].extend(additions)
+        parent["messages"] = parent["messages"][-80:]
+        parent["updated_at"] = _now_iso()
+    chat["merged_at"] = _now_iso()
+    store["active_id"] = parent["id"]
+    await _save_chat_store(store)
+    return JSONResponse({"ok": True, "chat_id": parent["id"], "merged": len(additions)})
+
+
+@router.post("/admin/chat/delete_message")
+async def chat_delete_message(request: Request, _: bool = Depends(auth.require_admin)):
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001
+        data = {}
+    store = await _chat_store()
+    chat = _get_chat(store, data.get("chat_id"))
+    mid = data.get("message_id")
+    before = len(chat.get("messages", []))
+    chat["messages"] = [m for m in chat.get("messages", []) if m.get("id") != mid]
+    if len(chat["messages"]) == before:
+        return JSONResponse({"ok": False, "error": "Nachricht nicht gefunden."})
+    if (chat.get("pending_action") or {}).get("message_id") == mid:
+        chat["pending_action"] = None
+    chat["updated_at"] = _now_iso()
+    await _save_chat_store(store)
+    return JSONResponse({"ok": True})
 
 
 @router.post("/admin/chat/archive")
