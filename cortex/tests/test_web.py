@@ -86,9 +86,9 @@ def test_settings_labs_and_region_save(memdb):
     assert "lab_density" in r.text
     assert "addrresults" in r.text
     assert 'name="country_code"' in r.text
-    assert 'href="#settings-updates"' in r.text
-    assert "Git Pull ausführen" in r.text
-    assert "/admin/update/status" in r.text
+    assert 'href="#settings-updates"' not in r.text
+    assert "Git Pull ausführen" not in r.text
+    assert "/admin/update/status" not in r.text
 
     csrf = c.cookies.get(auth.CSRF_COOKIE)
     r = c.post("/admin/settings", data={

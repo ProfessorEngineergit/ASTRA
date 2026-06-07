@@ -113,7 +113,9 @@ async def _git_update_status(*, fetch: bool = False) -> dict:
     local_tag = await _git_text(["git", "describe", "--tags", "--exact-match", "HEAD"])
     latest_tag = await _git_text(["git", "describe", "--tags", "--abbrev=0", "origin/main"])
     ahead_behind = await _git_text(["git", "rev-list", "--left-right", "--count", "HEAD...origin/main"])
-    dirty = bool(await _git_text(["git", "status", "--short"]))
+    tracked_status = await _git_text(["git", "status", "--short", "--untracked-files=no"])
+    untracked_status = await _git_text(["git", "ls-files", "--others", "--exclude-standard"])
+    dirty = bool(tracked_status)
     commit_lines = await _git_text(
         ["git", "log", "--oneline", "--no-decorate", "--max-count=6", "HEAD..origin/main"]
     )
@@ -135,10 +137,12 @@ async def _git_update_status(*, fetch: bool = False) -> dict:
         "current_version": current_version,
         "target_version": target_version,
         "release_mode": "release-tag" if latest_tag else "commit-fallback",
-        "update_available": bool(remote_full and local_full and remote_full != local_full),
+        "update_available": behind > 0,
         "ahead": ahead,
         "behind": behind,
         "dirty": dirty,
+        "tracked_changes": [line for line in tracked_status.splitlines() if line],
+        "untracked_count": len([line for line in untracked_status.splitlines() if line]),
         "commits": [line for line in commit_lines.splitlines() if line],
         "pull_command": " ".join(UPDATE_PULL_COMMAND),
         "rebuild_command": UPDATE_REBUILD_COMMAND,
@@ -857,7 +861,6 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
     s = await _app_settings()
     loc = s.get("location", {}) or {}
     labs = _labs(s)
-    update_status = await _git_update_status(fetch=False)
     token = await auth.issue_csrf()
     save_fx = " save-pulse" if saved and labs.get("save_effect") == "on" else ""
     flash = f'<div class="flash ok{save_fx}">Gespeichert.</div>' if saved else ""
@@ -887,19 +890,6 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
         }.items())
     cur_font = labs.get("font", s.get("font", "inter"))
     addr = esc(loc.get("address", ""))
-    update_ok = bool(update_status.get("ok"))
-    update_available = bool(update_status.get("update_available"))
-    update_title = "Update verfügbar" if update_available else "ASTRA ist aktuell" if update_ok else "Update-Check nicht bereit"
-    update_subtitle = (
-        f"Lokal {update_status.get('current_version', 'unbekannt')} · Remote {update_status.get('target_version', 'unbekannt')}"
-        if update_ok else update_status.get("message", "Git-Status konnte nicht gelesen werden.")
-    )
-    update_meter = "100" if update_available else "12" if update_ok else "0"
-    update_commits = update_status.get("commits") or []
-    update_notes = "".join(
-        f'<li>{esc(line)}</li>' for line in update_commits[:4]
-    ) or '<li>Keine entfernten Commits im lokalen Cache. „Nach Updates suchen" aktualisiert den Stand.</li>'
-    update_pull_disabled = "disabled" if (not update_available or update_status.get("dirty") or not update_ok) else ""
     font_opts = "".join(
         f'<option value="{esc(k)}" {"selected" if k == cur_font else ""}>{esc(name)}</option>'
         for k, name in font_choices())
@@ -1141,71 +1131,6 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
       setTimeout(() => map.invalidateSize(), 200);
     </script>"""
     )
-    update_script = """
-    <script>
-      (() => {
-        const root = document.querySelector('[data-settings-update]');
-        if (!root) return;
-        const title = document.getElementById('settingsUpdateTitle');
-        const subtitle = document.getElementById('settingsUpdateSubtitle');
-        const version = document.getElementById('settingsUpdateVersion');
-        const bar = document.getElementById('settingsUpdateBar');
-        const log = document.getElementById('settingsUpdateLog');
-        const notes = document.getElementById('settingsUpdateNotes');
-        const checkBtn = document.getElementById('settingsUpdateCheck');
-        const pullBtn = document.getElementById('settingsUpdatePull');
-
-        function renderList(lines) {
-          notes.innerHTML = '';
-          (lines && lines.length ? lines : ['Keine entfernten Commits im lokalen Cache.']).slice(0, 6).forEach(line => {
-            const li = document.createElement('li');
-            li.textContent = line;
-            notes.appendChild(li);
-          });
-        }
-        function render(d) {
-          title.textContent = d.update_available ? 'Update verfügbar' : d.ok ? 'ASTRA ist aktuell' : 'Update-Check nicht bereit';
-          version.textContent = d.target_version || d.remote_sha || d.current_version || 'Latest';
-          subtitle.textContent = d.ok
-            ? `Lokal ${d.current_version || '?'} · Remote ${d.target_version || d.remote_sha || '?'} · ${d.release_mode || 'commit'}`
-            : (d.message || 'Git-Status konnte nicht gelesen werden.');
-          bar.style.width = d.update_available ? '100%' : d.ok ? '12%' : '0%';
-          pullBtn.disabled = !d.ok || d.dirty || !d.update_available;
-          if (d.dirty) log.textContent = 'Lokale Git-Änderungen blockieren Pulls. Erst committen/stashen/aufräumen.';
-          renderList(d.commits || []);
-          if (d.pull) {
-            log.textContent = [d.message, d.pull.out, d.pull.err].filter(Boolean).join('\\n\\n') || d.message || '';
-          } else if (d.fetch && !d.fetch.ok) {
-            log.textContent = [d.fetch.err, d.fetch.out].filter(Boolean).join('\\n') || 'Fetch fehlgeschlagen.';
-          } else if (!d.dirty && !d.pull) {
-            log.textContent = d.release_note || '';
-          }
-        }
-        async function call(url, method) {
-          const r = await fetch(url, { method: method || 'GET' });
-          const d = await r.json();
-          render(d);
-          return d;
-        }
-        checkBtn.onclick = async () => {
-          checkBtn.disabled = true;
-          log.textContent = 'Prüfe origin/main und Tags...';
-          try { await call('/admin/update/check', 'POST'); }
-          catch (e) { log.textContent = 'Update-Check fehlgeschlagen: ' + e; }
-          finally { checkBtn.disabled = false; }
-        };
-        pullBtn.onclick = async () => {
-          if (!confirm('git pull --ff-only origin main jetzt auf dem Server ausführen?')) return;
-          pullBtn.disabled = true;
-          root.classList.add('is-pulling');
-          log.textContent = 'Pull läuft...';
-          try { await call('/admin/update/pull', 'POST'); }
-          catch (e) { log.textContent = 'Pull fehlgeschlagen: ' + e; }
-          finally { root.classList.remove('is-pulling'); pullBtn.disabled = false; }
-        };
-        call('/admin/update/status').catch(() => {});
-      })();
-    </script>"""
     body = f"""
     {_labs_css(labs)}
     <div class="settings-hero">
@@ -1224,7 +1149,6 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
       <a href="#settings-general">Allgemein</a>
       <a href="#settings-location">Standort</a>
       <a href="#settings-labs">Labs</a>
-      <a href="#settings-updates">Updates</a>
     </div>
     <form method="post" action="/admin/settings" id="settings-form">
       <input type="hidden" name="csrf" value="{esc(token)}">
@@ -1327,57 +1251,12 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
         <div class="labs-grid">{lab_tiles}</div>
       </div>
 
-      <div class="panel settings-update-panel" id="settings-updates" style="margin-bottom:16px">
-        <div class="settings-section-head">
-          <div>
-            <div class="lab-eyebrow">Updates</div>
-            <h2>Server-Update</h2>
-            <p>ASTRA prüft Releases/Tags und fällt sonst sauber auf Commits zurück. Der Pull läuft als
-              feste Git-Aktion im Repository, ohne freie Shell-Befehle.</p>
-          </div>
-          <a class="btn ghost sm" href="/admin/update">Große Karte</a>
-        </div>
-        <div class="settings-update-card {'has-update' if update_available else ''}" data-settings-update>
-          <div class="settings-update-grid"></div>
-          <div class="settings-update-inner">
-            <div class="settings-update-copy">
-              <span class="settings-update-eyebrow">Release Channel · {esc(update_status.get('release_mode', 'commit-fallback'))}</span>
-              <h3 id="settingsUpdateTitle">{esc(update_title)}</h3>
-              <p id="settingsUpdateSubtitle">{esc(update_subtitle)}</p>
-            </div>
-            <div class="settings-update-version" id="settingsUpdateVersion">
-              {esc(update_status.get('target_version') or update_status.get('remote_sha') or "Latest")}
-            </div>
-            <div class="settings-update-progress"><i id="settingsUpdateBar" style="width:{update_meter}%"></i></div>
-            <div class="settings-update-actions">
-              <button class="btn secondary" type="button" id="settingsUpdateCheck">Nach Updates suchen</button>
-              <button class="btn" type="button" id="settingsUpdatePull" {update_pull_disabled}>Git Pull ausführen</button>
-            </div>
-          </div>
-        </div>
-        <div class="settings-update-notes">
-          <div>
-            <div class="notes-header">Nächste Änderungen</div>
-            <ul id="settingsUpdateNotes">{update_notes}</ul>
-          </div>
-          <details>
-            <summary>Release-Regel für Agenten</summary>
-            <p>Ab jetzt ist ideal: nach erfolgreichem Commit einen Tag wie <code>v2026.06.07.1</code>
-              setzen und pushen. Die UI zeigt dann diesen Release-Tag; ohne Tag bleibt der Commit-SHA sichtbar.</p>
-            <pre>git tag -a vYYYY.MM.DD.N -m "ASTRA update"
-git push origin main --tags</pre>
-          </details>
-        </div>
-        <pre class="settings-update-log" id="settingsUpdateLog">{esc(update_status.get('release_note', ''))}</pre>
-      </div>
-
       <button class="btn" type="submit">Alles speichern</button>
     </form>
 
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    {settings_script}
-    {update_script}"""
+    {settings_script}"""
     return _html_with_csrf(page("Einstellungen", body, active="settings"), token)
 
 
@@ -2492,7 +2371,9 @@ async def updates_page(request: Request, _: bool = Depends(auth.require_admin)):
             mainUpdateBtn.disabled = !d.ok || d.dirty || !d.update_available;
             mainUpdateBtn.textContent = d.update_available ? 'Update starten' : d.dirty ? 'Lokale Änderungen' : 'Aktuell';
             if (d.dirty) {{
-                cardSubtitle.textContent = 'Lokale Git-Änderungen blockieren Pulls. Erst committen/stashen/aufräumen.';
+                cardSubtitle.textContent = 'Getrackte lokale Git-Änderungen blockieren Pulls. Erst committen/stashen/aufräumen.';
+            }} else if (d.untracked_count) {{
+                cardSubtitle.textContent += ` · ${{d.untracked_count}} ungetrackte Datei(en) ignoriert.`;
             }}
             renderCommitLines(d.commits || []);
         }}
@@ -2502,7 +2383,7 @@ async def updates_page(request: Request, _: bool = Depends(auth.require_admin)):
             const subtitleEl = document.getElementById('cardSubtitle');
 
             try {{
-                const response = await fetch('/admin/update/status');
+                const response = await fetch('/admin/update/check', {{method: 'POST'}});
                 if (response.ok) {{
                     applyUpdateStatus(await response.json());
                 }}
