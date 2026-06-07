@@ -6,7 +6,8 @@ import asyncio
 
 from app.plugins.registry import _discover_classes
 from app.tools import (
-    REGISTRY, Tool, ToolContext, clear_source, dispatch, needs_confirmation, openai_tools, register,
+    REGISTRY, Tool, ToolContext, capability_manifest, clear_source, dispatch, needs_confirmation,
+    openai_tools, register,
 )
 
 CORE_ALWAYS = {"recall_memory", "request_owner_approval"}
@@ -55,7 +56,7 @@ def test_home_assistant_read_state_does_not_pause_in_ask_mode():
     register(Tool(name="home_assistant_state", description="x", parameters={"type": "object", "properties": {}},
                   handler=lambda a, c: _async("ok"), owner_only=True, source="test"))
     register(Tool(name="home_assistant_call", description="x", parameters={"type": "object", "properties": {}},
-                  handler=lambda a, c: _async("ok"), owner_only=True, source="test"))
+                  handler=lambda a, c: _async("ok"), owner_only=True, source="test", safety="mutation"))
     try:
         assert needs_confirmation("home_assistant_state") is False
         assert needs_confirmation("home_assistant_call") is True
@@ -65,6 +66,24 @@ def test_home_assistant_read_state_does_not_pause_in_ask_mode():
                 REGISTRY.pop(name, None)
             else:
                 REGISTRY[name] = tool
+
+
+def test_safety_controls_confirmation_and_manifest_visibility():
+    register(Tool(name="_t_read", description="read", parameters={"type": "object", "properties": {}},
+                  handler=lambda a, c: _async("ok"), owner_only=True, source="test",
+                  safety="private_read", intents=["status"], examples=["read it"]))
+    register(Tool(name="_t_mutate", description="mutate", parameters={"type": "object", "properties": {}},
+                  handler=lambda a, c: _async("ok"), owner_only=True, source="test",
+                  safety="mutation", intents=["control"]))
+    try:
+        assert needs_confirmation("_t_read") is False
+        assert needs_confirmation("_t_mutate") is True
+        third = {c["tool"] for c in capability_manifest(is_owner=False)}
+        owner = {c["tool"] for c in capability_manifest(is_owner=True)}
+        assert "_t_read" not in third
+        assert "_t_read" in owner and "_t_mutate" in owner
+    finally:
+        clear_source("test")
 
 
 async def _async(v):

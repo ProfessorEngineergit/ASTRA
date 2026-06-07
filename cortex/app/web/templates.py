@@ -422,6 +422,15 @@ main:has(.chat-shell) { max-width: 1680px; padding: 18px 18px 44px; }
 .action-card span { color: var(--text-dim); font-family: 'JetBrains Mono', monospace; font-size: 12px; }
 .action-card pre { margin: 0; max-height: 180px; overflow: auto; color: var(--text-dim);
   font: 12px/1.45 'JetBrains Mono', monospace; white-space: pre-wrap; }
+.tool-cards { display: grid; gap: 8px; margin-top: 12px; }
+.tool-card { border: 1px solid var(--border); background: #050507; border-radius: 8px; padding: 8px 10px; }
+.tool-card.ok { border-color: rgba(54,211,153,.28); }
+.tool-card.warn { border-color: rgba(245,196,81,.32); }
+.tool-card summary { cursor: pointer; display: flex; gap: 10px; align-items: center; color: var(--text-dim); }
+.tool-card summary b { color: var(--text); font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+.tool-card summary span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.tool-card pre { margin: 8px 0 0; max-height: 220px; overflow: auto; color: var(--text-dim);
+  font: 11.5px/1.45 'JetBrains Mono', monospace; white-space: pre-wrap; }
 .chat-input { display: flex; gap: 10px; align-items: flex-end; padding: 16px 22px; border-top: 1px solid var(--hair);
   background: rgba(255,255,255,.018); }
 .chat-input textarea { flex: 1; resize: none; min-height: 50px; max-height: 220px;

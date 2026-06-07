@@ -16,7 +16,7 @@ from .config_store import SECRET_SENTINEL, get_config_store
 from .models import set_model_override
 from .plugins.base import CATEGORY_LABELS
 from .plugins.registry import get_manager
-from .tools import Tool, ToolContext, register
+from .tools import REGISTRY, Tool, ToolContext, capability_manifest, dispatch, register
 
 log = logging.getLogger("astra.admin_tools")
 
@@ -130,6 +130,52 @@ async def _test_integration(args: dict, ctx: ToolContext) -> str:
         return f"Fehler: {e}"
 
 
+async def _list_capabilities(args: dict, ctx: ToolContext) -> str:
+    caps = capability_manifest(is_owner=ctx.is_owner)
+    q = (args.get("query") or "").lower()
+    if q:
+        caps = [
+            c for c in caps
+            if q in (c["tool"] + " " + c["source"] + " " + c["description"]).lower()
+        ]
+    if not caps:
+        return "Keine passenden Agentenfähigkeiten."
+    rows = [
+        f"• {c['tool']} [{c['source']}/{c['safety']}] intents={','.join(c['intents']) or 'generic'}"
+        for c in caps[:80]
+    ]
+    return f"{len(caps)} Agentenfähigkeiten:\n" + "\n".join(rows)
+
+
+async def _explain_capability(args: dict, ctx: ToolContext) -> str:
+    slug = (args.get("slug") or args.get("tool") or "").strip()
+    caps = [
+        c for c in capability_manifest(is_owner=ctx.is_owner)
+        if c["source"] == slug or c["tool"] == slug
+    ]
+    if not caps:
+        return f"Keine Fähigkeit zu '{slug}' gefunden."
+    return json.dumps(caps[:20], ensure_ascii=False, indent=2)
+
+
+async def _test_capability(args: dict, ctx: ToolContext) -> str:
+    tool_name = (args.get("tool") or "").strip()
+    if tool_name not in REGISTRY:
+        return f"Unbekanntes Tool: {tool_name}"
+    test_args = args.get("args") or {}
+    if not isinstance(test_args, dict):
+        test_args = {}
+    test_ctx = ToolContext(
+        thread_id=ctx.thread_id,
+        channel=ctx.channel,
+        contact=ctx.contact,
+        max_sensitivity=ctx.max_sensitivity,
+        is_owner=ctx.is_owner,
+        permission_mode="bypass" if ctx.permission_mode == "bypass" else "auto",
+    )
+    return await dispatch(tool_name, test_args, test_ctx)
+
+
 # ─── Settings / autonomy / system ──────────────────────────────────────────────
 async def _get_settings(args: dict, ctx: ToolContext) -> str:
     s = await _settings()
@@ -218,8 +264,22 @@ def register_admin_tools() -> None:
              "allow_self_config": {"type": "boolean"}}}, _update_settings),
         ("astra_system_status", "Container-Leistung (RAM/CPU/Disk/Uptime) + Empfehlungen.",
          {"type": "object", "properties": {}}, _system_status),
+        ("astra_list_capabilities", "Liste verfügbare Agentenfähigkeiten mit Safety/Intent.",
+         {"type": "object", "properties": {"query": {"type": "string"}}}, _list_capabilities),
+        ("astra_explain_capability", "Erkläre eine Integration oder ein Tool aus dem Capability-Manifest.",
+         {"type": "object", "properties": {
+             "slug": {"type": "string"},
+             "tool": {"type": "string"}}}, _explain_capability),
+        ("astra_test_capability", "Teste ein konkretes Agenten-Tool mit optionalen Argumenten.",
+         {"type": "object", "properties": {
+             "tool": {"type": "string"},
+             "args": {"type": "object"}}}, _test_capability),
     ]
     for name, desc, params, handler in defs:
+        safety = "mutation" if name in {
+            "astra_configure_integration", "astra_update_settings", "astra_test_capability"
+        } else "private_read"
+        intents = ["status", "list"] if "list" in name or "status" in name else ["control"] if safety == "mutation" else ["status"]
         register(Tool(name=name, description=desc, parameters=params, handler=handler,
-                      owner_only=True, source="core"))
+                      owner_only=True, source="core", safety=safety, intents=intents))
     log.info("Registered %d self-admin tools.", len(defs))

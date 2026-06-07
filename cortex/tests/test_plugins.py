@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import types
 from datetime import time
@@ -14,6 +15,10 @@ from app.plugins.registry import _discover_classes, get_manager
 from app.tools import ToolContext
 
 EXPECTED = {"rmv", "home_assistant", "edupage", "google_tasks"}
+
+
+def _payload(text: str) -> dict:
+    return json.loads(text)
 
 
 def test_discovery_finds_builtin_plugins():
@@ -93,26 +98,32 @@ def test_edupage_auto_scans_for_next_lesson(monkeypatch):
     plugin = EduPagePlugin({"__enabled": True, "subdomain": "school", "username": "u", "password": "p"})
     calls = []
 
-    async def fake_timetable(day):
+    async def fake_timetable_result(day):
         calls.append(day)
         if len(calls) < 2:
-            return []
-        return [{
+            return {"ok": True, "method": "get_my_timetable", "date": day.isoformat(), "lessons": [], "error": None}
+        return {"ok": True, "method": "get_my_timetable", "date": day.isoformat(), "lessons": [{
             "period": "1",
             "subject": "Mathe",
             "teacher": "Frau X",
             "classroom": "A101",
             "start": "08:00",
             "end": "08:45",
-        }]
+        }], "error": None}
 
-    monkeypatch.setattr(plugin, "timetable", fake_timetable)
+    async def fake_changes_result(day):
+        return {"ok": True, "method": "get_timetable_changes", "date": day.isoformat(), "changes": [], "error": None}
+
+    monkeypatch.setattr(plugin, "timetable_result", fake_timetable_result)
+    monkeypatch.setattr(plugin, "changes_result", fake_changes_result)
     timetable = next(t for t in plugin.tools() if t.name == "get_timetable")
     ctx = ToolContext(thread_id="web-owner:test", channel="web", contact={"id": "owner"}, is_owner=True)
 
     result = asyncio.run(timetable.handler({}, ctx))
+    payload = _payload(result)
 
-    assert "Mathe" in result
+    assert payload["ok"] is True
+    assert "Mathe" in payload["summary"]
     assert len(calls) == 2
 
 
@@ -148,8 +159,11 @@ def test_edupage_fetch_uses_current_get_my_timetable_signature(monkeypatch):
     monkeypatch.setitem(sys.modules, "edupage_api", fake_mod)
 
     plugin = EduPagePlugin({"__enabled": True, "subdomain": "school", "username": "u", "password": "p"})
-    lessons = plugin._fetch_sync(__import__("datetime").date(2026, 6, 8))
+    result = plugin._fetch_sync(__import__("datetime").date(2026, 6, 8))
+    lessons = result["lessons"]
 
+    assert result["ok"] is True
+    assert result["method"] == "get_my_timetable"
     assert calls[0] == ("login", "u", "school")
     assert calls[1] == ("my", "2026-06-08")
     assert lessons[0]["subject"] == "Deutsch"
@@ -166,29 +180,78 @@ def test_edupage_group_filter_and_substitutions(monkeypatch):
         "preferred_group": "B",
     })
 
-    async def fake_timetable(day):
-        return [
+    async def fake_timetable_result(day):
+        return {"ok": True, "method": "get_my_timetable", "date": day.isoformat(), "lessons": [
             {"period": "1", "subject": "Physik", "teacher": "Frau P", "classroom": "P1",
              "groups": ["A"], "start": "08:00", "end": "08:45"},
             {"period": "2", "subject": "Mathe", "teacher": "Herr M", "classroom": "M2",
              "groups": ["B"], "start": "08:50", "end": "09:35", "curriculum": "Epoch"},
             {"period": "3", "subject": "Deutsch", "teacher": "Frau D", "classroom": "D3",
              "groups": [], "start": "09:50", "end": "10:35"},
-        ]
+        ], "error": None}
 
-    async def fake_changes(day):
-        return [{"class": "10B", "lesson": "2", "title": "Mathe in M4", "action": "change"}]
+    async def fake_changes_result(day):
+        return {"ok": True, "method": "get_timetable_changes", "date": day.isoformat(),
+                "changes": [{"class": "10B", "lesson": "2", "title": "Mathe in M4", "action": "change"}],
+                "error": None}
 
-    monkeypatch.setattr(plugin, "timetable", fake_timetable)
-    monkeypatch.setattr(plugin, "timetable_changes", fake_changes)
+    monkeypatch.setattr(plugin, "timetable_result", fake_timetable_result)
+    monkeypatch.setattr(plugin, "changes_result", fake_changes_result)
     timetable = next(t for t in plugin.tools() if t.name == "get_timetable")
     ctx = ToolContext(thread_id="web-owner:test", channel="web", contact={"id": "owner"}, is_owner=True)
 
     result = asyncio.run(timetable.handler({"day": "tomorrow"}, ctx))
+    payload = _payload(result)
 
-    assert "Gruppe B" in result
-    assert "Mathe" in result
-    assert "Epoch" in result
-    assert "Deutsch" in result
-    assert "Physik" not in result
-    assert "Vertretungen" in result
+    assert payload["ok"] is True
+    assert "Gruppe B" in payload["summary"]
+    assert "Mathe" in payload["summary"]
+    assert "Epoch" in payload["summary"]
+    assert "Deutsch" in payload["summary"]
+    assert "Physik" not in payload["summary"]
+    assert "Vertretungen" in payload["summary"]
+    assert payload["data"]["debug"]["raw_lesson_count"] == 3
+    assert payload["data"]["debug"]["filtered_lesson_count"] == 2
+
+
+def test_edupage_api_error_is_diagnostic(monkeypatch):
+    plugin = EduPagePlugin({"__enabled": True, "subdomain": "school", "username": "u", "password": "p"})
+
+    async def boom(day):
+        return {"ok": False, "method": "get_my_timetable", "date": day.isoformat(), "lessons": [],
+                "error": {"type": "LoginError", "message": "bad auth", "method": "get_my_timetable"}}
+
+    monkeypatch.setattr(plugin, "timetable_result", boom)
+    timetable = next(t for t in plugin.tools() if t.name == "edupage_get_timetable")
+    ctx = ToolContext(thread_id="web-owner:test", channel="web", contact={"id": "owner"}, is_owner=True)
+
+    payload = _payload(asyncio.run(timetable.handler({"day": "tomorrow"}, ctx)))
+
+    assert payload["ok"] is False
+    assert "API lieferte LoginError" in payload["summary"]
+    assert payload["data"]["debug"]["timetable_error"]["message"] == "bad auth"
+
+
+def test_edupage_changes_and_debug_tools(monkeypatch):
+    plugin = EduPagePlugin({"__enabled": True, "subdomain": "school", "username": "u", "password": "p"})
+
+    async def fake_timetable_result(day):
+        return {"ok": True, "method": "get_my_timetable", "date": day.isoformat(), "lessons": [], "error": None}
+
+    async def fake_changes_result(day):
+        return {"ok": True, "method": "get_timetable_changes", "date": day.isoformat(),
+                "changes": [{"class": "10B", "lesson": "1", "title": "Raumwechsel", "action": "change"}],
+                "error": None}
+
+    monkeypatch.setattr(plugin, "timetable_result", fake_timetable_result)
+    monkeypatch.setattr(plugin, "changes_result", fake_changes_result)
+    tool_map = {t.name: t for t in plugin.tools()}
+    ctx = ToolContext(thread_id="web-owner:test", channel="web", contact={"id": "owner"}, is_owner=True)
+
+    changes = _payload(asyncio.run(tool_map["edupage_get_changes"].handler({"day": "tomorrow"}, ctx)))
+    debug = _payload(asyncio.run(tool_map["edupage_debug_day"].handler({"day": "tomorrow"}, ctx)))
+
+    assert changes["ok"] is True
+    assert "Raumwechsel" in changes["summary"]
+    assert debug["data"]["debug"]["changes_count"] == 1
+    assert "edupage_get_timetable" in tool_map

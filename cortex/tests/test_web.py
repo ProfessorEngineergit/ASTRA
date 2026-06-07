@@ -158,6 +158,21 @@ def test_update_page_and_status(memdb):
     assert "repo_root" in data
 
 
+def test_system_shows_agent_tools(memdb):
+    _prime_manager()
+    c = TestClient(_app())
+    r = c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+
+    r = c.get("/admin/system")
+
+    assert r.status_code == 200
+    assert "Agent Tools" in r.text
+    assert "recall_memory" in r.text
+
+
 def test_chat_archive_restore_tabs(memdb):
     _prime_manager()
     c = TestClient(_app())
@@ -240,3 +255,31 @@ def test_chat_icon_actions_delete_and_merge(memdb):
     assert r.json()["ok"] is True
     parent = next(ch for ch in memdb[web_admin.CHAT_KEY]["chats"] if ch["id"] == chat_id)
     assert all(m["id"] != target for m in parent["messages"])
+
+
+def test_chat_renders_tool_call_cards(memdb):
+    _prime_manager()
+    c = TestClient(_app())
+    r = c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+
+    created = c.post("/admin/chat/new", json={}).json()
+    chat_id = created["chat_id"]
+    store = memdb[web_admin.CHAT_KEY]
+    chat = next(ch for ch in store["chats"] if ch["id"] == chat_id)
+    chat["messages"].append(web_admin._msg("assistant", "Ich habe EduPage gefragt.", tool_calls=[{
+        "tool": "edupage_get_timetable",
+        "args": {"day": "tomorrow"},
+        "ok": False,
+        "summary": "Ich habe EduPage gefragt, aber die API lieferte LoginError.",
+        "result": {"ok": False, "error": {"type": "LoginError"}},
+    }]))
+    memdb[web_admin.CHAT_KEY] = store
+
+    r = c.get(f"/admin/chat?chat={chat_id}")
+
+    assert r.status_code == 200
+    assert "tool-card warn" in r.text
+    assert "edupage_get_timetable" in r.text

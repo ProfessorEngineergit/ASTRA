@@ -2,16 +2,21 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import date as date_cls
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from ...config import get_settings
-from ...tools import Tool, ToolContext
+from ...tools import Tool, ToolContext, tool_result
 from ..base import ConfigField, FieldType, HealthStatus, Plugin, PluginCategory
 
 log = logging.getLogger("astra.plugin.edupage")
+
+
+def _err(e: Exception, *, method: str, day: date_cls) -> dict:
+    return {"type": type(e).__name__, "message": str(e), "method": method, "date": day.isoformat()}
 
 
 class EduPagePlugin(Plugin):
@@ -69,18 +74,20 @@ class EduPagePlugin(Plugin):
             "event": is_event,
         }
 
-    def _fetch_sync(self, day: date_cls) -> list[dict]:
+    def _fetch_sync(self, day: date_cls) -> dict:
         ep = self._login_sync()
+        method = "get_my_timetable"
         try:
             tt = ep.get_my_timetable(day)
         except AttributeError:
+            method = "get_timetable_legacy"
             tt = ep.get_timetable(day)
         out = []
         for ls in (getattr(tt, "lessons", None) or []):
             out.append(self._lesson_to_dict(ls))
-        return out
+        return {"ok": True, "method": method, "date": day.isoformat(), "lessons": out, "error": None}
 
-    def _changes_sync(self, day: date_cls) -> list[dict]:
+    def _changes_sync(self, day: date_cls) -> dict:
         ep = self._login_sync()
         changes = []
         for ch in ep.get_timetable_changes(day) or []:
@@ -91,23 +98,51 @@ class EduPagePlugin(Plugin):
                 "title": str(getattr(ch, "title", "") or ""),
                 "action": getattr(action, "value", str(action or "")),
             })
-        return changes
+        return {
+            "ok": True,
+            "method": "get_timetable_changes",
+            "date": day.isoformat(),
+            "changes": changes,
+            "error": None,
+        }
 
     async def timetable(self, day: date_cls | None = None) -> list[dict]:
+        day = day or date_cls.today()
+        result = await self.timetable_result(day)
+        return result.get("lessons", []) if result.get("ok") else []
+
+    async def timetable_result(self, day: date_cls | None = None) -> dict:
         day = day or date_cls.today()
         try:
             return await asyncio.to_thread(self._fetch_sync, day)
         except Exception as e:  # noqa: BLE001
             log.warning("EduPage fetch failed: %s", e)
-            return []
+            return {
+                "ok": False,
+                "method": "get_my_timetable",
+                "date": day.isoformat(),
+                "lessons": [],
+                "error": _err(e, method="get_my_timetable", day=day),
+            }
 
     async def timetable_changes(self, day: date_cls | None = None) -> list[dict]:
+        day = day or date_cls.today()
+        result = await self.changes_result(day)
+        return result.get("changes", []) if result.get("ok") else []
+
+    async def changes_result(self, day: date_cls | None = None) -> dict:
         day = day or date_cls.today()
         try:
             return await asyncio.to_thread(self._changes_sync, day)
         except Exception as e:  # noqa: BLE001
             log.warning("EduPage substitution fetch failed: %s", e)
-            return []
+            return {
+                "ok": False,
+                "method": "get_timetable_changes",
+                "date": day.isoformat(),
+                "changes": [],
+                "error": _err(e, method="get_timetable_changes", day=day),
+            }
 
     async def health_check(self) -> HealthStatus:
         base = await super().health_check()
@@ -195,6 +230,36 @@ class EduPagePlugin(Plugin):
             rows = [f"{ch.get('class')}: {ch.get('lesson')}. {ch.get('title')} [{ch.get('action')}]" for ch in changes]
         return "Vertretungen/Änderungen:\n- " + "\n- ".join(rows[:12])
 
+    @staticmethod
+    def _day_candidates(raw_day: str, today: date_cls) -> list[date_cls]:
+        raw_day = (raw_day or "auto").strip().lower()
+        if raw_day in ("now", "jetzt", "today", "heute"):
+            return [today]
+        if raw_day in ("tomorrow", "morgen"):
+            return [today + timedelta(days=1)]
+        if raw_day in ("auto", "next", "next_school_day", "nächster schultag", "naechster schultag"):
+            return [today + timedelta(days=i) for i in range(0, 8)]
+        try:
+            return [date_cls.fromisoformat(raw_day)]
+        except ValueError:
+            return [today + timedelta(days=i) for i in range(0, 8)]
+
+    @classmethod
+    def _debug(cls, day: date_cls, raw_result: dict, changes_result: dict, filtered: list[dict], group: str) -> dict:
+        raw_lessons = raw_result.get("lessons", []) if raw_result.get("ok") else []
+        return {
+            "date": day.isoformat(),
+            "group": group,
+            "timetable_method": raw_result.get("method"),
+            "changes_method": changes_result.get("method"),
+            "raw_lesson_count": len(raw_lessons),
+            "filtered_lesson_count": len(filtered),
+            "changes_count": len(changes_result.get("changes", []) if changes_result.get("ok") else []),
+            "available_groups": sorted({g for l in raw_lessons for g in (l.get("groups") or [])}),
+            "timetable_error": raw_result.get("error"),
+            "changes_error": changes_result.get("error"),
+        }
+
     def tools(self) -> list[Tool]:
         async def _get_timetable(args: dict, ctx: ToolContext) -> str:
             tz = ZoneInfo(get_settings().astra_timezone)
@@ -207,24 +272,36 @@ class EduPagePlugin(Plugin):
             if raw_day in ("now", "jetzt"):
                 raw_day = "today"
                 mode = "now"
-            if raw_day in ("today", "heute"):
-                days = [today]
-            elif raw_day in ("tomorrow", "morgen"):
-                days = [today + timedelta(days=1)]
-            elif raw_day in ("auto", "next", "next_school_day", "nächster schultag", "naechster schultag"):
-                days = [today + timedelta(days=i) for i in range(0, 8)]
-            else:
-                try:
-                    days = [date_cls.fromisoformat(raw_day)]
-                except ValueError:
-                    days = [today + timedelta(days=i) for i in range(0, 8)]
+            days = self._day_candidates(raw_day, today)
 
             checked: list[str] = []
+            diagnostics = []
             for day in days:
                 checked.append(day.isoformat())
-                raw_lessons = await self.timetable(day)
+                raw_result = await self.timetable_result(day)
+                if not raw_result.get("ok"):
+                    changes_result = await self.changes_result(day) if include_changes else {
+                        "ok": True, "changes": [], "method": "disabled", "error": None,
+                    }
+                    debug = self._debug(day, raw_result, changes_result, [], group)
+                    diagnostics.append(debug)
+                    summary = (
+                        f"Ich habe EduPage für {day.isoformat()} gefragt, aber die API lieferte "
+                        f"{(raw_result.get('error') or {}).get('type', 'einen Fehler')}: "
+                        f"{(raw_result.get('error') or {}).get('message', 'unbekannt')}."
+                    )
+                    return tool_result(
+                        ok=False, summary=summary, data={"debug": debug}, source=self.slug,
+                        error=raw_result.get("error"),
+                    )
+                raw_lessons = raw_result.get("lessons", [])
                 lessons = self._filter_lessons(raw_lessons, group)
-                changes = await self.timetable_changes(day) if include_changes else []
+                changes_result = await self.changes_result(day) if include_changes else {
+                    "ok": True, "changes": [], "method": "disabled", "error": None,
+                }
+                changes = changes_result.get("changes", []) if changes_result.get("ok") else []
+                debug = self._debug(day, raw_result, changes_result, lessons, group)
+                diagnostics.append(debug)
                 if lessons:
                     header = f"Stundenplan {day.isoformat()} · Gruppe {group}" if group else f"Stundenplan {day.isoformat()}"
                     if mode in ("now", "jetzt", "current", "next", "aktuell"):
@@ -238,19 +315,80 @@ class EduPagePlugin(Plugin):
                         body = header + ":\n- " + "\n- ".join(lines)
                     if include_changes:
                         body += "\n\n" + self._format_changes(changes, group)
-                    return body
+                        if not changes_result.get("ok"):
+                            body += (
+                                "\nVertretungen konnten nicht gelesen werden: "
+                                + json.dumps(changes_result.get("error"), ensure_ascii=False)
+                            )
+                    return tool_result(
+                        ok=True,
+                        summary=body,
+                        data={"date": day.isoformat(), "lessons": lessons, "changes": changes, "debug": debug},
+                        source=self.slug,
+                        warnings=[] if changes_result.get("ok") else ["Vertretungen nicht verfügbar"],
+                        error=None if changes_result.get("ok") else changes_result.get("error"),
+                    )
                 if raw_lessons:
-                    return (
+                    summary = (
                         f"Für {day.isoformat()} gibt es EduPage-Stunden, aber keine passende Stunde "
                         f"für Gruppe {group}. Verfügbare Gruppen: "
                         + ", ".join(sorted({g for l in raw_lessons for g in (l.get("groups") or [])}) or ["—"])
                     )
+                    return tool_result(ok=False, summary=summary, data={"debug": debug}, source=self.slug)
                 if changes:
-                    return f"Kein Stundenplan für {day.isoformat()} gefunden.\n\n{self._format_changes(changes, group)}"
-            return f"Kein Stundenplan gefunden. Geprüft: {', '.join(checked)}."
+                    summary = f"Kein Stundenplan für {day.isoformat()} gefunden.\n\n{self._format_changes(changes, group)}"
+                    return tool_result(
+                        ok=True, summary=summary,
+                        data={"date": day.isoformat(), "lessons": [], "changes": changes, "debug": debug},
+                        source=self.slug,
+                    )
+            return tool_result(
+                ok=False,
+                summary=f"Kein Stundenplan gefunden. Geprüft: {', '.join(checked)}.",
+                data={"checked": checked, "debug": diagnostics},
+                source=self.slug,
+                error={"type": "empty_timetable", "message": "EduPage lieferte keine Stunden für die geprüften Tage."},
+            )
 
-        return [Tool(
-            name="get_timetable",
+        async def _get_changes(args: dict, ctx: ToolContext) -> str:
+            tz = ZoneInfo(get_settings().astra_timezone)
+            today = datetime.now(tz).date()
+            day = self._day_candidates(str(args.get("day") or "today"), today)[0]
+            group = self._wanted_group(args, self._default_group())
+            result = await self.changes_result(day)
+            if not result.get("ok"):
+                summary = (
+                    f"Ich habe EduPage-Vertretungen für {day.isoformat()} gefragt, aber die API lieferte "
+                    f"{(result.get('error') or {}).get('type', 'einen Fehler')}: "
+                    f"{(result.get('error') or {}).get('message', 'unbekannt')}."
+                )
+                return tool_result(ok=False, summary=summary, data=result, source=self.slug, error=result.get("error"))
+            changes = result.get("changes", [])
+            summary = f"{day.isoformat()}: " + self._format_changes(changes, group)
+            return tool_result(ok=True, summary=summary, data=result, source=self.slug)
+
+        async def _debug_day(args: dict, ctx: ToolContext) -> str:
+            tz = ZoneInfo(get_settings().astra_timezone)
+            today = datetime.now(tz).date()
+            day = self._day_candidates(str(args.get("day") or "tomorrow"), today)[0]
+            group = self._wanted_group(args, self._default_group())
+            raw_result = await self.timetable_result(day)
+            raw_lessons = raw_result.get("lessons", []) if raw_result.get("ok") else []
+            lessons = self._filter_lessons(raw_lessons, group)
+            changes_result = await self.changes_result(day)
+            debug = self._debug(day, raw_result, changes_result, lessons, group)
+            summary = f"EduPage Debug {day.isoformat()}: {json.dumps(debug, ensure_ascii=False)}"
+            return tool_result(
+                ok=bool(raw_result.get("ok")),
+                summary=summary,
+                data={"debug": debug, "raw": raw_result, "changes": changes_result},
+                source=self.slug,
+                error=raw_result.get("error") or changes_result.get("error"),
+            )
+
+        return [
+            Tool(
+            name="edupage_get_timetable",
             description=(
                 "Hole Bahrians Schul-Stundenplan (EduPage). Ohne day sucht ASTRA den nächsten "
                 "Tag mit Unterricht. Standardgruppe ist B, außer Bahrian fragt explizit nach Gruppe A/B. "
@@ -262,10 +400,43 @@ class EduPagePlugin(Plugin):
                 "mode": {"type": "string", "description": "full oder now"},
                 "include_changes": {"type": "boolean", "description": "Vertretungen/Änderungen mit ausgeben"}}},
             handler=_get_timetable, owner_only=True, source=self.slug,
-        )]
+            safety="private_read", intents=["now", "list", "status"],
+            examples=["Was habe ich morgen?", "Was hat Gruppe A morgen?", "Was habe ich jetzt?"],
+            ),
+            Tool(
+                name="get_timetable",
+                description="Alias für edupage_get_timetable.",
+                parameters={"type": "object", "properties": {
+                    "day": {"type": "string"}, "group": {"type": "string"},
+                    "mode": {"type": "string"}, "include_changes": {"type": "boolean"}}},
+                handler=_get_timetable, owner_only=True, source=self.slug,
+                safety="private_read", intents=["now", "list"],
+                examples=["Stundenplan morgen"],
+            ),
+            Tool(
+                name="edupage_get_changes",
+                description="Hole EduPage-Vertretungen/Änderungen für einen exakten Tag.",
+                parameters={"type": "object", "properties": {
+                    "day": {"type": "string", "description": "today, tomorrow oder YYYY-MM-DD"},
+                    "group": {"type": "string", "description": "A oder B; leer = Standardgruppe B"}}},
+                handler=_get_changes, owner_only=True, source=self.slug,
+                safety="private_read", intents=["status", "list"],
+                examples=["Gibt es morgen Vertretungen?"],
+            ),
+            Tool(
+                name="edupage_debug_day",
+                description="Admin-Diagnose für EduPage an einem Tag: Methoden, Counts, verfügbare Gruppen, Fehler.",
+                parameters={"type": "object", "properties": {
+                    "day": {"type": "string", "description": "today, tomorrow oder YYYY-MM-DD"},
+                    "group": {"type": "string"}}},
+                handler=_debug_day, owner_only=True, source=self.slug,
+                safety="private_read", intents=["status"],
+                examples=["Debug EduPage morgen"],
+            ),
+        ]
 
     async def briefing_section(self) -> str | None:
-        lessons = await self.timetable(date_cls.today())
+        lessons = self._filter_lessons(await self.timetable(date_cls.today()), self._default_group())
         if not lessons:
             return None
         body = ", ".join(l["subject"] for l in lessons[:8])

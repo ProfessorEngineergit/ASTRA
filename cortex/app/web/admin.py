@@ -1411,6 +1411,52 @@ def _meter(pct, used_h, total_h) -> str:
             f'<div class="meter{cls}"><i style="width:{min(pct,100):.0f}%"></i></div>')
 
 
+def _tool_badge(safety: str) -> str:
+    label = {
+        "read": "read",
+        "private_read": "private",
+        "mutation": "ändert",
+        "external_send": "sendet",
+        "destructive": "riskant",
+    }.get(safety, safety or "tool")
+    cls = "ok" if safety in ("read", "private_read") else "warn"
+    return f'<span class="badge {cls}">{esc(label)}</span>'
+
+
+async def _agent_tools_panel() -> str:
+    from ..tools import capability_manifest
+    caps = capability_manifest(is_owner=True)
+    if not caps:
+        return '<div class="panel"><h2>Agent Tools</h2><p class="note">Keine Tools registriert.</p></div>'
+    rows = []
+    for cap in caps[:80]:
+        intents = ", ".join(cap.get("intents") or ["generic"])
+        examples = "; ".join(cap.get("examples") or [])
+        rows.append(
+            '<div class="svc">'
+            f'<span class="dot {"up" if not cap.get("requires_confirmation") else ""}"></span>'
+            f'<div style="flex:1"><div class="nm">{esc(cap["tool"])} {_tool_badge(cap.get("safety", ""))}</div>'
+            f'<div class="u">{esc(cap["source"])} · {esc(intents)}'
+            + (f' · {esc(examples)}' if examples else "")
+            + '</div></div>'
+            f'<form method="post" action="/admin/system/tool-test" style="margin:0">'
+            f'<input type="hidden" name="tool" value="{esc(cap["tool"])}">'
+            f'<button class="btn ghost sm" type="submit">Test</button></form></div>'
+        )
+    last = await db.get_setting("agent_tool_last", {}) or {}
+    last_html = ""
+    if last:
+        last_html = (
+            '<details style="margin-top:12px"><summary>Letzter Toolcall</summary>'
+            f'<pre>{esc(json.dumps(last, ensure_ascii=False, indent=2))}</pre></details>'
+        )
+    return (
+        '<div class="panel" style="margin-bottom:18px"><h2 style="margin:0 0 4px;font-size:15px">'
+        'Agent Tools</h2><p class="note" style="margin:0 0 12px">Registrierte Fähigkeiten, Safety und Schnelltest.</p>'
+        + "".join(rows) + last_html + '</div>'
+    )
+
+
 @router.get("/admin/system", response_class=HTMLResponse)
 async def system_page(request: Request, _: bool = Depends(auth.require_admin)):
     snap = sysinfo.snapshot()
@@ -1455,6 +1501,7 @@ async def system_page(request: Request, _: bool = Depends(auth.require_admin)):
         f'<div style="flex:1"><div class="nm">{esc(nm)}</div><div class="u">{esc(url)}</div></div>'
         f'<a class="btn ghost sm" target="_blank" rel="noopener" href="{esc(url)}">Öffnen ↗</a></div>'
         for nm, url, internal in services)
+    agent_tools = await _agent_tools_panel()
 
     body = f"""
     <div class="hero"><h1>System</h1>
@@ -1467,10 +1514,25 @@ async def system_page(request: Request, _: bool = Depends(auth.require_admin)):
       <p class="note" style="margin:0 0 8px">Vom Server vergebene Adressen. Interne Ports nur im LAN erreichbar.</p>
       {svc_rows}
     </div>
+    {agent_tools}
     <p class="note">Modell aktiv: <b>{esc(st.openai_model)}</b> (überschreibbar in den Einstellungen) ·
       <a href="/admin/update">Updates &amp; Versionen →</a></p>
     <script>setTimeout(() => location.reload(), 15000);</script>"""
     return HTMLResponse(page("System", body, active="system"))
+
+
+@router.post("/admin/system/tool-test")
+async def system_tool_test(request: Request, _: bool = Depends(auth.require_admin)):
+    from ..tools import ToolContext, dispatch
+    form = await request.form()
+    tool = str(form.get("tool") or "")
+    result = await dispatch(
+        tool,
+        {},
+        ToolContext(thread_id="web-system:tool-test", channel="web", contact={"id": "owner"}, is_owner=True),
+    )
+    await db.set_setting("agent_tool_last", {"tool": tool, "result": result, "ts": _now_iso()})
+    return RedirectResponse("/admin/system", status_code=303)
 
 
 # ─── Chat: multi-thread owner agent ────────────────────────────────────────────
@@ -1688,9 +1750,22 @@ def _render_messages(chat: dict) -> str:
                 f'<button class="btn ghost sm" data-deny-action="{esc(m["id"])}">Ablehnen</button>'
                 '</div></div>'
             )
+        tool_cards = ""
+        if m.get("tool_calls"):
+            cards = []
+            for call in m.get("tool_calls", [])[:6]:
+                ok = call.get("ok")
+                state = "ok" if ok is True else "warn" if ok is False else ""
+                cards.append(
+                    f'<details class="tool-card {state}"><summary>'
+                    f'<b>{esc(call.get("tool", "tool"))}</b><span>{esc(call.get("summary", ""))}</span>'
+                    '</summary>'
+                    f'<pre>{esc(json.dumps(call, ensure_ascii=False, indent=2))}</pre></details>'
+                )
+            tool_cards = '<div class="tool-cards">' + "".join(cards) + '</div>'
         msgs.append(
             f'<div class="msg-row {cls}" data-mid="{esc(m["id"])}">'
-            f'<div class="msg {cls}"><span class="msg-content">{esc(m.get("content", ""))}</span>{pending}</div>'
+            f'<div class="msg {cls}"><span class="msg-content">{esc(m.get("content", ""))}</span>{tool_cards}{pending}</div>'
             f'<div class="msg-actions">{actions}</div></div>'
         )
     if not msgs:
@@ -1908,6 +1983,8 @@ async def chat_send(request: Request, _: bool = Depends(auth.require_admin)):
         log.exception("web chat failed")
         result = {"reply": f"Fehler: {e}"}
     bot_msg = _msg("assistant", result.get("reply") or "(keine Antwort)")
+    if result.get("tool_calls"):
+        bot_msg["tool_calls"] = result["tool_calls"]
     if result.get("pending_action"):
         bot_msg["pending_action"] = result["pending_action"]
         chat["pending_action"] = {"message_id": bot_msg["id"], **result["pending_action"]}

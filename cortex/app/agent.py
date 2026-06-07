@@ -10,7 +10,7 @@ from . import knowledge
 from .config import get_settings
 from .models import get_gateway
 from .persona import Register, system_prompt
-from .tools import ToolContext, dispatch, needs_confirmation, openai_tools
+from .tools import ToolContext, capability_manifest, dispatch, needs_confirmation, openai_tools, result_summary
 
 log = logging.getLogger("astra.agent")
 MAX_TOOL_ITERS = 4
@@ -36,24 +36,25 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
     return out
 
 
-def _tool_context_hint(tools: list[dict]) -> str:
+def _tool_context_hint() -> str:
     rows = []
-    for tool in tools[:60]:
-        fn = tool.get("function") or {}
-        name = fn.get("name", "")
-        desc = " ".join(str(fn.get("description", "")).split())
-        if name:
-            rows.append(f"- {name}: {desc[:160]}")
+    for cap in capability_manifest(is_owner=True)[:80]:
+        intents = ",".join(cap.get("intents") or []) or "generic"
+        confirm = "confirm" if cap.get("requires_confirmation") else "safe"
+        examples = "; ".join(cap.get("examples") or [])[:140]
+        rows.append(
+            f"- {cap['tool']} [{cap['source']} · {cap['safety']} · {confirm} · {intents}]: "
+            f"{cap['description'][:150]}"
+            + (f" Beispiele: {examples}" if examples else "")
+        )
     if not rows:
         return ""
     return (
         "Verfügbare Agentenfähigkeiten in diesem Gespräch:\n"
         + "\n".join(rows)
-        + "\n\nWenn Bahrian nach aktuellen Integrationsdaten fragt (z. B. Stundenplan, "
-        "Home-Assistant-Räume, Sensoren, Entitäten, Systemstatus), nutze das passende "
-        "Werkzeug, statt aus Erinnerung zu antworten. Sage nur dann, dass du keinen "
-        "Zugriff hast, wenn kein passendes Werkzeug verfügbar ist oder das Werkzeug "
-        "konkret fehlschlägt."
+        + "\n\nNutze aktuelle Integrationsdaten immer per Werkzeug statt aus Erinnerung. "
+        "Tool-Ergebnisse sind JSON mit ok/summary/data/error. Wenn ok=false, erkläre den "
+        "konkreten API-Fehler und behaupte nicht, dass keine Daten existieren."
     )
 
 
@@ -112,7 +113,7 @@ async def generate_reply_meta(
             messages.append(
                 {"role": "system", "content": f"Dauerhaftes Wissen über {s.astra_owner_name}:\n{kb}"}
             )
-        tool_hint = _tool_context_hint(tools)
+        tool_hint = _tool_context_hint()
         if tool_hint:
             messages.append({"role": "system", "content": tool_hint})
     if summary:
@@ -147,11 +148,12 @@ async def generate_reply_meta(
         is_owner=is_owner, permission_mode=permission_mode,
     )
 
+    tool_trace = []
     for _ in range(MAX_TOOL_ITERS):
         msg = await gw.chat(messages, tools=tools)
         tool_calls = getattr(msg, "tool_calls", None)
         if not tool_calls:
-            return {"reply": (msg.content or "").strip()}
+            return {"reply": (msg.content or "").strip(), "tool_calls": tool_trace}
         messages.append(
             {
                 "role": "assistant",
@@ -185,7 +187,15 @@ async def generate_reply_meta(
                     },
                 }
             result = await dispatch(tc.function.name, args, ctx)
+            ok, summary, parsed = result_summary(result)
+            tool_trace.append({
+                "tool": tc.function.name,
+                "args": args,
+                "ok": ok,
+                "summary": summary,
+                "result": parsed if parsed is not None else result,
+            })
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
     final = await gw.chat(messages)
-    return {"reply": (final.content or "").strip()}
+    return {"reply": (final.content or "").strip(), "tool_calls": tool_trace}

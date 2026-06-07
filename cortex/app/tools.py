@@ -8,9 +8,13 @@ party messaging Bahrian can never see or invoke a personal-assistant tool.
 """
 from __future__ import annotations
 
+import json
 import logging
+import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
 
 from . import db, knowledge
 from .channels import get_channels  # noqa: F401  (kept for parity / future tools)
@@ -39,6 +43,9 @@ class Tool:
     requires_approval: bool = False
     owner_only: bool = False   # personal-assistant tools a third party must never reach
     source: str = "core"       # "core" or a plugin slug (for clean re-registration)
+    safety: str = "auto"  # auto | read | private_read | mutation | external_send | destructive
+    intents: list[str] = field(default_factory=list)
+    examples: list[str] = field(default_factory=list)
 
     def spec(self) -> dict:
         return {
@@ -49,6 +56,37 @@ class Tool:
                 "parameters": self.parameters,
             },
         }
+
+
+def tool_result(
+    *,
+    ok: bool,
+    summary: str,
+    data: Any = None,
+    source: str = "core",
+    warnings: list[str] | None = None,
+    error: dict | str | None = None,
+) -> str:
+    payload = {
+        "ok": ok,
+        "summary": summary,
+        "data": data,
+        "source": source,
+        "fresh_at": datetime.now(timezone.utc).isoformat(),
+        "warnings": warnings or [],
+        "error": error,
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def result_summary(raw: str) -> tuple[bool | None, str, dict | None]:
+    try:
+        parsed = json.loads(raw)
+    except Exception:  # noqa: BLE001
+        return None, raw.strip()[:500], None
+    if isinstance(parsed, dict) and "summary" in parsed:
+        return bool(parsed.get("ok")), str(parsed.get("summary") or ""), parsed
+    return None, raw.strip()[:500], None
 
 
 # ─── Core handlers ────────────────────────────────────────────────────────────
@@ -160,6 +198,10 @@ def needs_confirmation(name: str) -> bool:
         return False
     if tool.requires_approval:
         return True
+    if tool.safety in ("read", "private_read"):
+        return False
+    if tool.safety in ("mutation", "external_send", "destructive"):
+        return True
     lname = name.lower()
     if lname in _SAFE_TOOL_NAMES:
         return False
@@ -243,6 +285,23 @@ def openai_tools(*, is_owner: bool = False) -> list[dict]:
     return [t.spec() for t in REGISTRY.values() if is_owner or not t.owner_only]
 
 
+def capability_manifest(*, is_owner: bool = False) -> list[dict]:
+    out = []
+    for t in REGISTRY.values():
+        if t.owner_only and not is_owner:
+            continue
+        out.append({
+            "tool": t.name,
+            "source": t.source,
+            "description": t.description,
+            "safety": t.safety,
+            "intents": t.intents,
+            "examples": t.examples,
+            "requires_confirmation": needs_confirmation(t.name),
+        })
+    return out
+
+
 async def dispatch(name: str, args: dict, ctx: ToolContext) -> str:
     tool = REGISTRY.get(name)
     if not tool:
@@ -255,8 +314,38 @@ async def dispatch(name: str, args: dict, ctx: ToolContext) -> str:
         except Exception:  # noqa: BLE001 — the security gate must never fail open/crash
             pass
         return "Dieses Werkzeug ist nur für Bahrian selbst verfügbar."
+    started = time.perf_counter()
     try:
-        return await tool.handler(args, ctx)
+        result = await tool.handler(args, ctx)
     except Exception as e:  # noqa: BLE001
         log.error("tool %s failed: %s", name, e)
-        return f"Tool {name} fehlgeschlagen: {e}"
+        result = tool_result(
+            ok=False,
+            summary=f"Tool {name} fehlgeschlagen: {e}",
+            source=tool.source,
+            error={"type": type(e).__name__, "message": str(e)},
+        )
+    ok, summary, parsed = result_summary(result)
+    try:
+        last_detail = {
+            "tool": name,
+            "source": tool.source,
+            "safety": tool.safety,
+            "args": args,
+            "ok": ok,
+            "summary": summary,
+            "error": (parsed or {}).get("error") if parsed else None,
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "fresh_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await db.set_setting("agent_tool_last", last_detail)
+        await db.audit(
+            "agent_tool_call",
+            channel=ctx.channel,
+            thread_id=ctx.thread_id,
+            contact_id=ctx.contact.get("id"),
+            detail=last_detail,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return result
