@@ -1,14 +1,18 @@
 """Web admin router: first-run setup, login, plugin catalog + config forms."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
+from shutil import which
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
+from .. import __version__ as ASTRA_VERSION
 from .. import db, sysinfo
 from ..config import get_settings
 from ..config_store import SECRET_SENTINEL, get_config_store
@@ -22,6 +26,10 @@ from .templates import (
 )
 
 GH_REPO = "https://github.com/ProfessorEngineergit/ASTRA"
+GH_OWNER_REPO = "ProfessorEngineergit/ASTRA"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+UPDATE_PULL_COMMAND = ["git", "pull", "--ff-only", "origin", "main"]
+UPDATE_REBUILD_COMMAND = "docker compose up -d --build cortex"
 _GH_SVG = ('<svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor">'
            '<path d="M12 .5A12 12 0 0 0 8.2 23.9c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.5-1.4-1.3-1.8-1.3-1.8'
            '-1.1-.7.1-.7.1-.7 1.2 0 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.4-1.3-5.4-5.9'
@@ -53,6 +61,125 @@ def _redirect_with_session(url: str, token: str) -> RedirectResponse:
     resp.set_cookie(auth.COOKIE_NAME, token, max_age=auth.SESSION_TTL,
                     httponly=True, samesite="strict")
     return resp
+
+
+async def _run_update_cmd(args: list[str], *, timeout: float = 12) -> dict:
+    """Run a fixed maintenance command from the repo root."""
+    if args and args[0] == "git" and not which("git"):
+        return {"ok": False, "code": 127, "out": "", "err": "git ist auf diesem Server nicht installiert."}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            cwd=REPO_ROOT,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        return {"ok": False, "code": 124, "out": "", "err": f"Timeout nach {timeout:.0f}s."}
+    except FileNotFoundError:
+        return {"ok": False, "code": 127, "out": "", "err": f"{args[0]} wurde nicht gefunden."}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "code": 1, "out": "", "err": str(e)}
+    out = out_b.decode(errors="replace").strip()
+    err = err_b.decode(errors="replace").strip()
+    return {"ok": proc.returncode == 0, "code": proc.returncode, "out": out, "err": err}
+
+
+async def _git_text(args: list[str], *, timeout: float = 8) -> str:
+    result = await _run_update_cmd(args, timeout=timeout)
+    return result["out"].strip() if result["ok"] else ""
+
+
+async def _git_update_status(*, fetch: bool = False) -> dict:
+    repo_check = await _run_update_cmd(["git", "rev-parse", "--git-dir"], timeout=5)
+    if not repo_check["ok"]:
+        return {
+            "ok": False,
+            "git_available": bool(which("git")),
+            "repo_root": str(REPO_ROOT),
+            "app_version": ASTRA_VERSION,
+            "message": "ASTRA läuft hier nicht aus einem Git-Checkout. Pull ist deshalb nicht möglich.",
+        }
+
+    fetch_result = None
+    if fetch:
+        fetch_result = await _run_update_cmd(["git", "fetch", "--tags", "origin", "main"], timeout=35)
+
+    local_full = await _git_text(["git", "rev-parse", "HEAD"])
+    remote_full = await _git_text(["git", "rev-parse", "origin/main"])
+    local_short = await _git_text(["git", "rev-parse", "--short", "HEAD"])
+    remote_short = await _git_text(["git", "rev-parse", "--short", "origin/main"])
+    local_tag = await _git_text(["git", "describe", "--tags", "--exact-match", "HEAD"])
+    latest_tag = await _git_text(["git", "describe", "--tags", "--abbrev=0", "origin/main"])
+    ahead_behind = await _git_text(["git", "rev-list", "--left-right", "--count", "HEAD...origin/main"])
+    dirty = bool(await _git_text(["git", "status", "--short"]))
+    commit_lines = await _git_text(
+        ["git", "log", "--oneline", "--no-decorate", "--max-count=6", "HEAD..origin/main"]
+    )
+    ahead = behind = 0
+    if ahead_behind:
+        parts = ahead_behind.split()
+        if len(parts) == 2:
+            ahead, behind = int(parts[0]), int(parts[1])
+    target_version = latest_tag or remote_short or "unbekannt"
+    current_version = local_tag or (f"{ASTRA_VERSION}+{local_short}" if local_short else ASTRA_VERSION)
+    data = {
+        "ok": True,
+        "git_available": True,
+        "repo_root": str(REPO_ROOT),
+        "repo": GH_OWNER_REPO,
+        "app_version": ASTRA_VERSION,
+        "current_sha": local_short,
+        "remote_sha": remote_short,
+        "current_version": current_version,
+        "target_version": target_version,
+        "release_mode": "release-tag" if latest_tag else "commit-fallback",
+        "update_available": bool(remote_full and local_full and remote_full != local_full),
+        "ahead": ahead,
+        "behind": behind,
+        "dirty": dirty,
+        "commits": [line for line in commit_lines.splitlines() if line],
+        "pull_command": " ".join(UPDATE_PULL_COMMAND),
+        "rebuild_command": UPDATE_REBUILD_COMMAND,
+        "release_note": (
+            "Die Karte bevorzugt GitHub Releases/Tags. Ohne Tag nutzt ASTRA den neuesten Commit als Version."
+        ),
+    }
+    if fetch_result is not None:
+        data["fetch"] = {
+            "ok": fetch_result["ok"],
+            "code": fetch_result["code"],
+            "out": fetch_result["out"][-3000:],
+            "err": fetch_result["err"][-3000:],
+        }
+    return data
+
+
+async def _git_pull_update() -> dict:
+    before = await _git_update_status(fetch=False)
+    if not before.get("ok"):
+        return before
+    if before.get("dirty"):
+        return {
+            **before,
+            "ok": False,
+            "message": "Lokale Git-Änderungen blockieren den Pull. Erst committen, stashen oder bewusst aufräumen.",
+        }
+    result = await _run_update_cmd(UPDATE_PULL_COMMAND, timeout=75)
+    after = await _git_update_status(fetch=False)
+    payload = {
+        **after,
+        "ok": result["ok"],
+        "pull": {
+            "code": result["code"],
+            "out": result["out"][-6000:],
+            "err": result["err"][-6000:],
+        },
+        "message": "Git pull abgeschlossen." if result["ok"] else "Git pull ist fehlgeschlagen.",
+    }
+    await db.audit("self_update_pull", actor="owner", detail={"ok": result["ok"], "code": result["code"]})
+    return payload
 
 
 # ─── First-run setup ──────────────────────────────────────────────────────────
@@ -730,6 +857,7 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
     s = await _app_settings()
     loc = s.get("location", {}) or {}
     labs = _labs(s)
+    update_status = await _git_update_status(fetch=False)
     token = await auth.issue_csrf()
     save_fx = " save-pulse" if saved and labs.get("save_effect") == "on" else ""
     flash = f'<div class="flash ok{save_fx}">Gespeichert.</div>' if saved else ""
@@ -759,6 +887,19 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
         }.items())
     cur_font = labs.get("font", s.get("font", "inter"))
     addr = esc(loc.get("address", ""))
+    update_ok = bool(update_status.get("ok"))
+    update_available = bool(update_status.get("update_available"))
+    update_title = "Update verfügbar" if update_available else "ASTRA ist aktuell" if update_ok else "Update-Check nicht bereit"
+    update_subtitle = (
+        f"Lokal {update_status.get('current_version', 'unbekannt')} · Remote {update_status.get('target_version', 'unbekannt')}"
+        if update_ok else update_status.get("message", "Git-Status konnte nicht gelesen werden.")
+    )
+    update_meter = "100" if update_available else "12" if update_ok else "0"
+    update_commits = update_status.get("commits") or []
+    update_notes = "".join(
+        f'<li>{esc(line)}</li>' for line in update_commits[:4]
+    ) or '<li>Keine entfernten Commits im lokalen Cache. „Nach Updates suchen" aktualisiert den Stand.</li>'
+    update_pull_disabled = "disabled" if (not update_available or update_status.get("dirty") or not update_ok) else ""
     font_opts = "".join(
         f'<option value="{esc(k)}" {"selected" if k == cur_font else ""}>{esc(name)}</option>'
         for k, name in font_choices())
@@ -1000,6 +1141,71 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
       setTimeout(() => map.invalidateSize(), 200);
     </script>"""
     )
+    update_script = """
+    <script>
+      (() => {
+        const root = document.querySelector('[data-settings-update]');
+        if (!root) return;
+        const title = document.getElementById('settingsUpdateTitle');
+        const subtitle = document.getElementById('settingsUpdateSubtitle');
+        const version = document.getElementById('settingsUpdateVersion');
+        const bar = document.getElementById('settingsUpdateBar');
+        const log = document.getElementById('settingsUpdateLog');
+        const notes = document.getElementById('settingsUpdateNotes');
+        const checkBtn = document.getElementById('settingsUpdateCheck');
+        const pullBtn = document.getElementById('settingsUpdatePull');
+
+        function renderList(lines) {
+          notes.innerHTML = '';
+          (lines && lines.length ? lines : ['Keine entfernten Commits im lokalen Cache.']).slice(0, 6).forEach(line => {
+            const li = document.createElement('li');
+            li.textContent = line;
+            notes.appendChild(li);
+          });
+        }
+        function render(d) {
+          title.textContent = d.update_available ? 'Update verfügbar' : d.ok ? 'ASTRA ist aktuell' : 'Update-Check nicht bereit';
+          version.textContent = d.target_version || d.remote_sha || d.current_version || 'Latest';
+          subtitle.textContent = d.ok
+            ? `Lokal ${d.current_version || '?'} · Remote ${d.target_version || d.remote_sha || '?'} · ${d.release_mode || 'commit'}`
+            : (d.message || 'Git-Status konnte nicht gelesen werden.');
+          bar.style.width = d.update_available ? '100%' : d.ok ? '12%' : '0%';
+          pullBtn.disabled = !d.ok || d.dirty || !d.update_available;
+          if (d.dirty) log.textContent = 'Lokale Git-Änderungen blockieren Pulls. Erst committen/stashen/aufräumen.';
+          renderList(d.commits || []);
+          if (d.pull) {
+            log.textContent = [d.message, d.pull.out, d.pull.err].filter(Boolean).join('\\n\\n') || d.message || '';
+          } else if (d.fetch && !d.fetch.ok) {
+            log.textContent = [d.fetch.err, d.fetch.out].filter(Boolean).join('\\n') || 'Fetch fehlgeschlagen.';
+          } else if (!d.dirty && !d.pull) {
+            log.textContent = d.release_note || '';
+          }
+        }
+        async function call(url, method) {
+          const r = await fetch(url, { method: method || 'GET' });
+          const d = await r.json();
+          render(d);
+          return d;
+        }
+        checkBtn.onclick = async () => {
+          checkBtn.disabled = true;
+          log.textContent = 'Prüfe origin/main und Tags...';
+          try { await call('/admin/update/check', 'POST'); }
+          catch (e) { log.textContent = 'Update-Check fehlgeschlagen: ' + e; }
+          finally { checkBtn.disabled = false; }
+        };
+        pullBtn.onclick = async () => {
+          if (!confirm('git pull --ff-only origin main jetzt auf dem Server ausführen?')) return;
+          pullBtn.disabled = true;
+          root.classList.add('is-pulling');
+          log.textContent = 'Pull läuft...';
+          try { await call('/admin/update/pull', 'POST'); }
+          catch (e) { log.textContent = 'Pull fehlgeschlagen: ' + e; }
+          finally { root.classList.remove('is-pulling'); pullBtn.disabled = false; }
+        };
+        call('/admin/update/status').catch(() => {});
+      })();
+    </script>"""
     body = f"""
     {_labs_css(labs)}
     <div class="settings-hero">
@@ -1014,9 +1220,15 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
       </a>
     </div>
     {flash}
+    <div class="settings-tabs">
+      <a href="#settings-general">Allgemein</a>
+      <a href="#settings-location">Standort</a>
+      <a href="#settings-labs">Labs</a>
+      <a href="#settings-updates">Updates</a>
+    </div>
     <form method="post" action="/admin/settings" id="settings-form">
       <input type="hidden" name="csrf" value="{esc(token)}">
-      <div class="panel" style="margin-bottom:16px">
+      <div class="panel" id="settings-general" style="margin-bottom:16px">
         <div class="field"><label>Name</label>
           <input type="text" name="owner_name" value="{esc(s.get('owner_name', 'Bahrian'))}"></div>
         <div class="row" style="gap:16px;align-items:flex-start">
@@ -1061,7 +1273,7 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
               Schlüssel zu setzen und Einstellungen zu ändern — direkt aus dem Chat.</div></div></div>
       </div>
 
-      <div class="panel" style="margin-bottom:16px">
+      <div class="panel" id="settings-location" style="margin-bottom:16px">
         <h2 style="margin:0 0 6px;font-size:15px">Standort</h2>
         <p class="note" style="margin:0 0 12px">Adresse tippen, Vorschlag übernehmen, Pin ziehen
           oder Browser-Standort nutzen. Landkreis, Bundesland und Land speichert ASTRA für regionale Filter.</p>
@@ -1098,7 +1310,7 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
              border:1px solid var(--border)"></div>
       </div>
 
-      <div class="panel labs-console" style="margin-bottom:16px">
+      <div class="panel labs-console" id="settings-labs" style="margin-bottom:16px">
         <div class="labs-head">
           {_BEAKER_SVG}
           <div>
@@ -1115,12 +1327,57 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
         <div class="labs-grid">{lab_tiles}</div>
       </div>
 
+      <div class="panel settings-update-panel" id="settings-updates" style="margin-bottom:16px">
+        <div class="settings-section-head">
+          <div>
+            <div class="lab-eyebrow">Updates</div>
+            <h2>Server-Update</h2>
+            <p>ASTRA prüft Releases/Tags und fällt sonst sauber auf Commits zurück. Der Pull läuft als
+              feste Git-Aktion im Repository, ohne freie Shell-Befehle.</p>
+          </div>
+          <a class="btn ghost sm" href="/admin/update">Große Karte</a>
+        </div>
+        <div class="settings-update-card {'has-update' if update_available else ''}" data-settings-update>
+          <div class="settings-update-grid"></div>
+          <div class="settings-update-inner">
+            <div class="settings-update-copy">
+              <span class="settings-update-eyebrow">Release Channel · {esc(update_status.get('release_mode', 'commit-fallback'))}</span>
+              <h3 id="settingsUpdateTitle">{esc(update_title)}</h3>
+              <p id="settingsUpdateSubtitle">{esc(update_subtitle)}</p>
+            </div>
+            <div class="settings-update-version" id="settingsUpdateVersion">
+              {esc(update_status.get('target_version') or update_status.get('remote_sha') or "Latest")}
+            </div>
+            <div class="settings-update-progress"><i id="settingsUpdateBar" style="width:{update_meter}%"></i></div>
+            <div class="settings-update-actions">
+              <button class="btn secondary" type="button" id="settingsUpdateCheck">Nach Updates suchen</button>
+              <button class="btn" type="button" id="settingsUpdatePull" {update_pull_disabled}>Git Pull ausführen</button>
+            </div>
+          </div>
+        </div>
+        <div class="settings-update-notes">
+          <div>
+            <div class="notes-header">Nächste Änderungen</div>
+            <ul id="settingsUpdateNotes">{update_notes}</ul>
+          </div>
+          <details>
+            <summary>Release-Regel für Agenten</summary>
+            <p>Ab jetzt ist ideal: nach erfolgreichem Commit einen Tag wie <code>v2026.06.07.1</code>
+              setzen und pushen. Die UI zeigt dann diesen Release-Tag; ohne Tag bleibt der Commit-SHA sichtbar.</p>
+            <pre>git tag -a vYYYY.MM.DD.N -m "ASTRA update"
+git push origin main --tags</pre>
+          </details>
+        </div>
+        <pre class="settings-update-log" id="settingsUpdateLog">{esc(update_status.get('release_note', ''))}</pre>
+      </div>
+
       <button class="btn" type="submit">Alles speichern</button>
     </form>
 
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    {settings_script}"""
+    {settings_script}
+    {update_script}"""
     return _html_with_csrf(page("Einstellungen", body, active="settings"), token)
 
 
@@ -1248,7 +1505,7 @@ async def system_page(request: Request, _: bool = Depends(auth.require_admin)):
       {svc_rows}
     </div>
     <p class="note">Modell aktiv: <b>{esc(st.openai_model)}</b> (überschreibbar in den Einstellungen) ·
-      <a href="/admin/updates">Updates &amp; Versionen →</a></p>
+      <a href="/admin/update">Updates &amp; Versionen →</a></p>
     <script>setTimeout(() => location.reload(), 15000);</script>"""
     return HTMLResponse(page("System", body, active="system"))
 
@@ -1327,6 +1584,28 @@ def _get_chat(store: dict, chat_id: str | None = None) -> dict:
     return store["chats"][0]
 
 
+def _select_chat(store: dict, chat_id: str | None = None, *, archived: bool = False) -> dict | None:
+    candidates = [c for c in store["chats"] if bool(c.get("archived")) is archived]
+    if chat_id:
+        picked = next((c for c in candidates if c["id"] == chat_id), None)
+        if picked:
+            if not archived:
+                store["active_id"] = picked["id"]
+            return picked
+    if not candidates and not archived:
+        fresh = _new_chat()
+        store["chats"].insert(0, fresh)
+        store["active_id"] = fresh["id"]
+        return fresh
+    if not candidates:
+        return None
+    active_id = store.get("active_id")
+    picked = next((c for c in candidates if c["id"] == active_id), candidates[0])
+    if not archived:
+        store["active_id"] = picked["id"]
+    return picked
+
+
 def _chat_messages_for_agent(chat: dict) -> list[dict]:
     return [
         {"role": m["role"], "content": m["content"]}
@@ -1343,20 +1622,28 @@ def _mode_label(mode: str) -> str:
     }.get(mode, "Automodus")
 
 
-def _render_chat_list(store: dict, active_id: str) -> str:
+def _render_chat_list(store: dict, active_id: str, *, archived: bool = False) -> str:
     rows = []
     for c in store["chats"]:
-        if c.get("archived"):
+        if bool(c.get("archived")) is not archived:
             continue
         active = " active" if c["id"] == active_id else ""
-        rows.append(
-            f'<a class="thread{active}" href="/admin/chat?chat={esc(c["id"])}">'
+        href = f'/admin/chat?{"view=archive&" if archived else ""}chat={esc(c["id"])}'
+        thread = (
+            f'<a class="thread{active}" href="{href}">'
             f'<span>{esc(c.get("title") or "Neuer Chat")}</span>'
             f'<small>{len(c.get("messages", []))} Nachrichten · {esc(_mode_label(c.get("permission_mode", "ask")))}</small>'
             '</a>'
         )
-    archived = sum(1 for c in store["chats"] if c.get("archived"))
-    rows.append(f'<div class="arch-note">{archived} archiviert</div>' if archived else "")
+        if archived:
+            rows.append(
+                f'<div class="thread-wrap">{thread}'
+                f'<button type="button" data-restore-chat="{esc(c["id"])}">Zurück</button></div>'
+            )
+        else:
+            rows.append(thread)
+    if not rows:
+        rows.append('<div class="arch-note">Keine archivierten Chats.</div>' if archived else '<div class="arch-note">Kein aktiver Chat.</div>')
     return "".join(rows)
 
 
@@ -1396,61 +1683,91 @@ def _render_messages(chat: dict) -> str:
 
 
 @router.get("/admin/chat", response_class=HTMLResponse)
-async def chat_page(request: Request, _: bool = Depends(auth.require_admin), chat: str = ""):
+async def chat_page(
+    request: Request,
+    _: bool = Depends(auth.require_admin),
+    chat: str = "",
+    view: str = "",
+):
     store = await _chat_store()
-    active = _get_chat(store, chat or None)
+    archive_view = view == "archive"
+    active = _select_chat(store, chat or None, archived=archive_view)
     await _save_chat_store(store)
     appset = await _app_settings()
     autonomy = appset.get("autonomy", "ask")
-    mode = active.get("permission_mode", "ask")
+    mode = (active or {}).get("permission_mode", "ask")
+    active_id = (active or {}).get("id", "")
+    title = (active or {}).get("title") or "Archiv"
+    active_count = sum(1 for c in store["chats"] if not c.get("archived"))
+    archived_count = sum(1 for c in store["chats"] if c.get("archived"))
+    title_actions = (
+        f'<button class="btn sm" id="restorechat">Wiederherstellen</button>'
+        if archive_view and active else
+        '<button class="btn ghost sm" id="branchchat">Branch</button>'
+    )
+    archive_button = "" if archive_view else '<button class="btn ghost sm" id="archivechat">Archivieren</button>'
+    input_html = (
+        '<div class="chat-input archived"><p>Archivierter Thread. Wiederherstellen, um weiterzuschreiben.</p>'
+        '<button class="btn sm" id="restorebottom">Wiederherstellen</button></div>'
+        if archive_view and active else
+        '<div class="chat-input">'
+        '<textarea id="inp" placeholder="Nachricht oder Aufgabe an ASTRA…" rows="1"></textarea>'
+        '<button class="btn" id="send">Senden</button>'
+        '<button class="btn ghost sm" id="clear" title="Verlauf leeren">Leeren</button>'
+        '</div>'
+    )
+    messages_html = _render_messages(active) if active else '<div class="msg sys">Noch nichts im Archiv.</div>'
     body = f"""
-    <div class="chat-shell" data-chat="{esc(active['id'])}">
+    <div class="chat-shell" data-chat="{esc(active_id)}" data-view="{'archive' if archive_view else 'active'}">
       <aside class="chat-side">
         <div class="side-head"><b>ASTRA Chat</b><button class="btn sm" id="newchat">Neu</button></div>
-        <div class="threads">{_render_chat_list(store, active['id'])}</div>
+        <div class="chat-tabs">
+          <a class="{'active' if not archive_view else ''}" href="/admin/chat">Aktiv <span>{active_count}</span></a>
+          <a class="{'active' if archive_view else ''}" href="/admin/chat?view=archive">Archiv <span>{archived_count}</span></a>
+        </div>
+        <div class="threads">{_render_chat_list(store, active_id, archived=archive_view)}</div>
         <div class="perm-box">
           <label>Ausführung</label>
-          <select id="perm">
+          <select id="perm" {"disabled" if archive_view else ""}>
             <option value="ask" {"selected" if mode == "ask" else ""}>Jedes Mal fragen</option>
             <option value="auto" {"selected" if mode == "auto" else ""}>Automodus</option>
             <option value="bypass" {"selected" if mode == "bypass" else ""}>Berechtigungen umgehen</option>
           </select>
           <label>Autonomielevel</label>
-          <select id="autonomy">
+          <select id="autonomy" {"disabled" if archive_view else ""}>
             <option value="ask" {"selected" if autonomy == "ask" else ""}>ask</option>
             <option value="confident" {"selected" if autonomy == "confident" else ""}>confident</option>
             <option value="full" {"selected" if autonomy == "full" else ""}>full</option>
           </select>
           <p>Ask pausiert riskante Toolcalls. Bypass gilt nur hier im Owner-Webchat.</p>
         </div>
-        <button class="btn ghost sm" id="archivechat">Archivieren</button>
+        {archive_button}
       </aside>
       <section class="chat-main">
         <div class="chat-title">
-          <div><span>Thread</span><h1>{esc(active.get("title") or "Neuer Chat")}</h1></div>
-          <button class="btn ghost sm" id="branchchat">Branch</button>
+          <div><span>{"Archivierter Thread" if archive_view else "Thread"}</span><h1>{esc(title)}</h1></div>
+          <div class="chat-title-actions">{title_actions}</div>
         </div>
-        <div class="chat-log" id="log">{_render_messages(active)}</div>
-        <div class="chat-input">
-          <textarea id="inp" placeholder="Nachricht oder Aufgabe an ASTRA…" rows="1"></textarea>
-          <button class="btn" id="send">Senden</button>
-          <button class="btn ghost sm" id="clear" title="Verlauf leeren">Leeren</button>
-        </div>
+        <div class="chat-log" id="log">{messages_html}</div>
+        {input_html}
       </section>
     </div>
     <script>
-      const root=document.querySelector('.chat-shell'), chatId=root.dataset.chat;
+      const root=document.querySelector('.chat-shell'), chatId=root.dataset.chat, archiveView=root.dataset.view==='archive';
       const log=document.getElementById('log'), inp=document.getElementById('inp');
       const perm=document.getElementById('perm'), autonomy=document.getElementById('autonomy');
       const scroll=()=>log.scrollTop=log.scrollHeight; scroll();
       function add(role,txt){{const r=document.createElement('div');r.className='msg-row '+role;
         const b=document.createElement('div');b.className='msg '+role;b.textContent=txt;r.appendChild(b);log.appendChild(r);scroll();return r;}}
       async function post(url, data){{const r=await fetch(url,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(data||{{}})}});return await r.json();}}
-      async function saveSettings(){{await post('/admin/chat/settings',{{chat_id:chatId,permission_mode:perm.value,autonomy:autonomy.value}});}}
-      perm.onchange=saveSettings; autonomy.onchange=saveSettings;
-      inp.addEventListener('input',()=>{{inp.style.height='auto';inp.style.height=Math.min(inp.scrollHeight,180)+'px';}});
-      inp.addEventListener('keydown',e=>{{if(e.key==='Enter'&&!e.shiftKey){{e.preventDefault();go();}}}});
-      document.getElementById('send').onclick=go;
+      async function restore(id){{const d=await post('/admin/chat/restore',{{chat_id:id||chatId}}); location.href='/admin/chat?chat='+encodeURIComponent(d.chat_id||id||chatId);}}
+      async function saveSettings(){{if(!archiveView&&chatId) await post('/admin/chat/settings',{{chat_id:chatId,permission_mode:perm.value,autonomy:autonomy.value}});}}
+      if(perm) perm.onchange=saveSettings; if(autonomy) autonomy.onchange=saveSettings;
+      if(inp) {{
+        inp.addEventListener('input',()=>{{inp.style.height='auto';inp.style.height=Math.min(inp.scrollHeight,220)+'px';}});
+        inp.addEventListener('keydown',e=>{{if(e.key==='Enter'&&!e.shiftKey){{e.preventDefault();go();}}}});
+        document.getElementById('send').onclick=go;
+      }}
       async function go(){{
         const t=inp.value.trim(); if(!t) return; inp.value=''; inp.style.height='auto';
         add('user',t); const typing=add('typing','ASTRA arbeitet…');
@@ -1461,9 +1778,15 @@ async def chat_page(request: Request, _: bool = Depends(auth.require_admin), cha
         }}catch(e){{ typing.remove(); add('bot','Fehler: '+e); }}
       }}
       document.getElementById('newchat').onclick=async()=>{{const d=await post('/admin/chat/new',{{}}); location.href='/admin/chat?chat='+d.chat_id;}};
-      document.getElementById('archivechat').onclick=async()=>{{await post('/admin/chat/archive',{{chat_id:chatId}}); location.href='/admin/chat';}};
-      document.getElementById('branchchat').onclick=async()=>{{const d=await post('/admin/chat/branch',{{chat_id:chatId}}); location.href='/admin/chat?chat='+d.chat_id;}};
-      document.getElementById('clear').onclick=async()=>{{await post('/admin/chat/clear',{{chat_id:chatId}}); location.reload();}};
+      const archiveBtn=document.getElementById('archivechat'), branchBtn=document.getElementById('branchchat');
+      const clearBtn=document.getElementById('clear'), restoreBtn=document.getElementById('restorechat');
+      const restoreBottom=document.getElementById('restorebottom');
+      if(archiveBtn) archiveBtn.onclick=async()=>{{await post('/admin/chat/archive',{{chat_id:chatId}}); location.href='/admin/chat?view=archive&chat='+encodeURIComponent(chatId);}};
+      if(branchBtn) branchBtn.onclick=async()=>{{const d=await post('/admin/chat/branch',{{chat_id:chatId}}); location.href='/admin/chat?chat='+d.chat_id;}};
+      if(clearBtn) clearBtn.onclick=async()=>{{await post('/admin/chat/clear',{{chat_id:chatId}}); location.reload();}};
+      if(restoreBtn) restoreBtn.onclick=()=>restore(chatId);
+      if(restoreBottom) restoreBottom.onclick=()=>restore(chatId);
+      document.querySelectorAll('[data-restore-chat]').forEach(b=>b.onclick=()=>restore(b.dataset.restoreChat));
       log.onclick=async e=>{{
         const edit=e.target.closest('[data-edit]'), branch=e.target.closest('[data-branch]');
         const run=e.target.closest('[data-run-action]'), deny=e.target.closest('[data-deny-action]');
@@ -1646,6 +1969,21 @@ async def chat_archive(request: Request, _: bool = Depends(auth.require_admin)):
     return JSONResponse({"ok": True})
 
 
+@router.post("/admin/chat/restore")
+async def chat_restore(request: Request, _: bool = Depends(auth.require_admin)):
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001
+        data = {}
+    store = await _chat_store()
+    chat = _get_chat(store, data.get("chat_id"))
+    chat["archived"] = False
+    chat["updated_at"] = _now_iso()
+    store["active_id"] = chat["id"]
+    await _save_chat_store(store)
+    return JSONResponse({"ok": True, "chat_id": chat["id"]})
+
+
 @router.post("/admin/chat/clear")
 async def chat_clear(request: Request, _: bool = Depends(auth.require_admin)):
     try:
@@ -1659,6 +1997,26 @@ async def chat_clear(request: Request, _: bool = Depends(auth.require_admin)):
     chat["updated_at"] = _now_iso()
     await _save_chat_store(store)
     return JSONResponse({"ok": True})
+
+
+@router.get("/admin/updates", response_class=HTMLResponse)
+async def updates_legacy(_: bool = Depends(auth.require_admin)):
+    return RedirectResponse("/admin/update", status_code=303)
+
+
+@router.get("/admin/update/status")
+async def update_status(_: bool = Depends(auth.require_admin)):
+    return JSONResponse(await _git_update_status(fetch=False))
+
+
+@router.post("/admin/update/check")
+async def update_check(_: bool = Depends(auth.require_admin)):
+    return JSONResponse(await _git_update_status(fetch=True))
+
+
+@router.post("/admin/update/pull")
+async def update_pull(_: bool = Depends(auth.require_admin)):
+    return JSONResponse(await _git_pull_update())
 
 
 # ─── Updates: release notes + hyperspace + GitHub links ───────────────────────
@@ -2105,40 +2463,52 @@ async def updates_page(request: Request, _: bool = Depends(auth.require_admin)):
         setTimeout(resizeCanvas, 100);
         updateAndDrawStars();
 
-        /* --- COMMITS FETCH --- */
+        function renderCommitLines(lines) {{
+            const commitListEl = document.getElementById('commitList');
+            commitListEl.innerHTML = '';
+            const useLines = lines && lines.length ? lines : ['Keine entfernten Commits im lokalen Cache.'];
+            useLines.slice(0, 6).forEach(line => {{
+                const li = document.createElement('li');
+                li.className = 'commit-item';
+                const kind = line.includes(' feat') || line.startsWith('feat') ? 'feat'
+                    : line.includes(' fix') || line.startsWith('fix') ? 'fix'
+                    : 'chore';
+                const span = document.createElement('span');
+                span.className = kind;
+                span.textContent = kind + ':';
+                li.appendChild(span);
+                li.appendChild(document.createTextNode(' ' + line.replace(/^[a-f0-9]{{7,}}\\s+/, '')));
+                commitListEl.appendChild(li);
+            }});
+        }}
+
+        function applyUpdateStatus(d) {{
+            TARGET_VERSION = d.target_version || d.remote_sha || d.current_version || 'Latest';
+            bigVersion.textContent = TARGET_VERSION;
+            cardTitle.textContent = d.update_available ? 'Update verfügbar' : d.ok ? 'ASTRA ist aktuell' : 'Update nicht bereit';
+            cardSubtitle.textContent = d.ok
+                ? `Lokal ${{d.current_version || '?'}} · Remote ${{d.target_version || d.remote_sha || '?'}} · ${{d.release_mode || 'commit'}}`
+                : (d.message || 'Git-Status konnte nicht gelesen werden.');
+            mainUpdateBtn.disabled = !d.ok || d.dirty || !d.update_available;
+            mainUpdateBtn.textContent = d.update_available ? 'Update starten' : d.dirty ? 'Lokale Änderungen' : 'Aktuell';
+            if (d.dirty) {{
+                cardSubtitle.textContent = 'Lokale Git-Änderungen blockieren Pulls. Erst committen/stashen/aufräumen.';
+            }}
+            renderCommitLines(d.commits || []);
+        }}
+
+        /* --- UPDATE STATUS FETCH --- */
         async function fetchGitHubCommits() {{
             const subtitleEl = document.getElementById('cardSubtitle');
-            const commitListEl = document.getElementById('commitList');
 
             try {{
-                const response = await fetch(`https://api.github.com/repos/${{GITHUB_REPO}}/commits?per_page=6`);
+                const response = await fetch('/admin/update/status');
                 if (response.ok) {{
-                    const commits = await response.json();
-                    commitListEl.innerHTML = '';
-                    const latestSha = commits[0].sha.substring(0, 7);
-                    TARGET_VERSION = latestSha;
-                    subtitleEl.innerHTML = `Mit GitHub verbunden.<br>Neueste Änderung: <b>${{latestSha}}</b>.`;
-
-                    commits.forEach(item => {{
-                        const firstLine = item.commit.message.split('\n')[0];
-                        const li = document.createElement('li');
-                        li.className = 'commit-item';
-
-                        if (firstLine.startsWith('feat')) {{
-                            li.innerHTML = `<span class="feat">feat:</span> ${{firstLine.replace(/^feat(\(.*\))?:/, '').trim()}}`;
-                        }} else if (firstLine.startsWith('fix')) {{
-                            li.innerHTML = `<span class="fix">fix:</span> ${{firstLine.replace(/^fix(\(.*\))?:/, '').trim()}}`;
-                        }} else if (firstLine.startsWith('chore')) {{
-                            li.innerHTML = `<span class="chore">chore:</span> ${{firstLine.replace(/^chore(\(.*\))?:/, '').trim()}}`;
-                        }} else {{
-                            li.innerHTML = `<span class="chore">push:</span> ${{firstLine}}`;
-                        }}
-                        commitListEl.appendChild(li);
-                    }});
+                    applyUpdateStatus(await response.json());
                 }}
             }} catch (error) {{
-                console.error("GitHub-Abfrage fehlgeschlagen", error);
-                subtitleEl.textContent = "Verbindung zu GitHub fehlgeschlagen.";
+                console.error("Update-Status fehlgeschlagen", error);
+                subtitleEl.textContent = "Update-Status konnte nicht gelesen werden.";
             }}
         }}
 
@@ -2178,49 +2548,60 @@ async def updates_page(request: Request, _: bool = Depends(auth.require_admin)):
             mainUpdateBtn.style.display = 'block';
         }}
 
-        function startUpdateProcess() {{
+        async function startUpdateProcess() {{
             if (isNotesOpen) toggleReleaseNotes();
             toggleNotesBtn.style.display = 'none';
 
             speedSettings.target = speedSettings.hyper;
             card.classList.add('is-updating');
 
-            // Optionally call a python API here to run the actual update command
-            // fetch('/admin/api/do_update', {{method: 'POST'}});
-
             let currentPercent = 0;
+            let done = false;
+            let result = null;
             function simulateProgress() {{
-                let increment = Math.floor(Math.random() * 3) + 1;
-                if (currentPercent > 75) increment = Math.random() > 0.4 ? 1 : 0;
-                if (currentPercent > 92) increment = Math.random() > 0.7 ? 1 : 0;
-
-                currentPercent += increment;
-
-                if (currentPercent >= 100) {{
+                if (done) {{
                     currentPercent = 100;
                     progressNumber.textContent = `${{currentPercent}}%`;
-                    showReloadState();
+                    showReloadState(result);
                 }} else {{
+                    let increment = Math.floor(Math.random() * 4) + 1;
+                    if (currentPercent > 76) increment = Math.random() > 0.55 ? 1 : 0;
+                    currentPercent = Math.min(96, currentPercent + increment);
                     progressNumber.textContent = `${{currentPercent}}%`;
                     setTimeout(simulateProgress, Math.random() * 80 + 40);
                 }}
             }}
             setTimeout(simulateProgress, 800);
+            try {{
+                const response = await fetch('/admin/update/pull', {{method: 'POST'}});
+                result = await response.json();
+            }} catch (error) {{
+                result = {{ok:false, message:String(error)}};
+            }}
+            done = true;
         }}
 
-        function showReloadState() {{
+        function showReloadState(result) {{
             speedSettings.target = speedSettings.normal;
 
             setTimeout(() => {{
                 confirmWrapper.style.display = 'none';
-                mainUpdateBtn.textContent = "Seite neu laden";
+                mainUpdateBtn.textContent = "Status neu laden";
                 mainUpdateBtn.setAttribute('onclick', 'location.reload()');
                 mainUpdateBtn.style.display = 'block';
                 
                 card.classList.remove('is-updating');
-                cardTitle.textContent = "Update bereitgestellt";
-                cardSubtitle.textContent = "Neu geladen wird...";
+                cardTitle.textContent = result && result.ok ? "Update bereitgestellt" : "Update fehlgeschlagen";
+                cardSubtitle.textContent = result && result.ok
+                    ? "Git pull wurde ausgeführt. Bei Docker-Deployments danach Container neu bauen/starten."
+                    : ((result && result.message) || "Git pull konnte nicht ausgeführt werden.");
                 
+                if (result) {{
+                    renderCommitLines(result.commits || []);
+                    if (result.target_version || result.current_version) {{
+                        TARGET_VERSION = result.target_version || result.current_version;
+                    }}
+                }}
                 bigVersion.textContent = TARGET_VERSION;
                 card.classList.add('has-updated');
                 
@@ -2229,4 +2610,3 @@ async def updates_page(request: Request, _: bool = Depends(auth.require_admin)):
     </script>
     """
     return HTMLResponse(page("Updates", body, active="update"))
-

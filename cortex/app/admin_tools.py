@@ -31,7 +31,9 @@ async def _settings() -> dict:
     return await db.get_setting("app_settings", {}) or {}
 
 
-async def _writes_allowed() -> bool:
+async def _writes_allowed(ctx: ToolContext | None = None) -> bool:
+    if ctx and ctx.is_owner and ctx.channel == "web" and ctx.permission_mode == "bypass":
+        return True
     s = await _settings()
     return s.get("allow_self_config", True)
 
@@ -79,7 +81,7 @@ async def _integration_details(args: dict, ctx: ToolContext) -> str:
 
 
 async def _configure_integration(args: dict, ctx: ToolContext) -> str:
-    if not await _writes_allowed():
+    if not await _writes_allowed(ctx):
         return "Selbst-Konfiguration ist deaktiviert (Einstellungen → allow_self_config)."
     mgr = get_manager()
     slug = args.get("slug", "")
@@ -144,7 +146,7 @@ async def _get_settings(args: dict, ctx: ToolContext) -> str:
 
 
 async def _update_settings(args: dict, ctx: ToolContext) -> str:
-    if not await _writes_allowed():
+    if not await _writes_allowed(ctx):
         return "Änderungen an Einstellungen sind deaktiviert (allow_self_config)."
     from .brain import set_autonomy
     from .web.templates import set_font

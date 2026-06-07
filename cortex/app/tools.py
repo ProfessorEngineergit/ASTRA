@@ -27,6 +27,7 @@ class ToolContext:
     contact: dict
     max_sensitivity: str = "none"
     is_owner: bool = False     # True only when ASTRA is talking to the owner himself
+    permission_mode: str = "auto"  # web owner chat: ask | auto | bypass
 
 
 @dataclass
@@ -109,6 +110,61 @@ async def _remember_fact(args: dict, ctx: ToolContext) -> str:
 
 # ─── Registry ─────────────────────────────────────────────────────────────────
 REGISTRY: dict[str, Tool] = {}
+
+_SAFE_TOOL_NAMES = {
+    "recall_memory",
+    "astra_list_integrations",
+    "astra_integration_details",
+    "astra_test_integration",
+    "astra_get_settings",
+    "astra_system_status",
+}
+_SAFE_PREFIXES = (
+    "get_",
+    "list_",
+    "read_",
+    "search_",
+    "recent_",
+    "today_",
+    "status_",
+)
+_MUTATING_HINTS = (
+    "add",
+    "call",
+    "complete",
+    "configure",
+    "control",
+    "create",
+    "delete",
+    "note",
+    "post",
+    "power",
+    "publish",
+    "remove",
+    "remember",
+    "scene",
+    "send",
+    "set",
+    "toggle",
+    "trigger",
+    "update",
+    "write",
+)
+
+
+def needs_confirmation(name: str) -> bool:
+    """Whether a web-owner-chat tool call should pause in ask mode."""
+    tool = REGISTRY.get(name)
+    if not tool:
+        return False
+    if tool.requires_approval:
+        return True
+    lname = name.lower()
+    if lname in _SAFE_TOOL_NAMES:
+        return False
+    if lname.startswith(_SAFE_PREFIXES):
+        return False
+    return any(hint in lname for hint in _MUTATING_HINTS) or tool.owner_only
 
 
 def register(tool: Tool) -> None:

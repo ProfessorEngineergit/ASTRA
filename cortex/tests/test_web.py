@@ -86,6 +86,9 @@ def test_settings_labs_and_region_save(memdb):
     assert "lab_density" in r.text
     assert "addrresults" in r.text
     assert 'name="country_code"' in r.text
+    assert 'href="#settings-updates"' in r.text
+    assert "Git Pull ausführen" in r.text
+    assert "/admin/update/status" in r.text
 
     csrf = c.cookies.get(auth.CSRF_COOKIE)
     r = c.post("/admin/settings", data={
@@ -128,3 +131,61 @@ def test_settings_labs_and_region_save(memdb):
     assert saved["location"]["country_code"] == "de"
     assert saved["location"]["state"] == "Hessen"
     assert saved["location"]["county"] == "Frankfurt am Main"
+
+
+def test_update_page_and_status(memdb):
+    _prime_manager()
+    c = TestClient(_app())
+    r = c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+
+    r = c.get("/admin/update")
+    assert r.status_code == 200
+    assert "Update starten" in r.text
+    assert "/admin/update/pull" in r.text
+
+    r = c.get("/admin/updates", follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/admin/update"
+
+    r = c.get("/admin/update/status")
+    assert r.status_code == 200
+    data = r.json()
+    assert "current_version" in data or "message" in data
+    assert "app_version" in data
+
+
+def test_chat_archive_restore_tabs(memdb):
+    _prime_manager()
+    c = TestClient(_app())
+    r = c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+
+    r = c.get("/admin/chat")
+    assert r.status_code == 200
+    assert "chat-tabs" in r.text
+    assert "Archiv <span>0</span>" in r.text
+    assert "Berechtigungen umgehen" in r.text
+
+    created = c.post("/admin/chat/new", json={}).json()
+    chat_id = created["chat_id"]
+    r = c.post("/admin/chat/archive", json={"chat_id": chat_id})
+    assert r.status_code == 200 and r.json()["ok"] is True
+
+    r = c.get(f"/admin/chat?view=archive&chat={chat_id}")
+    assert r.status_code == 200
+    assert "Archivierter Thread" in r.text
+    assert "Wiederherstellen" in r.text
+    assert f'data-restore-chat="{chat_id}"' in r.text
+
+    r = c.post("/admin/chat/restore", json={"chat_id": chat_id})
+    assert r.status_code == 200
+    assert r.json()["chat_id"] == chat_id
+
+    r = c.get(f"/admin/chat?chat={chat_id}")
+    assert r.status_code == 200
+    assert "Archiv <span>0</span>" in r.text
