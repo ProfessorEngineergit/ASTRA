@@ -34,13 +34,29 @@ class EduPagePlugin(Plugin):
                     env_fallback="edupage_password"),
         ConfigField("preferred_group", "Standard-Gruppe", required=False, default="B",
                     help="z. B. B. Wird genutzt, wenn Bahrian keine Gruppe nennt."),
+        ConfigField("child_id", "Kind-ID (optional)", required=False,
+                    help="Für Elternaccounts: EduPage person_id des Kindes. Leer = kein Wechsel."),
     ]
+
+    @staticmethod
+    def _normalize_subdomain(raw: str) -> str:
+        sub = (raw or "").strip()
+        sub = sub.removeprefix("https://").removeprefix("http://")
+        sub = sub.split("/", 1)[0]
+        if sub.endswith(".edupage.org"):
+            sub = sub[:-len(".edupage.org")]
+        return sub.strip()
 
     def _login_sync(self):
         from edupage_api import Edupage  # type: ignore
 
         ep = Edupage()
-        ep.login(self.get("username"), self.get("password"), self.get("subdomain"))
+        ep.login(self.get("username"), self.get("password"), self._normalize_subdomain(self.get("subdomain")))
+        child_id = str(self.get("child_id") or "").strip()
+        if child_id:
+            if not child_id.isdigit():
+                raise ValueError("child_id muss die numerische EduPage person_id sein.")
+            ep.switch_to_child(int(child_id))
         return ep
 
     @staticmethod
@@ -77,6 +93,11 @@ class EduPagePlugin(Plugin):
     def _fetch_sync(self, day: date_cls) -> dict:
         ep = self._login_sync()
         method = "get_my_timetable"
+        user_id = ""
+        try:
+            user_id = str(ep.get_user_id() or "")
+        except Exception:  # noqa: BLE001
+            user_id = ""
         try:
             tt = ep.get_my_timetable(day)
         except AttributeError:
@@ -85,7 +106,13 @@ class EduPagePlugin(Plugin):
         out = []
         for ls in (getattr(tt, "lessons", None) or []):
             out.append(self._lesson_to_dict(ls))
-        return {"ok": True, "method": method, "date": day.isoformat(), "lessons": out, "error": None}
+        warnings = []
+        if user_id.startswith("Rodic") and not self.get("child_id"):
+            warnings.append("EduPage ist als Elternaccount eingeloggt; child_id ist nicht gesetzt.")
+        return {
+            "ok": True, "method": method, "date": day.isoformat(), "lessons": out,
+            "error": None, "user_id": user_id, "warnings": warnings,
+        }
 
     def _changes_sync(self, day: date_cls) -> dict:
         ep = self._login_sync()
@@ -258,6 +285,8 @@ class EduPagePlugin(Plugin):
             "available_groups": sorted({g for l in raw_lessons for g in (l.get("groups") or [])}),
             "timetable_error": raw_result.get("error"),
             "changes_error": changes_result.get("error"),
+            "user_id": raw_result.get("user_id", ""),
+            "warnings": (raw_result.get("warnings") or []) + (changes_result.get("warnings") or []),
         }
 
     def tools(self) -> list[Tool]:
@@ -325,7 +354,7 @@ class EduPagePlugin(Plugin):
                         summary=body,
                         data={"date": day.isoformat(), "lessons": lessons, "changes": changes, "debug": debug},
                         source=self.slug,
-                        warnings=[] if changes_result.get("ok") else ["Vertretungen nicht verfügbar"],
+                        warnings=debug.get("warnings", []) + ([] if changes_result.get("ok") else ["Vertretungen nicht verfügbar"]),
                         error=None if changes_result.get("ok") else changes_result.get("error"),
                     )
                 if raw_lessons:

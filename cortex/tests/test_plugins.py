@@ -171,6 +171,38 @@ def test_edupage_fetch_uses_current_get_my_timetable_signature(monkeypatch):
     assert lessons[0]["curriculum"] == "Epochal"
 
 
+def test_edupage_normalizes_url_and_switches_child(monkeypatch):
+    calls = []
+
+    class FakeEdupage:
+        def login(self, username, password, subdomain):
+            calls.append(("login", subdomain))
+
+        def switch_to_child(self, child):
+            calls.append(("child", child))
+
+        def get_user_id(self):
+            return "Student123"
+
+        def get_my_timetable(self, day):
+            calls.append(("tt", day.isoformat()))
+            return types.SimpleNamespace(lessons=[])
+
+    monkeypatch.setitem(sys.modules, "edupage_api", types.SimpleNamespace(Edupage=FakeEdupage))
+    plugin = EduPagePlugin({
+        "__enabled": True,
+        "subdomain": "https://demo.edupage.org/login/",
+        "username": "u",
+        "password": "p",
+        "child_id": "42",
+    })
+
+    result = plugin._fetch_sync(__import__("datetime").date(2026, 6, 8))
+
+    assert calls[:2] == [("login", "demo"), ("child", 42)]
+    assert result["ok"] is True
+
+
 def test_edupage_group_filter_and_substitutions(monkeypatch):
     plugin = EduPagePlugin({
         "__enabled": True,
