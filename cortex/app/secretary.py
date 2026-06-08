@@ -1,4 +1,4 @@
-"""Aegis secretary policy for third-party channels."""
+"""Secretary policy for third-party channels."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -40,12 +40,10 @@ def secretary_settings(app_settings: dict | None) -> dict:
             "enabled": bool(data.get("enabled", enabled)),
             "mode": data.get("mode", mode),
             "label": data.get("label") or CHANNEL_LABELS.get(name, name),
-            "import_to_chat": bool(data.get("import_to_chat", name == "telegram")),
         }
 
     return {
         "enabled": bool(raw.get("enabled", True)),
-        "name": raw.get("name", "Aegis"),
         "tone": raw.get("tone", "warm"),
         "jailbreak_tone": raw.get("jailbreak_tone", "firm"),
         "school_direct": bool(raw.get("school_direct", True)),
@@ -62,7 +60,6 @@ def secretary_settings(app_settings: dict | None) -> dict:
         ),
         "header": raw.get("header", "--ASTRA--"),
         "channels": {
-            "telegram": chan("telegram", enabled=True, mode="chat_import"),
             "waha": chan("waha", enabled=True, mode="school_direct"),
             "signal": chan("signal", enabled=True, mode="school_direct"),
             "email": chan("email", enabled=True, mode="always_ask"),

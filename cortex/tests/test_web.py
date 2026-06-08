@@ -338,20 +338,30 @@ def test_secretary_shows_channel_threads_and_chat_import(memdb, monkeypatch):
     _prime_manager()
 
     async def fake_list_threads(limit=80):
-        return [{
-            "thread_id": "telegram:123",
-            "channel": "telegram",
-            "state": "answered",
-            "who": "Bahrian",
-            "trust_tier": 0,
-        }]
+        return [
+            {
+                "thread_id": "telegram:123",
+                "channel": "telegram",
+                "state": "answered",
+                "who": "Bahrian",
+                "trust_tier": 0,
+            },
+            {
+                "thread_id": "waha:49123@c.us",
+                "channel": "waha",
+                "state": "deferred",
+                "who": "Max",
+                "trust_tier": 3,
+            },
+        ]
 
     async def fake_recent_messages(thread_id, limit=80):
-        assert thread_id == "telegram:123"
-        return [
-            {"role": "owner", "content": "Telegram-Nachricht", "created_at": None},
-            {"role": "assistant", "content": "Antwort", "created_at": None},
-        ]
+        if thread_id == "telegram:123":
+            return [
+                {"role": "owner", "content": "Telegram-Nachricht", "created_at": None},
+                {"role": "assistant", "content": "Antwort", "created_at": None},
+            ]
+        return [{"role": "user", "content": "WhatsApp-Nachricht", "created_at": None}]
 
     from app import db
     monkeypatch.setattr(db, "list_threads", fake_list_threads)
@@ -370,11 +380,14 @@ def test_secretary_shows_channel_threads_and_chat_import(memdb, monkeypatch):
     r = c.get("/admin/secretary")
 
     assert r.status_code == 200
-    assert "Aegis Secretary" in r.text
+    assert "ASTRA Secretary" in r.text
     assert "Channel Threads" in r.text
     assert "WAHA Webhook" in r.text
-    assert "Telegram-Nachricht" in r.text
-    assert "Telegram" in r.text
+    assert "WhatsApp-Nachricht" in r.text
+    assert "Telegram-Nachricht" not in r.text
+    assert "sec_telegram_mode" not in r.text
+    assert "sec_telegram_enabled" not in r.text
+    assert "setup-chatbox" in r.text
 
     chat_id = web_admin._channel_chat_id("telegram:123")
     r = c.get(f"/admin/chat?chat={chat_id}")
@@ -382,3 +395,8 @@ def test_secretary_shows_channel_threads_and_chat_import(memdb, monkeypatch):
     assert r.status_code == 200
     assert "from Telegram" in r.text
     assert "Telegram-Nachricht" in r.text
+
+    r = c.post("/admin/secretary/setup-chat", json={"channel": "waha", "message": "Wie teste ich den Header?"})
+    assert r.status_code == 200
+    assert "X-Astra-Secret" in r.json()["reply"]
+    assert "secretary_setup_chats" in memdb

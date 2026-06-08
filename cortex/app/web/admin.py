@@ -1815,19 +1815,66 @@ def _select(name: str, value: str, options: list[tuple[str, str]]) -> str:
     return f'<select name="{esc(name)}">{opts}</select>'
 
 
+SECRETARY_SETUP_CHANNELS = ("waha", "signal", "email")
+
+
+def _setup_seed(channel: str) -> list[dict]:
+    label = _channel_label(channel)
+    guides = {
+        "waha": (
+            "Ich helfe dir beim WhatsApp-Setup. Ziel: WAHA schickt eingehende Nachrichten an "
+            "/ingress/waha, ASTRA erkennt Gruppen, fromMe und Rueckfragen sauber."
+        ),
+        "signal": (
+            "Ich helfe dir beim Signal-Setup. Ziel: signal-cli-rest-api liefert Nachrichten an "
+            "/ingress/signal inklusive groupInfo, damit Gruppen sicher behandelt werden."
+        ),
+        "email": (
+            "Ich helfe dir beim Mail-Setup. Ziel: IMAP/Gmail normalisiert Mails nach /ingress/email; "
+            "Antworten bleiben standardmaessig bestaetigungspflichtig."
+        ),
+    }
+    return [{"role": "assistant", "content": guides.get(channel, f"Ich helfe dir beim {label}-Setup.")}]
+
+
+def _setup_messages(store: dict, channel: str) -> list[dict]:
+    chats = store.setdefault("chats", {})
+    if channel not in chats:
+        chats[channel] = _setup_seed(channel)
+    return chats[channel]
+
+
+def _render_setup_chat(channel: str, messages: list[dict]) -> str:
+    rows = []
+    for msg in messages[-8:]:
+        role = msg.get("role", "assistant")
+        cls = "user" if role == "user" else "bot"
+        who = "Du" if role == "user" else "ASTRA"
+        rows.append(
+            f'<div class="setup-msg {cls}"><b>{esc(who)}</b><span>{esc(msg.get("content", ""))}</span></div>'
+        )
+    return (
+        f'<div class="setup-chatbox" data-setup-channel="{esc(channel)}">'
+        f'<div class="setup-log">{"".join(rows)}</div>'
+        '<div class="setup-input">'
+        '<input type="text" placeholder="Frag ASTRA zur Einrichtung...">'
+        '<button class="btn sm" type="button">Fragen</button>'
+        '</div></div>'
+    )
+
+
 def _secretary_channel_card(channel: str, cfg: dict) -> str:
     mode_options = {
-        "telegram": [("chat_import", "In Chat importieren"), ("off", "Nur speichern")],
         "waha": [("school_direct", "Schulzeit direkt"), ("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
         "signal": [("school_direct", "Schulzeit direkt"), ("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
         "email": [("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
     }[channel]
     setup = {
-        "telegram": "Telegram wird in den normalen Chat gespiegelt und dort als from Telegram markiert.",
         "waha": "WAHA Webhook: /ingress/waha mit X-Astra-Secret. Gruppen werden standardmaessig nur nach Freigabe bearbeitet.",
         "signal": "signal-cli-rest-api Webhook: /ingress/signal mit X-Astra-Secret. groupInfo aktiviert Gruppenschutz.",
         "email": "Mail-Ingress: /ingress/email fuer normalisierte IMAP/Gmail-Events. Senden bleibt bestaetigungspflichtig.",
     }[channel]
+    setup_store = cfg.get("_setup_store") or {}
     return f"""
       <div class="secretary-card">
         <h3>{esc(cfg.get("label") or _channel_label(channel))}
@@ -1841,6 +1888,7 @@ def _secretary_channel_card(channel: str, cfg: dict) -> str:
           {_select(f"sec_{channel}_mode", cfg.get("mode", "policy"), mode_options)}
         </div>
         <p>{esc(setup)}</p>
+        {_render_setup_chat(channel, _setup_messages(setup_store, channel))}
         <div class="mini">{esc(channel)}</div>
       </div>
     """
@@ -1856,7 +1904,8 @@ async def inbox_legacy(_: bool = Depends(auth.require_admin), thread: str = ""):
 async def secretary_page(request: Request, _: bool = Depends(auth.require_admin), thread: str = ""):
     appset = await _app_settings()
     settings = secretary_settings(appset)
-    threads = await db.list_threads(80)
+    all_threads = await db.list_threads(80)
+    threads = [t for t in all_threads if t.get("channel") in SECRETARY_SETUP_CHANNELS]
     selected = next((t for t in threads if t.get("thread_id") == thread), threads[0] if threads else None)
     active_id = selected.get("thread_id") if selected else ""
     side_rows = []
@@ -1872,9 +1921,10 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
     messages = await db.recent_messages(active_id, 80) if active_id else []
     title = selected.get("who") if selected else "Keine Threads"
     token = await auth.issue_csrf()
+    setup_store = await db.get_setting("secretary_setup_chats", {}) or {}
     channel_cards = "".join(
-        _secretary_channel_card(ch, settings["channels"][ch])
-        for ch in ("telegram", "waha", "signal", "email")
+        _secretary_channel_card(ch, {**settings["channels"][ch], "_setup_store": setup_store})
+        for ch in SECRETARY_SETUP_CHANNELS
     )
     workdays = {int(v) for v in (settings.get("workdays") or []) if str(v).isdigit()}
     weekday_checks = "".join(
@@ -1885,8 +1935,8 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
     group_options = [("owner_grant", "Nur nach Auftrag"), ("always_ask", "Immer fragen"), ("auto", "Automatisch erlauben")]
     body = f"""
     <div class="hero">
-      <h1>{esc(settings.get("name", "Aegis"))} Secretary</h1>
-      <p>WhatsApp, Signal, Mail und Telegram-Kontext sicher einrichten, abstimmen und ueberwachen.</p>
+      <h1>ASTRA Secretary</h1>
+      <p>WhatsApp, Signal und Mail so einrichten, dass ASTRA nur dort stellvertretend spricht, wo es wirklich gemeint ist.</p>
     </div>
     <form method="post" action="/admin/secretary">
       <input type="hidden" name="csrf" value="{esc(token)}">
@@ -1897,7 +1947,7 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
           <div class="secretary-cards">{channel_cards}</div>
         </section>
         <aside class="setup-chat">
-          <div class="setup-bubble"><strong>ASTRA Setup</strong><br>Verbinde WAHA, Signal oder Mail mit den Ingress-Endpunkten und nutze immer den Header <code>X-Astra-Secret</code>.</div>
+          <div class="setup-bubble"><strong>ASTRA Setup</strong><br>Telegram bleibt im normalen Chat. Secretary ist nur WhatsApp, Signal und Mail, also dort, wo ASTRA fuer dich antworten kann.</div>
           <div class="setup-bubble"><strong>WAHA</strong><br><code>POST /ingress/waha</code> fuer WhatsApp-Nachrichten.</div>
           <div class="setup-bubble"><strong>Signal</strong><br><code>POST /ingress/signal</code> aus signal-cli-rest-api.</div>
           <div class="setup-bubble"><strong>Mail</strong><br><code>POST /ingress/email</code> mit <code>from</code>, <code>subject</code> und <code>text</code>.</div>
@@ -1905,9 +1955,8 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
       </div>
 
       <div class="panel" style="margin-top:16px">
-        <h2 style="margin:0 0 6px;font-size:17px">Aegis Policy</h2>
+        <h2 style="margin:0 0 6px;font-size:17px">Secretary Policy</h2>
         <div class="secretary-row">
-          <div><label>Name</label><input type="text" name="sec_name" value="{esc(settings.get("name"))}"></div>
           <div><label>Tonfall</label>{_select("sec_tone", settings.get("tone", "warm"), tone_options)}</div>
           <div><label>Security-Tonfall</label>{_select("sec_jailbreak_tone", settings.get("jailbreak_tone", "firm"), tone_options)}</div>
           <div><label>Gruppenaktionen</label>{_select("sec_group_actions", settings.get("group_actions", "owner_grant"), group_options)}</div>
@@ -1917,7 +1966,7 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
           <div><label>Warten bis Eingriff</label><input type="number" name="sec_wait_after" min="1" max="480" value="{esc(settings.get("wait_after_minutes"))}"></div>
         </div>
         <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:13px">
-          <label class="secretary-switch"><input type="checkbox" name="sec_enabled"{_checked(settings.get("enabled", True))}> Aegis aktiv</label>
+          <label class="secretary-switch"><input type="checkbox" name="sec_enabled"{_checked(settings.get("enabled", True))}> Secretary aktiv</label>
           <label class="secretary-switch"><input type="checkbox" name="sec_school_direct"{_checked(settings.get("school_direct", True))}> In Schulzeit direkt antworten</label>
           {weekday_checks}
         </div>
@@ -1941,7 +1990,44 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
         </div>
         <div class="chat-log">{_render_hub_messages(messages)}</div>
       </section>
-    </div>"""
+    </div>
+    <script>
+      document.querySelectorAll('.setup-chatbox').forEach(box => {{
+        const channel = box.dataset.setupChannel;
+        const input = box.querySelector('input');
+        const btn = box.querySelector('button');
+        const log = box.querySelector('.setup-log');
+        const add = (role, text) => {{
+          const row = document.createElement('div');
+          row.className = 'setup-msg ' + (role === 'user' ? 'user' : 'bot');
+          row.innerHTML = '<b>' + (role === 'user' ? 'Du' : 'ASTRA') + '</b><span></span>';
+          row.querySelector('span').textContent = text;
+          log.appendChild(row);
+          log.scrollTop = log.scrollHeight;
+        }};
+        const send = async () => {{
+          const text = input.value.trim();
+          if (!text) return;
+          input.value = '';
+          add('user', text);
+          btn.disabled = true;
+          try {{
+            const r = await fetch('/admin/secretary/setup-chat', {{
+              method: 'POST',
+              headers: {{'Content-Type': 'application/json'}},
+              body: JSON.stringify({{channel, message: text}})
+            }});
+            const d = await r.json();
+            add('assistant', d.reply || 'Ich habe dazu gerade keine Antwort.');
+          }} catch (e) {{
+            add('assistant', 'Setup-Chat konnte gerade nicht antworten.');
+          }}
+          btn.disabled = false;
+        }};
+        btn.onclick = send;
+        input.addEventListener('keydown', e => {{ if (e.key === 'Enter') send(); }});
+      }});
+    </script>"""
     return _html_with_csrf(page("Secretary", body, active="secretary"), token)
 
 
@@ -1960,16 +2046,14 @@ async def secretary_save(request: Request, _: bool = Depends(auth.require_admin)
             return fallback
 
     channels = {}
-    for ch in ("telegram", "waha", "signal", "email"):
+    for ch in SECRETARY_SETUP_CHANNELS:
         channels[ch] = {
             "enabled": form.get(f"sec_{ch}_enabled") == "on",
             "mode": str(form.get(f"sec_{ch}_mode") or current["channels"][ch]["mode"]),
             "label": current["channels"][ch].get("label") or _channel_label(ch),
-            "import_to_chat": ch == "telegram" and form.get("sec_telegram_mode") == "chat_import",
         }
     appset["secretary"] = {
         "enabled": form.get("sec_enabled") == "on",
-        "name": str(form.get("sec_name") or "Aegis"),
         "tone": str(form.get("sec_tone") or "warm"),
         "jailbreak_tone": str(form.get("sec_jailbreak_tone") or "firm"),
         "school_direct": form.get("sec_school_direct") == "on",
@@ -1986,6 +2070,76 @@ async def secretary_save(request: Request, _: bool = Depends(auth.require_admin)
     await db.set_setting("app_settings", appset)
     await db.audit("secretary_settings_saved", actor="owner", detail={"channels": list(channels)})
     return RedirectResponse("/admin/secretary", status_code=303)
+
+
+def _setup_fallback_reply(channel: str, message: str) -> str:
+    base = {
+        "waha": (
+            "Fuer WAHA brauchst du den Container, eine aktive Session und einen Webhook auf "
+            "/ingress/waha. Wichtig sind body, from, fromMe und bei Gruppen die Gruppen-JID."
+        ),
+        "signal": (
+            "Fuer Signal brauchst du signal-cli-rest-api, eine registrierte Nummer und Webhooks auf "
+            "/ingress/signal. Achte darauf, groupInfo mitzugeben, damit Gruppen nicht automatisch handeln."
+        ),
+        "email": (
+            "Fuer Mail sollte ein Poller oder Gmail/IMAP-Plugin normalisierte Felder an /ingress/email senden: "
+            "from, name, subject und text. Antworten bleiben in der Regel bestaetigungspflichtig."
+        ),
+    }.get(channel, "Ich helfe dir bei dieser Secretary-Einrichtung.")
+    lowered = message.lower()
+    if "secret" in lowered or "header" in lowered:
+        return "Nutze den HTTP-Header X-Astra-Secret mit deinem CORTEX_SHARED_SECRET. Ohne diesen Header lehnt ASTRA Ingress-Anfragen ab."
+    if "gruppe" in lowered or "group" in lowered:
+        return "Gruppen sind absichtlich gebremst: ASTRA fragt nach, solange du nicht genau diese Gruppe freigibst. Das ist fuer WhatsApp und Signal wichtig."
+    return base
+
+
+@router.post("/admin/secretary/setup-chat")
+async def secretary_setup_chat(request: Request, _: bool = Depends(auth.require_admin)):
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001
+        data = {}
+    channel = str(data.get("channel") or "")
+    message = str(data.get("message") or "").strip()
+    if channel not in SECRETARY_SETUP_CHANNELS or not message:
+        return JSONResponse({"ok": False, "reply": "Diese Einrichtung kenne ich nicht."}, status_code=400)
+    store = await db.get_setting("secretary_setup_chats", {}) or {}
+    messages = _setup_messages(store, channel)
+    messages.append({"role": "user", "content": message, "ts": _now_iso()})
+    reply = ""
+    try:
+        from ..agent import generate_reply_meta
+        from ..persona import Register
+        result = await generate_reply_meta(
+            register=Register.OWNER,
+            contact={"id": "owner", "is_owner": True},
+            thread_id=f"web-secretary-setup:{channel}",
+            channel="web",
+            history=[
+                {"role": m.get("role", "assistant"), "content": m.get("content", "")}
+                for m in messages[-12:]
+                if m.get("role") in {"user", "assistant"}
+            ],
+            extra_system=(
+                "Du hilfst Bahrian interaktiv bei einer ASTRA-Secretary-Einrichtung. "
+                f"Kanal: {_channel_label(channel)}. Antworte konkret, kurz, mit naechsten Schritten "
+                "und bleibe bei Webhook, Sicherheit, Gruppenverhalten, Testpayloads und Fehlersuche."
+            ),
+            permission_mode="ask",
+        )
+        reply = result.get("reply") or ""
+        if reply.startswith("(ASTRA: kein OpenAI-Key"):
+            reply = ""
+    except Exception:  # noqa: BLE001
+        log.debug("Secretary setup chat used fallback for %s", channel, exc_info=True)
+    reply = reply or _setup_fallback_reply(channel, message)
+    messages.append({"role": "assistant", "content": reply, "ts": _now_iso()})
+    store.setdefault("chats", {})[channel] = messages[-40:]
+    await db.set_setting("secretary_setup_chats", store)
+    await db.audit("secretary_setup_chat", actor="owner", detail={"channel": channel, "len": len(message)})
+    return JSONResponse({"ok": True, "reply": reply, "messages": store["chats"][channel][-8:]})
 
 
 # ─── Chat: multi-thread owner agent ────────────────────────────────────────────
@@ -2153,10 +2307,6 @@ def _channel_message(thread_id: str, idx: int, message: dict) -> dict:
 
 
 async def _sync_channel_threads_into_chats(store: dict) -> None:
-    appset = await _app_settings()
-    sec = secretary_settings(appset)
-    if not sec["channels"].get("telegram", {}).get("import_to_chat", True):
-        return
     try:
         threads = await db.list_threads(80)
     except Exception:  # noqa: BLE001

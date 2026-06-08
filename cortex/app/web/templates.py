@@ -532,6 +532,16 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
 .setup-bubble { padding: 12px 13px; border: 1px solid var(--border-soft); border-radius: 14px;
   background: rgba(255,255,255,.035); color: var(--text-dim); font-size: 13px; line-height: 1.48; }
 .setup-bubble strong { color: var(--text); }
+.setup-chatbox { display: grid; gap: 8px; margin-top: 4px; padding: 10px; background: #050507;
+  border: 1px solid var(--border-soft); border-radius: var(--r-sm); }
+.setup-log { display: grid; gap: 7px; max-height: 210px; overflow: auto; }
+.setup-msg { display: grid; gap: 2px; max-width: 92%; padding: 8px 9px; border-radius: 10px;
+  background: rgba(255,255,255,.035); border: 1px solid var(--border-soft); }
+.setup-msg.user { justify-self: end; background: rgba(244,245,248,.12); border-color: rgba(244,245,248,.18); }
+.setup-msg b { color: var(--text); font-size: 10px; text-transform: uppercase; letter-spacing: .07em; }
+.setup-msg span { color: var(--text-dim); font-size: 12px; line-height: 1.4; }
+.setup-input { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 7px; }
+.setup-input input { padding: 8px 9px; font-size: 12.5px; }
 .policy-stack { display: grid; gap: 9px; }
 .policy-line { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px;
   border: 1px solid var(--border-soft); border-radius: var(--r-sm); background: rgba(255,255,255,.025); }

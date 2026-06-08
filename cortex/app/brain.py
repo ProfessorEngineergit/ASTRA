@@ -142,7 +142,7 @@ async def _send_and_record(
             meta=meta,
         )
     except Exception:  # noqa: BLE001
-        log.debug("Aegis context ledger write failed for outbound %s", thread_id, exc_info=True)
+        log.debug("Secretary context ledger write failed for outbound %s", thread_id, exc_info=True)
     await db.audit(
         "reply_sent",
         channel=channel,
@@ -217,7 +217,7 @@ async def handle_inbound(
             meta=thread.get("meta") or {},
         )
     except Exception:  # noqa: BLE001
-        log.debug("Aegis context ledger write failed for inbound %s", thread_id, exc_info=True)
+        log.debug("Secretary context ledger write failed for inbound %s", thread_id, exc_info=True)
 
     # ── Owner's own conversation with ASTRA (peer IS the owner) ─────────────────
     if peer_is_owner:

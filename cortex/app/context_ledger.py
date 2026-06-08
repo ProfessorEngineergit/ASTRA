@@ -1,4 +1,4 @@
-"""Aegis context ledger: compact files for contacts, threads, and groups."""
+"""Secretary context ledger: compact files for contacts, threads, people, and groups."""
 from __future__ import annotations
 
 import asyncio
@@ -11,7 +11,7 @@ from .config import get_settings
 
 
 def _root() -> Path:
-    path = Path(get_settings().brain_data_dir) / "aegis"
+    path = Path(get_settings().brain_data_dir) / "secretary"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -105,6 +105,20 @@ def _append(entry: dict) -> None:
             _load_tail(group_file),
             f"Group {group_key}",
         )
+        participant = entry.get("participant_handle")
+        if participant:
+            person_key = f"{entry.get('channel')}:{participant}"
+            person_entry = {**entry, "handle": participant, "group_context": group_key}
+            person_line = json.dumps(person_entry, ensure_ascii=False, sort_keys=True)
+            person_file = root / "contacts" / f"{_safe(person_key)}.jsonl"
+            person_file.parent.mkdir(parents=True, exist_ok=True)
+            with person_file.open("a", encoding="utf-8") as f:
+                f.write(person_line + "\n")
+            _write_capsule(
+                root / "contacts" / f"{_safe(person_key)}.md",
+                _load_tail(person_file),
+                f"Contact {person_key}",
+            )
 
 
 async def record_interaction(
