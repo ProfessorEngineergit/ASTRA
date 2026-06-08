@@ -511,9 +511,9 @@ def _area_attrs(slug: str) -> str:
 def _labs_css(labs: dict) -> str:
     accent = {
         "platinum": ("#f4f5f8", "#aab4d6"),
-        "ion": ("#9ee7ff", "#67e8f9"),
-        "aurora": ("#c4f1be", "#c4b5fd"),
-        "ember": ("#ffd6a5", "#f5c451"),
+        "ion": ("#d9f3ff", "#a9c9dc"),
+        "aurora": ("#e5e9f0", "#bfc7d8"),
+        "ember": ("#f3e4bc", "#d4bd7a"),
     }.get(labs.get("accent"), ("#f4f5f8", "#aab4d6"))
     event_opacity = {"off": "0", "subtle": ".35", "deep": ".62"}.get(
         labs.get("event_horizon"), ".35"
@@ -1862,6 +1862,14 @@ def _chat_icon(name: str) -> str:
             '<path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/>'
             '<path d="M10 11v5M14 11v5"/></svg>'
         ),
+        "shield": (
+            '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 20 7v5c0 5-3.4 8.6-8 9'
+            ' -4.6-.4-8-4-8-9V7Z"/><path d="m9 12 2 2 4-5"/></svg>'
+        ),
+        "send": (
+            '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4Z"/>'
+            '<path d="M22 2 11 13"/></svg>'
+        ),
     }
     return icons[name]
 
@@ -2041,11 +2049,16 @@ def _render_messages(chat: dict) -> str:
             p = m["pending_action"]
             pending = (
                 '<div class="action-card">'
-                f'<div><b>Agentenaktion</b><span>{esc(p.get("tool"))}</span></div>'
-                f'<pre>{esc(json.dumps(p.get("args", {}), ensure_ascii=False, indent=2))}</pre>'
-                '<div class="row">'
+                '<div class="action-head">'
+                f'<span class="action-mark">{_chat_icon("shield")}</span>'
+                '<div><small>Freigabe erforderlich</small>'
+                f'<b>{esc(p.get("tool"))}</b></div></div>'
+                '<p>Diese Aktion wartet auf deine Entscheidung.</p>'
+                '<details class="action-details"><summary>Argumente anzeigen</summary>'
+                f'<pre>{esc(json.dumps(p.get("args", {}), ensure_ascii=False, indent=2))}</pre></details>'
+                '<div class="action-row">'
                 f'<button class="btn sm" data-run-action="{esc(m["id"])}">Ausführen</button>'
-                f'<button class="btn ghost sm" data-deny-action="{esc(m["id"])}">Ablehnen</button>'
+                f'<button class="btn ghost sm danger" data-deny-action="{esc(m["id"])}">Ablehnen</button>'
                 '</div></div>'
             )
         tool_cards = ""
@@ -2097,6 +2110,8 @@ async def chat_page(
     mode = (active or {}).get("permission_mode", "ask")
     active_id = (active or {}).get("id", "")
     title = (active or {}).get("title") or "Archiv"
+    mode_cls = mode if mode in ("ask", "auto", "bypass") else "auto"
+    autonomy_cls = autonomy if autonomy in ("ask", "confident", "full") else "ask"
     active_count = sum(1 for c in store["chats"] if not c.get("archived"))
     archived_count = sum(1 for c in store["chats"] if c.get("archived"))
     can_merge = bool(active and active.get("parent_id") and not archive_view)
@@ -2122,7 +2137,7 @@ async def chat_page(
         '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21.4 11.6 12 21a6 6 0 0 1-8.5-8.5l9.7-9.7a4 4 0 0 1 5.7 5.7L9.2 18.2a2 2 0 1 1-2.8-2.8l8.8-8.8"/></svg>'
         '</label>'
         '<textarea id="inp" placeholder="Nachricht oder Aufgabe an ASTRA…" rows="1"></textarea>'
-        '<button class="btn" id="send">Senden</button>'
+        f'<button class="btn send-btn" id="send">{_chat_icon("send")}<span>Senden</span></button>'
         '<button class="btn ghost sm" id="clear" title="Verlauf leeren">Leeren</button>'
         '</div>'
     )
@@ -2130,37 +2145,63 @@ async def chat_page(
     body = f"""
     <div class="chat-shell" data-chat="{esc(active_id)}" data-view="{'archive' if archive_view else 'active'}">
       <aside class="chat-side">
-        <div class="side-head"><b>ASTRA Chat</b><button class="btn sm" id="newchat">Neu</button></div>
+        <div class="side-head"><div><small>Workspace</small><b>ASTRA Chat</b></div><button class="btn sm" id="newchat">Neu</button></div>
         <div class="chat-tabs">
           <a class="{'active' if not archive_view else ''}" href="/admin/chat">Aktiv <span>{active_count}</span></a>
           <a class="{'active' if archive_view else ''}" href="/admin/chat?view=archive">Archiv <span>{archived_count}</span></a>
         </div>
         <div class="threads">{_render_chat_list(store, active_id, archived=archive_view)}</div>
         <div class="perm-box">
-          <label>Ausführung</label>
-          <select id="perm" {"disabled" if archive_view else ""}>
-            <option value="ask" {"selected" if mode == "ask" else ""}>Jedes Mal fragen</option>
-            <option value="auto" {"selected" if mode == "auto" else ""}>Automodus</option>
-            <option value="bypass" {"selected" if mode == "bypass" else ""}>Berechtigungen umgehen</option>
-          </select>
-          <label>Autonomielevel</label>
-          <select id="autonomy" {"disabled" if archive_view else ""}>
-            <option value="ask" {"selected" if autonomy == "ask" else ""}>ask</option>
-            <option value="confident" {"selected" if autonomy == "confident" else ""}>confident</option>
-            <option value="full" {"selected" if autonomy == "full" else ""}>full</option>
-          </select>
-          <p>Ask pausiert riskante Toolcalls. Bypass gilt nur hier im Owner-Webchat.</p>
+          <div class="perm-head">
+            <span class="perm-icon">{_chat_icon("shield")}</span>
+            <div><small>Berechtigungen</small><strong>Ausführung</strong></div>
+          </div>
+          <div class="perm-grid">
+            <label>Modus</label>
+            <select id="perm" {"disabled" if archive_view else ""}>
+              <option value="ask" {"selected" if mode == "ask" else ""}>Fragen</option>
+              <option value="auto" {"selected" if mode == "auto" else ""}>Auto</option>
+              <option value="bypass" {"selected" if mode == "bypass" else ""}>Berechtigungen umgehen</option>
+            </select>
+            <label>Autonomie</label>
+            <select id="autonomy" {"disabled" if archive_view else ""}>
+              <option value="ask" {"selected" if autonomy == "ask" else ""}>ask</option>
+              <option value="confident" {"selected" if autonomy == "confident" else ""}>confident</option>
+              <option value="full" {"selected" if autonomy == "full" else ""}>full</option>
+            </select>
+          </div>
+          <div class="perm-status mode-{esc(mode_cls)}">
+            <span></span>{esc(_mode_label(mode))}
+          </div>
         </div>
         {archive_button}
       </aside>
       <section class="chat-main">
         <div class="chat-title">
-          <div><span>{"Archivierter Thread" if archive_view else "Thread"}</span><h1>{esc(title)}</h1></div>
+          <div><span>{"Archivierter Thread" if archive_view else "Thread"}</span><h1>{esc(title)}</h1>
+            <div class="chat-state">
+              <span class="mode-pill mode-{esc(mode_cls)}">{esc(_mode_label(mode))}</span>
+              <span class="mode-pill autonomy-{esc(autonomy_cls)}">Autonomie {esc(autonomy)}</span>
+            </div>
+          </div>
           <div class="chat-title-actions">{title_actions}</div>
         </div>
         <div class="chat-log" id="log">{messages_html}</div>
         {input_html}
       </section>
+    </div>
+    <div class="confirm-modal" id="confirmModal" hidden>
+      <div class="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+        <div class="confirm-mark">{_chat_icon("shield")}</div>
+        <div>
+          <h2 id="confirmTitle">Bestätigen</h2>
+          <p id="confirmText">Diese Aktion ausführen?</p>
+          <div class="confirm-actions">
+            <button class="btn ghost sm" id="confirmCancel" type="button">Abbrechen</button>
+            <button class="btn sm" id="confirmOk" type="button">Bestätigen</button>
+          </div>
+        </div>
+      </div>
     </div>
     <script>
       const root=document.querySelector('.chat-shell'), chatId=root.dataset.chat, archiveView=root.dataset.view==='archive';
@@ -2179,6 +2220,24 @@ async def chat_page(
         }} catch(e) {{
           prompt('Text kopieren:', text);
         }}
+      }}
+      function confirmChoice(title, text, okLabel='Bestätigen', tone='default') {{
+        return new Promise(resolve => {{
+          const modal=document.getElementById('confirmModal');
+          const titleEl=document.getElementById('confirmTitle'), textEl=document.getElementById('confirmText');
+          const ok=document.getElementById('confirmOk'), cancel=document.getElementById('confirmCancel');
+          titleEl.textContent=title; textEl.textContent=text; ok.textContent=okLabel;
+          ok.classList.toggle('danger', tone==='danger');
+          modal.hidden=false;
+          const close = value => {{
+            modal.hidden=true;
+            ok.onclick=null; cancel.onclick=null; modal.onclick=null; document.onkeydown=null;
+            resolve(value);
+          }};
+          ok.onclick=()=>close(true); cancel.onclick=()=>close(false);
+          modal.onclick=e=>{{if(e.target===modal) close(false);}};
+          document.onkeydown=e=>{{if(e.key==='Escape') close(false);}};
+        }});
       }}
       async function saveSettings(){{if(!archiveView&&chatId) await post('/admin/chat/settings',{{chat_id:chatId,permission_mode:perm.value,autonomy:autonomy.value}});}}
       if(perm) perm.onchange=saveSettings; if(autonomy) autonomy.onchange=saveSettings;
@@ -2203,14 +2262,16 @@ async def chat_page(
       const mergeBtn=document.getElementById('mergechat');
       const clearBtn=document.getElementById('clear'), restoreBtn=document.getElementById('restorechat');
       const restoreBottom=document.getElementById('restorebottom');
-      if(archiveBtn) archiveBtn.onclick=async()=>{{await post('/admin/chat/archive',{{chat_id:chatId}}); location.href='/admin/chat?view=archive&chat='+encodeURIComponent(chatId);}};
+      if(archiveBtn) archiveBtn.onclick=async()=>{{if(!await confirmChoice('Chat archivieren', 'Der Thread bleibt erhalten und wandert ins Archiv.', 'Archivieren')) return;
+        await post('/admin/chat/archive',{{chat_id:chatId}}); location.href='/admin/chat?view=archive&chat='+encodeURIComponent(chatId);}};
       if(branchBtn) branchBtn.onclick=async()=>{{const d=await post('/admin/chat/branch',{{chat_id:chatId}}); location.href='/admin/chat?chat='+d.chat_id;}};
       if(mergeBtn) mergeBtn.onclick=async()=>{{
-        if(!confirm('Neue Nachrichten aus diesem Branch in den Ursprung mergen?')) return;
+        if(!await confirmChoice('Branch mergen', 'Neue Nachrichten werden in den Ursprung übernommen.', 'Mergen')) return;
         const d=await post('/admin/chat/merge',{{chat_id:chatId}});
         location.href='/admin/chat?chat='+encodeURIComponent(d.chat_id||chatId);
       }};
-      if(clearBtn) clearBtn.onclick=async()=>{{await post('/admin/chat/clear',{{chat_id:chatId}}); location.reload();}};
+      if(clearBtn) clearBtn.onclick=async()=>{{if(!await confirmChoice('Verlauf leeren', 'Alle Nachrichten in diesem Chat werden entfernt.', 'Leeren', 'danger')) return;
+        await post('/admin/chat/clear',{{chat_id:chatId}}); location.reload();}};
       if(restoreBtn) restoreBtn.onclick=()=>restore(chatId);
       if(restoreBottom) restoreBottom.onclick=()=>restore(chatId);
       document.querySelectorAll('[data-restore-chat]').forEach(b=>b.onclick=()=>restore(b.dataset.restoreChat));
@@ -2223,7 +2284,7 @@ async def chat_page(
           if(text!==null){{await post('/admin/chat/edit',{{chat_id:chatId,message_id:edit.dataset.edit,content:text}}); location.reload();}}}}
         if(branch){{const d=await post('/admin/chat/branch',{{chat_id:chatId,message_id:branch.dataset.branch}}); location.href='/admin/chat?chat='+d.chat_id;}}
         if(copy){{const row=copy.closest('.msg-row'); const text=row.querySelector('.msg-content')?.textContent||''; await copyText(text, copy);}}
-        if(del){{if(!confirm('Diese Nachricht wirklich löschen?')) return;
+        if(del){{if(!await confirmChoice('Nachricht löschen', 'Diese Nachricht wird aus dem Thread entfernt.', 'Löschen', 'danger')) return;
           await post('/admin/chat/delete_message',{{chat_id:chatId,message_id:del.dataset.delete}}); location.reload();}}
         if(run){{await post('/admin/chat/action',{{chat_id:chatId,message_id:run.dataset.runAction,decision:'run'}}); location.reload();}}
         if(deny){{await post('/admin/chat/action',{{chat_id:chatId,message_id:deny.dataset.denyAction,decision:'deny'}}); location.reload();}}
@@ -2538,11 +2599,11 @@ async def updates_page(request: Request, _: bool = Depends(auth.require_admin)):
             position: relative;
             width: 100%;
             min-height: 160px;
-            background: var(--bg-1, rgba(10, 11, 16, 0.6));
-            border: 1px solid var(--border, rgba(0, 210, 255, 0.15));
+            background: linear-gradient(180deg, rgba(16, 16, 21, 0.92), rgba(7, 7, 10, 0.98));
+            border: 1px solid var(--border);
             border-radius: 16px;
             overflow: hidden;
-            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5), inset 0 0 30px rgba(0, 210, 255, 0.04);
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.035);
             display: flex;
             align-items: center;
             transition: all 0.6s cubic-bezier(0.16, 1, 0.3, 1);
@@ -2591,7 +2652,7 @@ async def updates_page(request: Request, _: bool = Depends(auth.require_admin)):
             background: linear-gradient(to bottom, #ffffff, #a2b4c7);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
-            filter: drop-shadow(0 0 30px rgba(0, 210, 255, 0.4));
+            filter: drop-shadow(0 0 30px rgba(170, 180, 214, 0.32));
         }}
 
         /* Aktivierungs-Klasse nach dem Update-Prozess */
@@ -2631,26 +2692,36 @@ async def updates_page(request: Request, _: bool = Depends(auth.require_admin)):
 
         /* --- BUTTONS & LINKS --- */
         .card-actions .btn-primary {{
-            background: linear-gradient(135deg, #00f0ff 0%, #0072ff 100%);
-            color: #000;
+            background: var(--accent);
+            color: var(--accent-ink);
             border: none;
             padding: 12px 28px;
             border-radius: 8px;
             font-size: 14px;
             font-weight: 600;
             cursor: pointer;
-            box-shadow: 0 0 20px rgba(0, 240, 255, 0.3);
+            box-shadow: 0 12px 28px rgba(244, 245, 248, 0.08);
             transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
         }}
 
         .card-actions .btn-primary:hover {{
             transform: translateY(-2px);
-            box-shadow: 0 0 30px rgba(0, 240, 255, 0.6);
-            background: linear-gradient(135deg, #55f5ff 0%, #338cff 100%);
+            box-shadow: 0 16px 36px rgba(244, 245, 248, 0.14);
+            filter: brightness(.94);
         }}
 
         .card-actions .btn-primary:active {{
             transform: translateY(0);
+        }}
+
+        .card-actions .btn-primary:disabled {{
+            background: var(--surface-2);
+            color: var(--text-faint);
+            border: 1px solid var(--border);
+            box-shadow: none;
+            cursor: not-allowed;
+            filter: none;
+            transform: none;
         }}
 
         .card-actions .link-secondary {{
@@ -2678,15 +2749,15 @@ async def updates_page(request: Request, _: bool = Depends(auth.require_admin)):
 
         .confirm-text {{
             font-size: 14px;
-            color: #00d2ff;
+            color: var(--text);
             font-weight: 500;
             margin-right: 8px;
         }}
 
         .card-actions .btn-danger {{
             background: transparent;
-            color: #ff4a4a;
-            border: 1px solid rgba(255, 74, 74, 0.3);
+            color: #fecdd3;
+            border: 1px solid rgba(251, 113, 133, 0.34);
             padding: 10px 18px;
             border-radius: 8px;
             font-size: 13px;
@@ -2696,8 +2767,8 @@ async def updates_page(request: Request, _: bool = Depends(auth.require_admin)):
         }}
 
         .card-actions .btn-danger:hover {{
-            background: rgba(255, 74, 74, 0.1);
-            border-color: rgba(255, 74, 74, 0.6);
+            background: rgba(251, 113, 133, 0.12);
+            border-color: rgba(251, 113, 133, 0.55);
         }}
 
         /* --- ZUSTAND: UPDATING SCREEN --- */
@@ -2725,7 +2796,7 @@ async def updates_page(request: Request, _: bool = Depends(auth.require_admin)):
             background: linear-gradient(to bottom, #ffffff, #a2b4c7);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
-            filter: drop-shadow(0 0 30px rgba(0, 210, 255, 0.4));
+            filter: drop-shadow(0 0 30px rgba(170, 180, 214, 0.32));
         }}
 
         /* --- RELEASE NOTES AREA --- */
@@ -2744,8 +2815,8 @@ async def updates_page(request: Request, _: bool = Depends(auth.require_admin)):
         }}
 
         .release-notes-card {{
-            background: var(--bg-2, rgba(10, 11, 16, 0.3));
-            border: 1px solid var(--border, rgba(255, 255, 255, 0.04));
+            background: var(--surface);
+            border: 1px solid var(--border);
             border-radius: 12px;
             padding: 24px;
             display: flex;
@@ -2758,7 +2829,7 @@ async def updates_page(request: Request, _: bool = Depends(auth.require_admin)):
             font-size: 11px;
             text-transform: uppercase;
             letter-spacing: 0.1em;
-            color: #00d2ff;
+            color: var(--link);
             font-weight: 700;
         }}
 
@@ -2783,12 +2854,12 @@ async def updates_page(request: Request, _: bool = Depends(auth.require_admin)):
 
         .commit-item::before {{
             content: "•";
-            color: #00d2ff;
+            color: var(--link);
             font-weight: bold;
         }}
 
-        .commit-item span.feat {{ color: #50e3c2; }}
-        .commit-item span.fix {{ color: #ff4a4a; }}
+        .commit-item span.feat {{ color: var(--link); }}
+        .commit-item span.fix {{ color: #fecdd3; }}
         .commit-item span.chore {{ color: #a2b4c7; }}
 
         .astra-card.is-updating .card-inner {{
