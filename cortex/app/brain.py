@@ -139,7 +139,12 @@ async def _send_and_record(
             role="assistant",
             text=text,
             display=contact.get("display_name") or contact.get("handle"),
-            meta=meta,
+            meta={
+                **meta,
+                "relationship": contact.get("relationship"),
+                "trust_tier": contact.get("trust_tier"),
+                "is_owner": contact.get("is_owner"),
+            },
         )
     except Exception:  # noqa: BLE001
         log.debug("Secretary context ledger write failed for outbound %s", thread_id, exc_info=True)
@@ -201,6 +206,11 @@ async def handle_inbound(
             channel, sender_handle, display_name=sender_display,
             trust_tier=0 if peer_is_owner else 3, is_owner=peer_is_owner,
         )
+    contact_meta = {
+        "relationship": contact.get("relationship"),
+        "trust_tier": contact.get("trust_tier"),
+        "is_owner": contact.get("is_owner"),
+    }
     thread = await db.ensure_thread(thread_id, channel, contact["id"])
     if thread_meta:
         await db.merge_thread_meta(thread_id, thread_meta)
@@ -214,7 +224,7 @@ async def handle_inbound(
             role="owner" if author_is_owner else "user",
             text=text,
             display=sender_display,
-            meta=thread.get("meta") or {},
+            meta={**(thread.get("meta") or {}), **contact_meta},
         )
     except Exception:  # noqa: BLE001
         log.debug("Secretary context ledger write failed for inbound %s", thread_id, exc_info=True)

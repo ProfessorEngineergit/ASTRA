@@ -46,20 +46,44 @@ def _write_capsule(path: Path, entries: list[dict], title: str) -> None:
         for item in entries
         for reason in (item.get("security_reasons") or [])
     })
-    participants = sorted({
+    people = sorted({
         item.get("participant_display") or item.get("display") or item.get("handle") or ""
         for item in entries
         if item.get("participant_display") or item.get("display") or item.get("handle")
     })[:12]
+    handles = sorted({
+        value
+        for item in entries
+        for value in (item.get("handle"), item.get("participant_handle"), item.get("username"), item.get("participant_username"))
+        if value
+    })[:12]
+    relationships = sorted({
+        value for item in entries for value in (item.get("relationship"), item.get("relationship_note")) if value
+    })[:12]
+    groups = sorted({
+        value for item in entries for value in (item.get("group_context"), item.get("group_id")) if value
+    })[:12]
+    threads = sorted({item.get("thread_id") for item in entries if item.get("thread_id")})[:12]
     recent = entries[-12:]
+    compressed = _compressed_context(entries)
     lines = [
         f"# {title}",
         "",
         f"Updated: {datetime.now(timezone.utc).isoformat()}",
         f"Messages tracked: {len(entries)}",
     ]
-    if participants:
-        lines.extend(["", "## People", *[f"- {p}" for p in participants]])
+    if people:
+        lines.extend(["", "## People", *[f"- {p}" for p in people]])
+    if handles:
+        lines.extend(["", "## Handles", *[f"- {h}" for h in handles]])
+    if relationships:
+        lines.extend(["", "## Relationship", *[f"- {r}" for r in relationships]])
+    if groups:
+        lines.extend(["", "## Known From Groups", *[f"- {g}" for g in groups]])
+    if threads:
+        lines.extend(["", "## Linked Threads", *[f"- {t}" for t in threads]])
+    if compressed:
+        lines.extend(["", "## Context Capsule", compressed])
     if security:
         lines.extend(["", "## Security Notes", *[f"- {s}" for s in security]])
     lines.extend(["", "## Recent Context"])
@@ -68,6 +92,29 @@ def _write_capsule(path: Path, entries: list[dict], title: str) -> None:
         ts = str(item.get("ts", ""))[:19]
         lines.append(f"- {ts} {who}: {_entry_preview(item.get('text', ''), 220)}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _compressed_context(entries: list[dict]) -> str:
+    if not entries:
+        return ""
+    recent = entries[-30:]
+    by_role: dict[str, int] = {}
+    words: dict[str, int] = {}
+    for item in recent:
+        by_role[item.get("role", "unknown")] = by_role.get(item.get("role", "unknown"), 0) + 1
+        for word in re.findall(r"[A-Za-zÄÖÜäöüß0-9][A-Za-zÄÖÜäöüß0-9_-]{3,}", item.get("text", "").lower()):
+            if word in {"dass", "nicht", "oder", "aber", "eine", "einen", "wenn", "dann", "bitte", "astra"}:
+                continue
+            words[word] = words.get(word, 0) + 1
+    topics = ", ".join(word for word, _count in sorted(words.items(), key=lambda kv: (-kv[1], kv[0]))[:8])
+    counts = ", ".join(f"{role}:{count}" for role, count in sorted(by_role.items()))
+    last = _entry_preview(recent[-1].get("text", ""), 180)
+    lines = [f"- Rolling window: {len(recent)} recent events ({counts})."]
+    if topics:
+        lines.append(f"- Recurring terms: {topics}.")
+    if last:
+        lines.append(f"- Latest signal: {last}")
+    return "\n".join(lines)
 
 
 def _append(entry: dict) -> None:
@@ -144,6 +191,11 @@ async def record_interaction(
         "group_id": meta.get("group_id"),
         "participant_handle": meta.get("participant_handle"),
         "participant_display": meta.get("participant_display"),
+        "username": meta.get("username"),
+        "participant_username": meta.get("participant_username"),
+        "relationship": meta.get("relationship"),
+        "relationship_note": meta.get("relationship_note"),
+        "trust_tier": meta.get("trust_tier"),
         "security_reasons": meta.get("security_reasons") or [],
     }
     await asyncio.to_thread(_append, entry)

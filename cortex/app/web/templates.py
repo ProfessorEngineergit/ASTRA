@@ -518,9 +518,17 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
 .secretary-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px,1fr)); gap: 12px; }
 .secretary-card { display: grid; gap: 12px; padding: 16px; background: var(--surface);
   border: 1px solid var(--border); border-radius: var(--r-lg); }
+.secretary-card.active { border-color: rgba(170,180,214,.34); box-shadow: inset 0 1px 0 rgba(255,255,255,.04), 0 18px 42px rgba(0,0,0,.28); }
 .secretary-card h3 { margin: 0; font-size: 15px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .secretary-card p { margin: 0; color: var(--text-dim); font-size: 12.5px; line-height: 1.45; }
 .secretary-card .mini { color: var(--text-faint); font-size: 11px; }
+.install-head { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }
+.install-head span:first-child { color: var(--text-faint); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
+.install-actions { display: flex; gap: 9px; align-items: center; flex-wrap: wrap; }
+.install-config { display: grid; gap: 10px; border-top: 1px solid var(--border-soft); padding-top: 12px; }
+.install-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 9px; }
+.setup-field { display: grid; gap: 5px; }
+.setup-field input, .setup-field select { padding: 9px 10px; font-size: 12.5px; }
 .secretary-row { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
 .secretary-row label, .secretary-card label { color: var(--text-faint); font-size: 10px;
   text-transform: uppercase; letter-spacing: .07em; }
@@ -529,6 +537,7 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
 .secretary-switch input { width: auto; }
 .setup-chat { display: grid; gap: 10px; padding: 16px; background: #050507; border: 1px solid var(--border);
   border-radius: var(--r-lg); }
+.setup-coach { position: sticky; top: 82px; align-self: start; }
 .setup-bubble { padding: 12px 13px; border: 1px solid var(--border-soft); border-radius: 14px;
   background: rgba(255,255,255,.035); color: var(--text-dim); font-size: 13px; line-height: 1.48; }
 .setup-bubble strong { color: var(--text); }
@@ -542,6 +551,15 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
 .setup-msg span { color: var(--text-dim); font-size: 12px; line-height: 1.4; }
 .setup-input { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 7px; }
 .setup-input input { padding: 8px 9px; font-size: 12.5px; }
+.pairing-panel { display: grid; gap: 10px; padding: 11px; border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm); background: rgba(255,255,255,.025); }
+.pairing-panel b { display: block; font-size: 12.5px; }
+.pairing-panel span { display: block; color: var(--text-dim); font-size: 12px; line-height: 1.4; }
+.pairing-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.qr-box { min-height: 52px; display: grid; place-items: center; color: var(--text-faint);
+  border: 1px dashed var(--border); border-radius: var(--r-sm); padding: 10px; text-align: center; font-size: 12px; }
+.qr-box img { max-width: 190px; width: 100%; height: auto; border-radius: 8px; background: #fff; padding: 8px; }
+.qr-box small { display: block; margin-top: 6px; color: var(--text-faint); }
 .policy-stack { display: grid; gap: 9px; }
 .policy-line { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px;
   border: 1px solid var(--border-soft); border-radius: var(--r-sm); background: rgba(255,255,255,.025); }

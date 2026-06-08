@@ -152,6 +152,8 @@ async def _handle_tg_update(
                     "chat_type": chat_type,
                     "participant_handle": sender_id,
                     "participant_display": _tg_display(cb["from"]),
+                    "participant_username": cb["from"].get("username"),
+                    "username": cb["from"].get("username"),
                     "source_tag": "from Telegram",
                 },
             )
@@ -185,6 +187,8 @@ async def _handle_tg_update(
                 "chat_type": chat_type,
                 "participant_handle": sender_id,
                 "participant_display": _tg_display(sender),
+                "participant_username": sender.get("username"),
+                "username": sender.get("username"),
                 "source_tag": "from Telegram",
             },
         )
@@ -424,6 +428,8 @@ async def ingress_waha(
             "group_id": from_jid if is_group else None,
             "participant_handle": payload.get("participant") or raw_data.get("participant"),
             "participant_display": raw_data.get("notifyName"),
+            "participant_username": raw_data.get("pushname") or raw_data.get("notifyName"),
+            "username": raw_data.get("pushname") or raw_data.get("notifyName"),
             "source_tag": "from WhatsApp",
         },
     )
@@ -481,6 +487,8 @@ async def ingress_signal(
             "group_name": group_info.get("name"),
             "participant_handle": sender_handle,
             "participant_display": display_name,
+            "participant_username": envelope.get("sourceUuid") or display_name,
+            "username": envelope.get("sourceUuid") or display_name,
             "source_tag": "from Signal",
         },
     )
@@ -510,6 +518,6 @@ async def ingress_email(
         sender_handle=sender_handle,
         text=content,
         sender_display=body.get("name") or sender_handle,
-        thread_meta={"source_tag": "from Mail"},
+        thread_meta={"source_tag": "from Mail", "username": body.get("name") or sender_handle},
     )
     return {"ok": True}

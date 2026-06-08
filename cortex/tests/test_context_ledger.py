@@ -22,6 +22,8 @@ def test_group_participant_gets_own_context_file(tmp_path, monkeypatch):
             "group_id": "klasse@g.us",
             "participant_handle": "49123@c.us",
             "participant_display": "Max",
+            "participant_username": "max",
+            "relationship": "Mitschueler",
         },
     ))
 
@@ -29,4 +31,9 @@ def test_group_participant_gets_own_context_file(tmp_path, monkeypatch):
     assert (root / "groups" / "waha_klasse@g.us.md").exists()
     person_file = root / "contacts" / "waha_49123@c.us.md"
     assert person_file.exists()
-    assert "Max" in person_file.read_text(encoding="utf-8")
+    text = person_file.read_text(encoding="utf-8")
+    assert "Max" in text
+    assert "max" in text
+    assert "Mitschueler" in text
+    assert "Known From Groups" in text
+    assert "Context Capsule" in text

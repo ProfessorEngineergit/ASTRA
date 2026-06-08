@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -1816,6 +1817,65 @@ def _select(name: str, value: str, options: list[tuple[str, str]]) -> str:
 
 
 SECRETARY_SETUP_CHANNELS = ("waha", "signal", "email")
+SECRETARY_CHANNEL_SETUP = {
+    "waha": {
+        "title": "WhatsApp via WAHA",
+        "kind": "WhatsApp",
+        "summary": "Session, Webhook, QR-Pairing und Gruppenbremse.",
+    },
+    "signal": {
+        "title": "Signal",
+        "kind": "Signal",
+        "summary": "signal-cli-rest-api, Account und Gruppenmetadaten.",
+    },
+    "email": {
+        "title": "Mail",
+        "kind": "IMAP/SMTP",
+        "summary": "IMAP-Eingang, SMTP-Ausgang und Freigabegrenzen.",
+    },
+}
+
+
+def _secretary_installations(settings: dict) -> dict:
+    raw = settings.get("installations") or {}
+    defaults = {
+        "waha": {
+            "title": "WhatsApp via WAHA",
+            "base_url": "",
+            "session": "default",
+            "api_key": "",
+            "webhook_url": "/ingress/waha",
+            "events": "message",
+            "status": "not_configured",
+        },
+        "signal": {
+            "title": "Signal",
+            "base_url": "",
+            "account": "",
+            "webhook_url": "/ingress/signal",
+            "status": "not_configured",
+        },
+        "email": {
+            "title": "Mail",
+            "provider": "imap_smtp",
+            "imap_host": "",
+            "imap_port": "993",
+            "imap_user": "",
+            "imap_mailbox": "INBOX",
+            "smtp_host": "",
+            "smtp_port": "587",
+            "smtp_user": "",
+            "from_address": "",
+            "poll_minutes": "5",
+            "webhook_url": "/ingress/email",
+            "status": "not_configured",
+        },
+    }
+    out = {}
+    for channel, default in defaults.items():
+        saved = raw.get(channel) or {}
+        out[channel] = {**default, **saved}
+    return out
 
 
 def _setup_seed(channel: str) -> list[dict]:
@@ -1863,7 +1923,59 @@ def _render_setup_chat(channel: str, messages: list[dict]) -> str:
     )
 
 
-def _secretary_channel_card(channel: str, cfg: dict) -> str:
+def _field(name: str, label: str, value: str = "", *, placeholder: str = "", typ: str = "text") -> str:
+    return (
+        f'<div class="setup-field"><label>{esc(label)}</label>'
+        f'<input type="{esc(typ)}" name="{esc(name)}" value="{esc(value)}" '
+        f'placeholder="{esc(placeholder)}"></div>'
+    )
+
+
+def _channel_setup_fields(channel: str, inst: dict) -> str:
+    if channel == "waha":
+        return (
+            '<div class="install-fields">'
+            + _field("sec_waha_title", "Titel", inst.get("title", ""), placeholder="WhatsApp via WAHA")
+            + _field("sec_waha_base_url", "WAHA Base URL", inst.get("base_url", ""), placeholder="http://waha:3000")
+            + _field("sec_waha_session", "Session", inst.get("session", "default"), placeholder="default")
+            + _field("sec_waha_api_key", "API Key optional", inst.get("api_key", ""), placeholder="X-Api-Key")
+            + _field("sec_waha_events", "Hook Events", inst.get("events", "message"), placeholder="message")
+            + _field("sec_waha_webhook", "ASTRA Webhook", inst.get("webhook_url", "/ingress/waha"))
+            + "</div>"
+            '<div class="pairing-panel" data-waha-pairing>'
+            '<div><b>Pairing</b><span>Session starten, dann QR mit WhatsApp scannen.</span></div>'
+            '<div class="pairing-actions"><button class="btn ghost sm" type="button" data-waha-start>Session starten</button>'
+            '<button class="btn sm" type="button" data-waha-qr>QR laden</button></div>'
+            '<div class="qr-box" data-qr-box></div></div>'
+        )
+    if channel == "signal":
+        return (
+            '<div class="install-fields">'
+            + _field("sec_signal_title", "Titel", inst.get("title", ""), placeholder="Signal")
+            + _field("sec_signal_base_url", "signal-cli API URL", inst.get("base_url", ""), placeholder="http://signal-api:8080")
+            + _field("sec_signal_account", "Account / Nummer", inst.get("account", ""), placeholder="+491...")
+            + _field("sec_signal_webhook", "ASTRA Webhook", inst.get("webhook_url", "/ingress/signal"))
+            + "</div>"
+            '<div class="pairing-panel"><div><b>Pairing</b><span>Registrierung oder Linked-Device-QR erfolgt im signal-cli-rest-api Dienst; ASTRA erwartet danach Webhooks mit groupInfo.</span></div></div>'
+        )
+    return (
+        '<div class="install-fields">'
+        + _field("sec_email_title", "Titel", inst.get("title", ""), placeholder="Mail")
+        + _field("sec_email_imap_host", "IMAP Host", inst.get("imap_host", ""), placeholder="imap.example.com")
+        + _field("sec_email_imap_port", "IMAP Port", inst.get("imap_port", "993"))
+        + _field("sec_email_imap_user", "IMAP User", inst.get("imap_user", ""), placeholder="bahrian@example.com")
+        + _field("sec_email_imap_mailbox", "Mailbox", inst.get("imap_mailbox", "INBOX"))
+        + _field("sec_email_smtp_host", "SMTP Host", inst.get("smtp_host", ""), placeholder="smtp.example.com")
+        + _field("sec_email_smtp_port", "SMTP Port", inst.get("smtp_port", "587"))
+        + _field("sec_email_smtp_user", "SMTP User", inst.get("smtp_user", ""), placeholder="bahrian@example.com")
+        + _field("sec_email_from", "Absender", inst.get("from_address", ""), placeholder="Bahrian <...>")
+        + _field("sec_email_poll", "Poll Minuten", inst.get("poll_minutes", "5"), typ="number")
+        + _field("sec_email_webhook", "ASTRA Webhook", inst.get("webhook_url", "/ingress/email"))
+        + "</div>"
+    )
+
+
+def _secretary_channel_card(channel: str, cfg: dict, inst: dict) -> str:
     mode_options = {
         "waha": [("school_direct", "Schulzeit direkt"), ("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
         "signal": [("school_direct", "Schulzeit direkt"), ("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
@@ -1875,19 +1987,30 @@ def _secretary_channel_card(channel: str, cfg: dict) -> str:
         "email": "Mail-Ingress: /ingress/email fuer normalisierte IMAP/Gmail-Events. Senden bleibt bestaetigungspflichtig.",
     }[channel]
     setup_store = cfg.get("_setup_store") or {}
+    meta = SECRETARY_CHANNEL_SETUP[channel]
+    status = "konfiguriert" if any(inst.get(k) for k in ("base_url", "imap_host")) else "offen"
     return f"""
-      <div class="secretary-card">
-        <h3>{esc(cfg.get("label") or _channel_label(channel))}
-          <span class="source-tag">{'aktiv' if cfg.get("enabled") else 'aus'}</span></h3>
-        <label class="secretary-switch">
-          <input type="checkbox" name="sec_{esc(channel)}_enabled"{_checked(bool(cfg.get("enabled")))}>
-          Installation aktiv
-        </label>
-        <div>
-          <label>Modus</label>
-          {_select(f"sec_{channel}_mode", cfg.get("mode", "policy"), mode_options)}
+      <div class="secretary-card install-card" data-install="{esc(channel)}">
+        <div class="install-head">
+          <div><span>{esc(meta["kind"])}</span><h3>{esc(inst.get("title") or meta["title"])}</h3></div>
+          <span class="source-tag">{'aktiv' if cfg.get("enabled") else 'aus'}</span>
         </div>
         <p>{esc(setup)}</p>
+        <div class="install-actions">
+          <button class="btn sm" type="button" data-open-setup="{esc(channel)}">Einrichten</button>
+          <span class="mini">{esc(status)} · {esc(meta["summary"])}</span>
+        </div>
+        <div class="install-config" data-config="{esc(channel)}">
+          <label class="secretary-switch">
+            <input type="checkbox" name="sec_{esc(channel)}_enabled"{_checked(bool(cfg.get("enabled")))}>
+            Installation aktiv
+          </label>
+          <div class="setup-field">
+            <label>Modus</label>
+            {_select(f"sec_{channel}_mode", cfg.get("mode", "policy"), mode_options)}
+          </div>
+          {_channel_setup_fields(channel, inst)}
+        </div>
         {_render_setup_chat(channel, _setup_messages(setup_store, channel))}
         <div class="mini">{esc(channel)}</div>
       </div>
@@ -1922,8 +2045,9 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
     title = selected.get("who") if selected else "Keine Threads"
     token = await auth.issue_csrf()
     setup_store = await db.get_setting("secretary_setup_chats", {}) or {}
+    installations = _secretary_installations(settings)
     channel_cards = "".join(
-        _secretary_channel_card(ch, {**settings["channels"][ch], "_setup_store": setup_store})
+        _secretary_channel_card(ch, {**settings["channels"][ch], "_setup_store": setup_store}, installations[ch])
         for ch in SECRETARY_SETUP_CHANNELS
     )
     workdays = {int(v) for v in (settings.get("workdays") or []) if str(v).isdigit()}
@@ -1943,14 +2067,13 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
       <div class="secretary-grid">
         <section class="panel">
           <h2 style="margin:0 0 6px;font-size:17px">Kanäle</h2>
-          <p class="note" style="margin:0 0 14px">Nur die Aktivierung ist global. Jeder Kanal hat danach seine eigene Installation und Policy.</p>
+          <p class="note" style="margin:0 0 14px">Jede Installation hat eigene Zugangsdaten, Pairing und Policy. Klicke auf Einrichten, dann coacht ASTRA rechts mit Blick auf diese Felder.</p>
           <div class="secretary-cards">{channel_cards}</div>
         </section>
-        <aside class="setup-chat">
-          <div class="setup-bubble"><strong>ASTRA Setup</strong><br>Telegram bleibt im normalen Chat. Secretary ist nur WhatsApp, Signal und Mail, also dort, wo ASTRA fuer dich antworten kann.</div>
-          <div class="setup-bubble"><strong>WAHA</strong><br><code>POST /ingress/waha</code> fuer WhatsApp-Nachrichten.</div>
-          <div class="setup-bubble"><strong>Signal</strong><br><code>POST /ingress/signal</code> aus signal-cli-rest-api.</div>
-          <div class="setup-bubble"><strong>Mail</strong><br><code>POST /ingress/email</code> mit <code>from</code>, <code>subject</code> und <code>text</code>.</div>
+        <aside class="setup-chat setup-coach" id="setupCoach">
+          <div class="setup-bubble"><strong>ASTRA Setup Coach</strong><br><span id="coachIntro">Wähle links WhatsApp, Signal oder Mail. ASTRA sieht dann die aktuellen Felder und kann gezielt helfen.</span></div>
+          <div class="setup-bubble" id="coachAwareness"><strong>On-screen</strong><br>Noch keine Installation ausgewählt.</div>
+          <div class="setup-bubble"><strong>Ingress</strong><br><code>/ingress/waha</code>, <code>/ingress/signal</code>, <code>/ingress/email</code> brauchen <code>X-Astra-Secret</code>.</div>
         </aside>
       </div>
 
@@ -1978,7 +2101,7 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
       </div>
     </form>
 
-    <div class="chat-shell" style="height:auto;min-height:640px;margin-top:16px">
+    {f'''<div class="chat-shell" style="height:auto;min-height:640px;margin-top:16px">
       <aside class="chat-side">
         <div class="side-head"><div><small>Live</small><b>Channel Threads</b></div><span class="badge b-off">{len(threads)}</span></div>
         <div class="threads">{''.join(side_rows) or '<div class="arch-note">Noch keine Kanal-Threads.</div>'}</div>
@@ -1990,8 +2113,36 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
         </div>
         <div class="chat-log">{_render_hub_messages(messages)}</div>
       </section>
-    </div>
+    </div>''' if threads else ''}
     <script>
+      const activeSetup = {{channel: 'waha'}};
+      const labels = {{waha:'WhatsApp / WAHA', signal:'Signal', email:'Mail'}};
+      function formContext(channel) {{
+        const card = document.querySelector(`[data-install="${{channel}}"]`);
+        const out = {{}};
+        if (!card) return out;
+        card.querySelectorAll('input,select').forEach(el => {{
+          const key = (el.name || '').replace(/^sec_/, '');
+          if (!key) return;
+          out[key] = el.type === 'checkbox' ? el.checked : el.value;
+        }});
+        return out;
+      }}
+      function updateCoach(channel) {{
+        activeSetup.channel = channel;
+        document.querySelectorAll('.install-card').forEach(card => card.classList.toggle('active', card.dataset.install === channel));
+        document.querySelectorAll('.install-config').forEach(cfg => cfg.hidden = cfg.dataset.config !== channel);
+        document.querySelectorAll('.setup-chatbox').forEach(box => box.hidden = box.dataset.setupChannel !== channel);
+        const ctx = formContext(channel);
+        document.getElementById('coachIntro').textContent = `Einrichtung fuer ${{labels[channel]}}. Frag rechts im Chat nach naechsten Schritten oder Fehlern.`;
+        const visible = Object.entries(ctx).filter(([,v]) => v !== '' && v !== false).slice(0, 7)
+          .map(([k,v]) => `${{k}}=${{String(v).slice(0, 42)}}`).join(' · ');
+        document.getElementById('coachAwareness').innerHTML = '<strong>On-screen</strong><br>' + (visible || 'Noch keine Felder ausgefuellt.');
+      }}
+      document.querySelectorAll('[data-open-setup]').forEach(btn => btn.onclick = () => updateCoach(btn.dataset.openSetup));
+      document.querySelectorAll('.install-card input,.install-card select').forEach(el => el.addEventListener('input', () => updateCoach(activeSetup.channel)));
+      updateCoach('waha');
+
       document.querySelectorAll('.setup-chatbox').forEach(box => {{
         const channel = box.dataset.setupChannel;
         const input = box.querySelector('input');
@@ -2015,7 +2166,7 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
             const r = await fetch('/admin/secretary/setup-chat', {{
               method: 'POST',
               headers: {{'Content-Type': 'application/json'}},
-              body: JSON.stringify({{channel, message: text}})
+              body: JSON.stringify({{channel, message: text, context: formContext(channel)}})
             }});
             const d = await r.json();
             add('assistant', d.reply || 'Ich habe dazu gerade keine Antwort.');
@@ -2027,6 +2178,27 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
         btn.onclick = send;
         input.addEventListener('keydown', e => {{ if (e.key === 'Enter') send(); }});
       }});
+      const qrBtn = document.querySelector('[data-waha-qr]');
+      if (qrBtn) qrBtn.onclick = async () => {{
+        const box = document.querySelector('[data-qr-box]');
+        box.textContent = 'QR wird geladen...';
+        const r = await fetch('/admin/secretary/waha/qr', {{
+          method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(formContext('waha'))
+        }});
+        const d = await r.json();
+        if (d.image) box.innerHTML = `<img src="${{d.image}}" alt="WhatsApp QR"><small>${{d.source || ''}}</small>`;
+        else box.textContent = d.message || d.error || 'Kein QR verfuegbar.';
+      }};
+      const startBtn = document.querySelector('[data-waha-start]');
+      if (startBtn) startBtn.onclick = async () => {{
+        const box = document.querySelector('[data-qr-box]');
+        box.textContent = 'Session wird gestartet...';
+        const r = await fetch('/admin/secretary/waha/start', {{
+          method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(formContext('waha'))
+        }});
+        const d = await r.json();
+        box.textContent = d.message || (d.ok ? 'Session gestartet.' : 'Start fehlgeschlagen.');
+      }};
     </script>"""
     return _html_with_csrf(page("Secretary", body, active="secretary"), token)
 
@@ -2052,6 +2224,36 @@ async def secretary_save(request: Request, _: bool = Depends(auth.require_admin)
             "mode": str(form.get(f"sec_{ch}_mode") or current["channels"][ch]["mode"]),
             "label": current["channels"][ch].get("label") or _channel_label(ch),
         }
+    installations = {
+        "waha": {
+            "title": str(form.get("sec_waha_title") or "WhatsApp via WAHA"),
+            "base_url": str(form.get("sec_waha_base_url") or ""),
+            "session": str(form.get("sec_waha_session") or "default"),
+            "api_key": str(form.get("sec_waha_api_key") or ""),
+            "events": str(form.get("sec_waha_events") or "message"),
+            "webhook_url": str(form.get("sec_waha_webhook") or "/ingress/waha"),
+        },
+        "signal": {
+            "title": str(form.get("sec_signal_title") or "Signal"),
+            "base_url": str(form.get("sec_signal_base_url") or ""),
+            "account": str(form.get("sec_signal_account") or ""),
+            "webhook_url": str(form.get("sec_signal_webhook") or "/ingress/signal"),
+        },
+        "email": {
+            "title": str(form.get("sec_email_title") or "Mail"),
+            "provider": "imap_smtp",
+            "imap_host": str(form.get("sec_email_imap_host") or ""),
+            "imap_port": str(form.get("sec_email_imap_port") or "993"),
+            "imap_user": str(form.get("sec_email_imap_user") or ""),
+            "imap_mailbox": str(form.get("sec_email_imap_mailbox") or "INBOX"),
+            "smtp_host": str(form.get("sec_email_smtp_host") or ""),
+            "smtp_port": str(form.get("sec_email_smtp_port") or "587"),
+            "smtp_user": str(form.get("sec_email_smtp_user") or ""),
+            "from_address": str(form.get("sec_email_from") or ""),
+            "poll_minutes": str(form.get("sec_email_poll") or "5"),
+            "webhook_url": str(form.get("sec_email_webhook") or "/ingress/email"),
+        },
+    }
     appset["secretary"] = {
         "enabled": form.get("sec_enabled") == "on",
         "tone": str(form.get("sec_tone") or "warm"),
@@ -2066,6 +2268,7 @@ async def secretary_save(request: Request, _: bool = Depends(auth.require_admin)
         "intro": str(form.get("sec_intro") or current["intro"]),
         "header": str(form.get("sec_header") or current["header"]),
         "channels": channels,
+        "installations": installations,
     }
     await db.set_setting("app_settings", appset)
     await db.audit("secretary_settings_saved", actor="owner", detail={"channels": list(channels)})
@@ -2095,6 +2298,18 @@ def _setup_fallback_reply(channel: str, message: str) -> str:
     return base
 
 
+def _clean_setup_context(value: dict | None) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    out = {}
+    for key, raw in value.items():
+        if "api_key" in key:
+            out[key] = "set" if raw else ""
+        elif isinstance(raw, (str, int, float, bool)):
+            out[key] = str(raw)[:180] if not isinstance(raw, bool) else raw
+    return out
+
+
 @router.post("/admin/secretary/setup-chat")
 async def secretary_setup_chat(request: Request, _: bool = Depends(auth.require_admin)):
     try:
@@ -2103,6 +2318,7 @@ async def secretary_setup_chat(request: Request, _: bool = Depends(auth.require_
         data = {}
     channel = str(data.get("channel") or "")
     message = str(data.get("message") or "").strip()
+    context = _clean_setup_context(data.get("context"))
     if channel not in SECRETARY_SETUP_CHANNELS or not message:
         return JSONResponse({"ok": False, "reply": "Diese Einrichtung kenne ich nicht."}, status_code=400)
     store = await db.get_setting("secretary_setup_chats", {}) or {}
@@ -2125,7 +2341,8 @@ async def secretary_setup_chat(request: Request, _: bool = Depends(auth.require_
             extra_system=(
                 "Du hilfst Bahrian interaktiv bei einer ASTRA-Secretary-Einrichtung. "
                 f"Kanal: {_channel_label(channel)}. Antworte konkret, kurz, mit naechsten Schritten "
-                "und bleibe bei Webhook, Sicherheit, Gruppenverhalten, Testpayloads und Fehlersuche."
+                "und bleibe bei Webhook, Sicherheit, Gruppenverhalten, Testpayloads und Fehlersuche. "
+                f"Aktuelle Formularfelder: {json.dumps(context, ensure_ascii=False)}"
             ),
             permission_mode="ask",
         )
@@ -2140,6 +2357,96 @@ async def secretary_setup_chat(request: Request, _: bool = Depends(auth.require_
     await db.set_setting("secretary_setup_chats", store)
     await db.audit("secretary_setup_chat", actor="owner", detail={"channel": channel, "len": len(message)})
     return JSONResponse({"ok": True, "reply": reply, "messages": store["chats"][channel][-8:]})
+
+
+def _waha_headers(api_key: str) -> dict:
+    if not api_key:
+        return {}
+    return {"X-Api-Key": api_key, "Authorization": f"Bearer {api_key}"}
+
+
+def _waha_base(value: str) -> str:
+    return (value or "").strip().rstrip("/")
+
+
+async def _waha_request(base_url: str, path: str, *, api_key: str = "", method: str = "GET") -> dict:
+    import httpx
+    base = _waha_base(base_url)
+    if not base:
+        return {"ok": False, "message": "WAHA Base URL fehlt."}
+    url = f"{base}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            response = await client.request(method, url, headers=_waha_headers(api_key))
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "message": f"WAHA nicht erreichbar: {e}"}
+    content_type = response.headers.get("content-type", "")
+    return {
+        "ok": 200 <= response.status_code < 300,
+        "status": response.status_code,
+        "content_type": content_type,
+        "content": response.content,
+        "text": response.text[:1200],
+        "url": url,
+    }
+
+
+def _image_payload(result: dict, *, source: str) -> dict | None:
+    content_type = result.get("content_type", "")
+    content = result.get("content") or b""
+    if content_type.startswith("image/") and content:
+        encoded = base64.b64encode(content).decode("ascii")
+        return {"ok": True, "image": f"data:{content_type.split(';')[0]};base64,{encoded}", "source": source}
+    try:
+        data = json.loads(result.get("text") or "{}")
+    except json.JSONDecodeError:
+        data = {}
+    for key in ("image", "qr", "data", "base64"):
+        raw = data.get(key)
+        if isinstance(raw, str) and raw:
+            if raw.startswith("data:image/"):
+                return {"ok": True, "image": raw, "source": source}
+            if len(raw) > 100:
+                return {"ok": True, "image": "data:image/png;base64," + raw.split(",", 1)[-1], "source": source}
+    return None
+
+
+@router.post("/admin/secretary/waha/start")
+async def secretary_waha_start(request: Request, _: bool = Depends(auth.require_admin)):
+    data = await request.json()
+    base_url = str(data.get("waha_base_url") or data.get("base_url") or "")
+    session = str(data.get("waha_session") or data.get("session") or "default")
+    api_key = str(data.get("waha_api_key") or data.get("api_key") or "")
+    result = await _waha_request(base_url, f"/api/sessions/{session}/start", api_key=api_key, method="POST")
+    if result["ok"]:
+        return JSONResponse({"ok": True, "message": f"WAHA-Session {session} wurde gestartet."})
+    return JSONResponse({"ok": False, "message": result.get("text") or result.get("message") or "Start fehlgeschlagen."})
+
+
+@router.post("/admin/secretary/waha/qr")
+async def secretary_waha_qr(request: Request, _: bool = Depends(auth.require_admin)):
+    data = await request.json()
+    base_url = str(data.get("waha_base_url") or data.get("base_url") or "")
+    session = str(data.get("waha_session") or data.get("session") or "default")
+    api_key = str(data.get("waha_api_key") or data.get("api_key") or "")
+    attempts = [
+        (f"/api/{session}/auth/qr", "auth qr"),
+        (f"/api/screenshot?session={session}", "screenshot"),
+        ("/api/screenshot", "screenshot"),
+    ]
+    errors = []
+    for path, source in attempts:
+        result = await _waha_request(base_url, path, api_key=api_key)
+        if result["ok"]:
+            payload = _image_payload(result, source=source)
+            if payload:
+                return JSONResponse(payload)
+        errors.append(f"{source}: HTTP {result.get('status') or '-'} {result.get('message') or result.get('text') or ''}"[:260])
+    return JSONResponse({
+        "ok": False,
+        "message": "Kein QR-Bild von WAHA erhalten. Session starten und Base URL/API-Key pruefen.",
+        "errors": errors,
+    })
 
 
 # ─── Chat: multi-thread owner agent ────────────────────────────────────────────

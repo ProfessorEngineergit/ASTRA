@@ -383,6 +383,11 @@ def test_secretary_shows_channel_threads_and_chat_import(memdb, monkeypatch):
     assert "ASTRA Secretary" in r.text
     assert "Channel Threads" in r.text
     assert "WAHA Webhook" in r.text
+    assert "sec_waha_base_url" in r.text
+    assert "sec_email_imap_host" in r.text
+    assert "sec_signal_base_url" in r.text
+    assert "ASTRA Setup Coach" in r.text
+    assert "QR laden" in r.text
     assert "WhatsApp-Nachricht" in r.text
     assert "Telegram-Nachricht" not in r.text
     assert "sec_telegram_mode" not in r.text
@@ -396,7 +401,71 @@ def test_secretary_shows_channel_threads_and_chat_import(memdb, monkeypatch):
     assert "from Telegram" in r.text
     assert "Telegram-Nachricht" in r.text
 
-    r = c.post("/admin/secretary/setup-chat", json={"channel": "waha", "message": "Wie teste ich den Header?"})
+    r = c.post("/admin/secretary/setup-chat", json={
+        "channel": "waha",
+        "message": "Wie teste ich den Header?",
+        "context": {"waha_base_url": "http://waha:3000", "waha_api_key": "secret"},
+    })
     assert r.status_code == 200
     assert "X-Astra-Secret" in r.json()["reply"]
     assert "secretary_setup_chats" in memdb
+
+
+def test_secretary_hides_thread_shell_when_no_secretary_threads(memdb, monkeypatch):
+    _prime_manager()
+
+    async def fake_list_threads(limit=80):
+        return [{
+            "thread_id": "telegram:123",
+            "channel": "telegram",
+            "state": "answered",
+            "who": "Bahrian",
+            "trust_tier": 0,
+        }]
+
+    from app import db
+    monkeypatch.setattr(db, "list_threads", fake_list_threads)
+
+    c = TestClient(_app())
+    r = c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+
+    r = c.get("/admin/secretary")
+
+    assert r.status_code == 200
+    assert "Channel Threads" not in r.text
+    assert "Telegram" not in r.text
+
+
+def test_secretary_waha_qr_endpoint_returns_image(memdb, monkeypatch):
+    _prime_manager()
+
+    async def fake_waha_request(base_url, path, *, api_key="", method="GET"):
+        assert base_url == "http://waha:3000"
+        assert api_key == "secret"
+        return {
+            "ok": True,
+            "status": 200,
+            "content_type": "image/png",
+            "content": b"pngdata",
+            "text": "",
+            "url": f"{base_url}{path}",
+        }
+
+    monkeypatch.setattr(web_admin, "_waha_request", fake_waha_request)
+    c = TestClient(_app())
+    r = c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+
+    r = c.post("/admin/secretary/waha/qr", json={
+        "waha_base_url": "http://waha:3000",
+        "waha_session": "default",
+        "waha_api_key": "secret",
+    })
+
+    assert r.status_code == 200
+    assert r.json()["image"].startswith("data:image/png;base64,")
