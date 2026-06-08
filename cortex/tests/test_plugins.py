@@ -28,6 +28,25 @@ def test_discovery_finds_builtin_plugins():
     assert EXPECTED <= slugs
 
 
+def test_native_catalog_pack_adds_many_agent_friendly_plugins():
+    classes = _discover_classes()
+    native = [c for c in classes if getattr(c, "native_http", False)]
+
+    assert len(native) >= 50
+    sample = next(c for c in native if c.slug == "mattermost")
+    plugin = sample({"__enabled": True})
+    status = asyncio.run(plugin.tools()[0].handler({}, ToolContext(
+        thread_id="web-owner:test",
+        channel="web",
+        contact={"id": "owner"},
+        is_owner=True,
+    )))
+    payload = _payload(status)
+    assert payload["ok"] is False
+    assert payload["source"] == "mattermost"
+    assert payload["error"]["type"] == "not_configured"
+
+
 def test_all_plugin_tools_are_owner_only():
     for cls in _discover_classes():
         inst = cls({"__enabled": True})

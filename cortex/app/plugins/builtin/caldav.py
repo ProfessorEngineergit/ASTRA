@@ -1,7 +1,7 @@
-"""CalDAV — stub (raw CalDAV/iCal handling needs a dedicated lib).
+"""CalDAV calendar integration.
 
-Tip: for Google Calendar use the dedicated plugin (via n8n) which already
-supports read + write today.
+Generic CalDAV support needs robust iCalendar parsing and sync handling. Google
+Calendar has a dedicated plugin for read/write access.
 """
 from ..base import ConfigField, HealthState, HealthStatus, Plugin, PluginCategory
 

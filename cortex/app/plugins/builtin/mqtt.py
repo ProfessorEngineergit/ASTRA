@@ -1,4 +1,7 @@
-"""MQTT — stub (requires an MQTT client lib not yet bundled)."""
+"""MQTT broker integration.
+
+Direct publish/subscribe support requires an MQTT client dependency.
+"""
 from ..base import ConfigField, FieldType, HealthState, HealthStatus, Plugin, PluginCategory
 
 

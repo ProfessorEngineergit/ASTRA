@@ -163,7 +163,7 @@ async def _list_plugin_catalog(args: dict, ctx: ToolContext) -> str:
     return f"{len(rows)} passende Plugin-Einträge:\n" + "\n".join(rows) if rows else "Keine passenden Plugin-Einträge."
 
 
-async def _create_plugin_stub(args: dict, ctx: ToolContext) -> str:
+async def _create_plugin_module(args: dict, ctx: ToolContext) -> str:
     if not await _writes_allowed(ctx):
         return "Selbst-Konfiguration ist deaktiviert (Einstellungen → allow_self_config)."
     slug = str(args.get("slug") or "").strip().lower().replace("-", "_")
@@ -181,11 +181,11 @@ async def _create_plugin_stub(args: dict, ctx: ToolContext) -> str:
         return f"Plugin-Datei existiert bereits: {target}"
     class_name = "".join(part.capitalize() for part in slug.split("_")) + "Plugin"
     target.write_text(
-        f'''""" {name} — generated ASTRA plugin stub. """\nfrom __future__ import annotations\n\nfrom ...tools import Tool, ToolContext, tool_result\nfrom ..base import ConfigField, HealthStatus, Plugin, PluginCategory\n\n\nclass {class_name}(Plugin):\n    slug = "{slug}"\n    name = "{name}"\n    description = "{description}"\n    category = PluginCategory.{category.name}\n    icon = "🔌"\n    config_fields = [\n        ConfigField("base_url", "Basis-URL", required=False),\n    ]\n\n    async def health_check(self) -> HealthStatus:\n        if not self.is_toggled_on:\n            return HealthStatus.disabled()\n        return HealthStatus.ok("Plugin-Stub ist installiert. Implementierung fehlt noch.")\n\n    def tools(self) -> list[Tool]:\n        async def _status(args: dict, ctx: ToolContext) -> str:\n            return tool_result(ok=True, summary="{name} ist als Stub installiert.", source=self.slug)\n\n        return [Tool(\n            name="{slug}_status",\n            description="Status der {name}-Integration.",\n            parameters={{"type": "object", "properties": {{}}}},\n            handler=_status,\n            owner_only=True,\n            source=self.slug,\n            safety="private_read",\n            intents=["status"],\n        )]\n''',
+        f'''""" {name} integration module. """\nfrom __future__ import annotations\n\nfrom ...tools import Tool, ToolContext, tool_result\nfrom ..base import ConfigField, HealthStatus, Plugin, PluginCategory\n\n\nclass {class_name}(Plugin):\n    slug = "{slug}"\n    name = "{name}"\n    description = "{description}"\n    category = PluginCategory.{category.name}\n    icon = "🔌"\n    config_fields = [\n        ConfigField("base_url", "Basis-URL", required=False),\n    ]\n\n    async def health_check(self) -> HealthStatus:\n        if not self.is_toggled_on:\n            return HealthStatus.disabled()\n        return HealthStatus.ok("Grundmodul installiert; Detailfunktionen sind noch nicht hinterlegt.")\n\n    def tools(self) -> list[Tool]:\n        async def _status(args: dict, ctx: ToolContext) -> str:\n            return tool_result(ok=True, summary="{name} ist als Grundmodul verfuegbar.", source=self.slug)\n\n        return [Tool(\n            name="{slug}_status",\n            description="Status der {name}-Integration.",\n            parameters={{"type": "object", "properties": {{}}}},\n            handler=_status,\n            owner_only=True,\n            source=self.slug,\n            safety="private_read",\n            intents=["status"],\n        )]\n''',
         encoding="utf-8",
     )
-    await db.audit("plugin_stub_created", actor="astra", detail={"slug": slug, "path": str(target)})
-    return f"Plugin-Stub angelegt: {target}. Danach Tests laufen lassen und PluginManager neu laden."
+    await db.audit("plugin_module_created", actor="astra", detail={"slug": slug, "path": str(target)})
+    return f"Plugin-Modul angelegt: {target}. Danach Tests laufen lassen und PluginManager neu laden."
 
 
 async def _list_capabilities(args: dict, ctx: ToolContext) -> str:
@@ -318,14 +318,14 @@ def register_admin_tools() -> None:
          _test_integration),
         ("astra_list_plugin_catalog", "Liste native und katalogisierte Plugins, die ASTRA einrichten oder priorisieren kann.",
          {"type": "object", "properties": {"query": {"type": "string"}}}, _list_plugin_catalog),
-        ("astra_create_plugin_stub",
-         "Lege eine neue native Plugin-Datei als Stub an. Mutiert den Quellcode und braucht Freigabe im Ask-Modus.",
+        ("astra_create_plugin_module",
+         "Lege eine neue Plugin-Datei an. Mutiert den Quellcode und braucht Freigabe im Ask-Modus.",
          {"type": "object", "properties": {
              "slug": {"type": "string"},
              "name": {"type": "string"},
              "description": {"type": "string"},
              "category": {"type": "string"}},
-          "required": ["slug", "name", "category"]}, _create_plugin_stub),
+          "required": ["slug", "name", "category"]}, _create_plugin_module),
         ("astra_get_settings", "Zeige ASTRAs aktuelle Einstellungen (Modell, Autonomie, Standort …).",
          {"type": "object", "properties": {}}, _get_settings),
         ("astra_update_settings",
@@ -350,7 +350,7 @@ def register_admin_tools() -> None:
     for name, desc, params, handler in defs:
         safety = "mutation" if name in {
             "astra_configure_integration", "astra_update_settings", "astra_test_capability",
-            "astra_create_plugin_stub"
+            "astra_create_plugin_module"
         } else "private_read"
         intents = ["status", "list"] if "list" in name or "status" in name else ["control"] if safety == "mutation" else ["status"]
         register(Tool(name=name, description=desc, parameters=params, handler=handler,

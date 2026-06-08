@@ -1,4 +1,8 @@
-"""HVV Hamburg — stub (HVV's open API needs registered geofox credentials)."""
+"""HVV Hamburg integration.
+
+The Geofox API requires registered credentials before departure data can be
+queried directly.
+"""
 from ..base import ConfigField, HealthState, HealthStatus, Plugin, PluginCategory
 
 

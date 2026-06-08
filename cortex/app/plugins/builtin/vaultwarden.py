@@ -1,7 +1,7 @@
-"""Vaultwarden/Bitwarden — stub (vault decryption needs the BW crypto stack).
+"""Vaultwarden/Bitwarden integration.
 
-Reading secrets requires the full Bitwarden key-derivation + decryption flow; a
-safe implementation is planned. Until then this stays a catalog placeholder.
+Reading vault entries requires the Bitwarden key-derivation and decryption flow,
+so this module stays disabled until that path is implemented end to end.
 """
 from ..base import ConfigField, HealthState, HealthStatus, Plugin, PluginCategory
 

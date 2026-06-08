@@ -1,7 +1,8 @@
-"""IServ — stub (IServ exposes WebDAV/CalDAV/IMAP, no clean REST yet).
+"""IServ integration.
 
-Tip: IServ mail can already be read today via the IMAP plugin
-(imap.<deine-schule>.de), and the calendar via a future CalDAV plugin.
+IServ exposes mail and calendar data through standard protocols such as IMAP,
+WebDAV, and CalDAV. Mail access can already be configured through the IMAP
+plugin.
 """
 from ..base import ConfigField, HealthState, HealthStatus, Plugin, PluginCategory
 

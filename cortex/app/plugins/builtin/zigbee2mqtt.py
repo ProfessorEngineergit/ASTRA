@@ -1,7 +1,7 @@
-"""Zigbee2MQTT — stub (control path goes over MQTT, lib not yet bundled).
+"""Zigbee2MQTT integration.
 
-Tip: if you run Home Assistant, the Home-Assistant plugin can already control your
-Zigbee devices today via its services.
+Direct control runs through MQTT. If Home Assistant is already connected,
+Zigbee devices can also be controlled through the Home Assistant plugin.
 """
 from ..base import ConfigField, HealthState, HealthStatus, Plugin, PluginCategory
 
