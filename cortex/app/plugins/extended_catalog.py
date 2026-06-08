@@ -1,11 +1,7 @@
-"""Extended integration catalog — a large, data-driven list of known services.
+"""Integration catalog shared by the admin UI and generic HTTP integrations.
 
-These are NOT native plugins (no code/tools yet); they populate the catalog so the
-UI shows the full breadth of what ASTRA *can* integrate, each tagged "Katalog".
-Ask ASTRA to implement any of them and it becomes a real plugin in builtin/.
-
-Each entry: (name, simpleicons-brand-or-None, short German description).
-The brand slug drives the card logo (falls back to the category emoji on 404).
+Each entry is `(name, simpleicons-brand-or-None, short German description)`.
+The brand slug drives card logos where the web UI needs a fallback icon.
 """
 from __future__ import annotations
 

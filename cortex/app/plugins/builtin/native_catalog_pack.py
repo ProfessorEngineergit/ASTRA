@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 
 from ...tools import Tool, ToolContext, tool_result
+from .. import extended_catalog
 from ..base import ConfigField, FieldType, HealthStatus, Plugin, PluginCategory
 
 
@@ -28,6 +29,12 @@ def _class_name(slug: str) -> str:
 def _short(value: Any, limit: int = 700) -> str:
     text = str(value)
     return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _catalog_summary(text: str) -> str:
+    text = text.replace("Bereits nativ – ", "").replace("Bereits via WAHA – ", "")
+    text = text.replace("Bereits als Kanal – ", "")
+    return text.rstrip(".") + "."
 
 
 class NativeHttpCatalogPlugin(Plugin):
@@ -315,12 +322,26 @@ _SPECS = [
 ]
 
 
-for _name, _category, _description in _SPECS:
+def _service_specs() -> list[tuple[str, PluginCategory, str]]:
+    specs = list(_SPECS)
+    seen = {_slug(name) for name, _category, _description in specs}
+    reserved = {"moodle"}
+    for entry in extended_catalog.all_entries():
+        slug = _slug(entry.name)
+        if slug in seen or slug in reserved:
+            continue
+        specs.append((entry.name, entry.category, _catalog_summary(entry.description)))
+        seen.add(slug)
+    return specs
+
+
+for _name, _category, _description in _service_specs():
     _plugin_slug = _slug(_name)
     globals()[_class_name(_plugin_slug)] = type(
         _class_name(_plugin_slug),
         (NativeHttpCatalogPlugin,),
         {
+            "__module__": __name__,
             "slug": _plugin_slug,
             "name": _name,
             "description": _description + " Direkte REST/Webhook-Anbindung.",

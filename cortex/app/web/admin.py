@@ -484,7 +484,13 @@ def _opt(key: str, selected: str) -> str:
 
 
 def _area_for(slug: str) -> dict:
-    return _AREA_META.get(slug, {"global": True, "label": "global"})
+    if slug in _AREA_META:
+        return _AREA_META[slug]
+    if not slug.startswith("cat_") and f"cat_{slug}" in _AREA_META:
+        return _AREA_META[f"cat_{slug}"]
+    if slug.startswith("cat_") and slug[4:] in _AREA_META:
+        return _AREA_META[slug[4:]]
+    return {"global": True, "label": "global"}
 
 
 def _area_attrs(slug: str) -> str:
@@ -611,7 +617,7 @@ def _card_html(p, is_fav: bool, installation_count: int = 1) -> str:
 
 
 def _catalog_card_html(e) -> str:
-    """A non-native catalog entry — tagged 'Katalog', links to a GitHub request."""
+    """Catalog-only fallback card for entries without runtime tools."""
     cat_label = esc(CATEGORY_LABELS.get(e.category, e.category.value))
     issue = f"{GH_NEW_ISSUE}?title=Integration:+{esc(e.name)}&labels=integration"
     return f"""
@@ -628,7 +634,7 @@ def _catalog_card_html(e) -> str:
             </div>
           </div>
           <p>{esc(e.description)}</p>
-          <div class="row"><span class="badge b-soon">nicht nativ</span>
+          <div class="row"><span class="badge b-soon">nur im Katalog</span>
             <a class="btn ghost sm" style="margin-left:auto" target="_blank" rel="noopener"
                href="{issue}">Anfragen ↗</a></div>
         </div>"""

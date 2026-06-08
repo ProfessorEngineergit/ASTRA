@@ -9,10 +9,12 @@ from datetime import time
 
 from app import tools
 from app.config_store import get_config_store
+from app.plugins import extended_catalog
 from app.plugins.builtin.edupage import EduPagePlugin
 from app.plugins.builtin.google_calendar import GoogleCalendarPlugin
 from app.plugins.builtin.google_tasks import GoogleTasksPlugin
 from app.plugins.builtin.home_assistant import HomeAssistantPlugin
+from app.plugins.builtin.native_catalog_pack import _slug as native_slug
 from app.plugins.registry import _discover_classes, get_manager
 from app.tools import ToolContext
 
@@ -28,11 +30,11 @@ def test_discovery_finds_builtin_plugins():
     assert EXPECTED <= slugs
 
 
-def test_native_catalog_pack_adds_many_agent_friendly_plugins():
+def test_native_catalog_pack_adds_many_service_plugins():
     classes = _discover_classes()
     native = [c for c in classes if getattr(c, "native_http", False)]
 
-    assert len(native) >= 50
+    assert len(native) >= extended_catalog.count() - 5
     sample = next(c for c in native if c.slug == "mattermost")
     plugin = sample({"__enabled": True})
     status = asyncio.run(plugin.tools()[0].handler({}, ToolContext(
@@ -45,6 +47,19 @@ def test_native_catalog_pack_adds_many_agent_friendly_plugins():
     assert payload["ok"] is False
     assert payload["source"] == "mattermost"
     assert payload["error"]["type"] == "not_configured"
+
+
+def test_catalog_entries_have_runtime_plugins():
+    classes = _discover_classes()
+    class_slugs = {c.slug for c in classes}
+    class_names = {c.name.lower() for c in classes}
+    missing = [
+        entry.name
+        for entry in extended_catalog.all_entries()
+        if native_slug(entry.name) not in class_slugs and entry.name.lower() not in class_names
+    ]
+
+    assert missing == []
 
 
 def test_all_plugin_tools_are_owner_only():
