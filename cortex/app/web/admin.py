@@ -1623,6 +1623,65 @@ async def system_tool_test(request: Request, _: bool = Depends(auth.require_admi
     return RedirectResponse("/admin/system", status_code=303)
 
 
+# ─── Inbox: real channel threads from Telegram/WhatsApp/Signal/E-Mail ─────────
+def _channel_label(channel: str) -> str:
+    return {
+        "telegram": "Telegram",
+        "waha": "WhatsApp",
+        "signal": "Signal",
+        "email": "E-Mail",
+        "web": "Web",
+    }.get(channel, channel)
+
+
+def _render_hub_messages(messages: list[dict]) -> str:
+    rows = []
+    for m in messages:
+        role = m.get("role", "user")
+        cls = "user" if role in ("user", "owner") else "bot" if role == "assistant" else "sys"
+        label = "Bahrian" if role == "owner" else "ASTRA" if role == "assistant" else "Kontakt"
+        rows.append(
+            f'<div class="msg-row {cls}"><div class="msg {cls}">'
+            f'<b style="display:block;font-size:11px;color:var(--text-faint);margin-bottom:4px">{esc(label)}</b>'
+            f'{esc(m.get("content", ""))}</div></div>'
+        )
+    return "".join(rows) if rows else '<div class="msg sys">Noch keine Nachrichten in diesem Thread.</div>'
+
+
+@router.get("/admin/inbox", response_class=HTMLResponse)
+async def inbox_page(request: Request, _: bool = Depends(auth.require_admin), thread: str = ""):
+    threads = await db.list_threads(80)
+    selected = next((t for t in threads if t.get("thread_id") == thread), threads[0] if threads else None)
+    active_id = selected.get("thread_id") if selected else ""
+    side_rows = []
+    for t in threads:
+        tid = t.get("thread_id", "")
+        active = " active" if tid == active_id else ""
+        who = t.get("who") or tid
+        side_rows.append(
+            f'<a class="thread{active}" href="/admin/inbox?thread={esc(tid)}">'
+            f'<span>{esc(who)}</span>'
+            f'<small>{esc(_channel_label(t.get("channel", "")))} · {esc(t.get("state", ""))}</small></a>'
+        )
+    messages = await db.recent_messages(active_id, 80) if active_id else []
+    title = selected.get("who") if selected else "Keine Threads"
+    body = f"""
+    <div class="chat-shell">
+      <aside class="chat-side">
+        <div class="side-head"><b>Kanal-Inbox</b><span class="badge b-off">{len(threads)}</span></div>
+        <div class="threads">{''.join(side_rows) or '<div class="arch-note">Noch keine Kanal-Threads.</div>'}</div>
+      </aside>
+      <section class="chat-main">
+        <div class="chat-title">
+          <div><span>{esc(_channel_label(selected.get("channel", "")) if selected else "Inbox")}</span>
+          <h1>{esc(title or active_id or "Inbox")}</h1></div>
+        </div>
+        <div class="chat-log">{_render_hub_messages(messages)}</div>
+      </section>
+    </div>"""
+    return HTMLResponse(page("Inbox", body, active="inbox"))
+
+
 # ─── Chat: multi-thread owner agent ────────────────────────────────────────────
 CHAT_KEY = "web_chats_v2"
 

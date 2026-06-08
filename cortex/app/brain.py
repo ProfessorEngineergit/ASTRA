@@ -20,6 +20,8 @@ from .memory import get_memory
 from .models import get_gateway
 from .persona import TRIAGE_INSTRUCTIONS, Register
 from .policy import Mode, Sensitivity, TrustTier, reconcile
+from .secretary import SECRETARY_CHANNELS, plan_for, with_secretary_header
+from .security import check_inbound, check_outbound
 from .state import Act, Signal, ThreadState, next_state
 
 log = logging.getLogger("astra.brain")
@@ -60,9 +62,57 @@ def _peer(thread_id: str) -> str:
 
 
 # ─── shared helpers ──────────────────────────────────────────────────────────
-async def _send_and_record(channel: str, peer: str, thread_id: str, text: str, contact: dict) -> None:
+async def _app_settings() -> dict:
+    return await db.get_setting("app_settings", {}) or {}
+
+
+def _secretary_system(channel: str, plan_reason: str = "") -> str:
+    if channel not in SECRETARY_CHANNELS:
+        return ""
+    return (
+        "Du bist ASTRA im Secretary-Modus fuer Bahrians externe Kommunikation. "
+        "Sprich transparent als ASTRA, nie als Bahrian. Antworte knapp, organisatorisch, "
+        "ohne verbindliche Zusagen ohne Datenbasis. Wenn du Kalender/Stundenplan brauchst, "
+        "nutze Tools oder bleibe vorsichtig. "
+        f"Policy-Grund: {plan_reason or 'secretary'}."
+    )
+
+
+async def _send_and_record(
+    channel: str,
+    peer: str,
+    thread_id: str,
+    text: str,
+    contact: dict,
+    *,
+    max_sensitivity: str = "none",
+) -> None:
     if not text:
         return
+    if channel in SECRETARY_CHANNELS:
+        thread = await db.get_thread(thread_id)
+        meta = (thread or {}).get("meta") or {}
+        appset = await _app_settings()
+        text = with_secretary_header(
+            text,
+            first_interaction=not bool(meta.get("secretary_announced")),
+            app_settings=appset,
+        )
+        verdict = check_outbound(text, channel=channel, max_sensitivity=max_sensitivity)
+        if not verdict.ok:
+            await db.audit(
+                "security_blocked_outbound",
+                channel=channel,
+                thread_id=thread_id,
+                contact_id=contact.get("id"),
+                detail={"reasons": verdict.reasons, "preview": text[:160]},
+            )
+            text = with_secretary_header(
+                "Ich kann diese Antwort so nicht sicher senden. Ich frage Bahrian direkt.",
+                first_interaction=not bool(meta.get("secretary_announced")),
+                app_settings=appset,
+            )
+        await db.merge_thread_meta(thread_id, {"secretary_announced": True})
     ok = await get_channels().send(channel, peer, text)
     await db.add_message(thread_id, "assistant", text)
     await db.audit(
@@ -143,6 +193,37 @@ async def handle_inbound(
         return
 
     # ── Third party → triage + policy ──────────────────────────────────────────
+    inbound_verdict = check_inbound(text, channel=channel)
+    if not inbound_verdict.ok:
+        await db.audit(
+            "security_blocked_inbound",
+            channel=channel,
+            thread_id=thread_id,
+            contact_id=contact["id"],
+            detail={"reasons": inbound_verdict.reasons, "preview": text[:160]},
+        )
+        if channel == "email":
+            await db.add_message(thread_id, "assistant", "E-Mail wurde vom Security-Check blockiert.")
+            await _notify_owner(channel, thread_id, contact, text, "Security-Check hat eine E-Mail blockiert.")
+            return
+        await _send_and_record(
+            channel,
+            sender_handle,
+            thread_id,
+            "Ich kann diese Anfrage so nicht bearbeiten. Ich leite sie bei Bedarf an Bahrian weiter.",
+            contact,
+            max_sensitivity="none",
+        )
+        return
+    if inbound_verdict.reasons:
+        await db.audit(
+            "security_warn_inbound",
+            channel=channel,
+            thread_id=thread_id,
+            contact_id=contact["id"],
+            detail={"reasons": inbound_verdict.reasons},
+        )
+
     tier = TrustTier(int(contact["trust_tier"]))
     history = await db.recent_messages(thread_id)
     gw = get_gateway()
@@ -161,6 +242,15 @@ async def handle_inbound(
 
     # Autonomy override: a confident/full owner lets ASTRA skip waiting/asking.
     mode = decision.mode
+    appset = await _app_settings()
+    secretary_plan = plan_for(
+        channel=channel,
+        mode=mode,
+        max_sensitivity=decision.max_sensitivity,
+        app_settings=appset,
+        timezone=s.astra_timezone,
+    )
+    mode = secretary_plan.mode
     auto = get_autonomy()
     if auto == "full" and mode in (Mode.DEFER, Mode.ASK):
         mode = Mode.AUTO
@@ -173,8 +263,12 @@ async def handle_inbound(
             register=Register.THIRD, contact=contact, thread_id=thread_id, channel=channel,
             history=history, summary=thread.get("summary") or "",
             max_sensitivity=decision.max_sensitivity.value,
+            extra_system=_secretary_system(channel, secretary_plan.reason),
         )
-        await _send_and_record(channel, sender_handle, thread_id, reply, contact)
+        await _send_and_record(
+            channel, sender_handle, thread_id, reply, contact,
+            max_sensitivity=decision.max_sensitivity.value,
+        )
         cur = await db.get_thread(thread_id)
         if cur and cur["state"] != ThreadState.AWAITING_APPROVAL.value:  # a tool may have asked
             await db.set_thread_state(thread_id, ThreadState.ANSWERED.value)
@@ -184,7 +278,9 @@ async def handle_inbound(
         await db.set_thread_state(thread_id, ThreadState.DEFERRED.value, defer_until=defer_until)
         await db.merge_thread_meta(thread_id, {"max_sensitivity": decision.max_sensitivity.value})
         await db.audit("deferred", channel=channel, thread_id=thread_id, contact_id=contact["id"],
-                       detail={"defer_seconds": s.astra_defer_seconds})
+                       detail={"defer_seconds": s.astra_defer_seconds, "secretary": secretary_plan.reason})
+        if secretary_plan.should_notify_owner:
+            await _notify_owner(channel, thread_id, contact, text, "Secretary wartet auf Bahrian.")
         log.info("Deferred %s for %ss (waiting for owner).", thread_id, s.astra_defer_seconds)
 
     else:  # ASK
@@ -212,10 +308,29 @@ async def _ask_owner(channel: str, peer: str, thread_id: str, contact: dict, tex
             f"🔔 {name} ({channel}) fragt:\n„{text}“\n\nDarf ASTRA antworten?",
             buttons=buttons,
         )
-    await _send_and_record(
-        channel, peer, thread_id,
-        "Einen Moment — ich halte kurz Rücksprache mit Bahrian und melde mich gleich.",
-        contact,
+    if channel == "email":
+        await db.add_message(
+            thread_id,
+            "assistant",
+            "E-Mail-Antwort wartet auf Bahrians Freigabe.",
+        )
+    else:
+        await _send_and_record(
+            channel, peer, thread_id,
+            "Einen Moment — ich halte kurz Rücksprache mit Bahrian und melde mich gleich.",
+            contact,
+            max_sensitivity="none",
+        )
+
+
+async def _notify_owner(channel: str, thread_id: str, contact: dict, text: str, note: str) -> None:
+    s = get_settings()
+    if not (s.telegram_enabled and s.telegram_owner_chat_id):
+        return
+    name = contact.get("display_name") or contact.get("handle") or "Unbekannt"
+    await get_channels().send_telegram(
+        s.telegram_owner_chat_id,
+        f"Secretary-Hinweis: {note}\n{name} ({channel}) schrieb:\n{text[:900]}\n\nThread: {thread_id}",
     )
 
 
@@ -232,9 +347,15 @@ async def step_in(thread_id: str) -> None:
     reply = await generate_reply(
         register=Register.THIRD, contact=contact or {}, thread_id=thread_id, channel=thread["channel"],
         history=history, summary=thread.get("summary") or "", max_sensitivity=ceiling,
-        extra_system="Bahrian hat nicht selbst geantwortet. Antworte jetzt stellvertretend, knapp und souverän.",
+        extra_system=(
+            "Bahrian hat nicht selbst geantwortet. Antworte jetzt stellvertretend, knapp und souverän. "
+            + _secretary_system(thread["channel"], "defer-elapsed")
+        ),
     )
-    await _send_and_record(thread["channel"], _peer(thread_id), thread_id, reply, contact or {})
+    await _send_and_record(
+        thread["channel"], _peer(thread_id), thread_id, reply, contact or {},
+        max_sensitivity=ceiling,
+    )
     await db.set_thread_state(thread_id, ThreadState.ANSWERED.value)
     await db.audit("stepin", channel=thread["channel"], thread_id=thread_id,
                    contact_id=thread.get("contact_id"))
@@ -262,9 +383,12 @@ async def resume_after_approval(approval: dict, decision: str) -> None:
     reply = await generate_reply(
         register=Register.THIRD, contact=contact or {}, thread_id=thread_id, channel=thread["channel"],
         history=history, summary=thread.get("summary") or "", max_sensitivity=ceiling.value,
-        extra_system=instruction,
+        extra_system=instruction + " " + _secretary_system(thread["channel"], "owner-approved"),
     )
-    await _send_and_record(thread["channel"], _peer(thread_id), thread_id, reply, contact or {})
+    await _send_and_record(
+        thread["channel"], _peer(thread_id), thread_id, reply, contact or {},
+        max_sensitivity=ceiling.value,
+    )
     await db.set_thread_state(thread_id, ThreadState.ANSWERED.value)
     await db.audit("resume", channel=thread["channel"], thread_id=thread_id,
                    contact_id=thread.get("contact_id"), detail={"decision": decision})

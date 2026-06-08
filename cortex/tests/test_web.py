@@ -316,3 +316,40 @@ def test_chat_accepts_media_uploads(memdb, monkeypatch):
     assert r.status_code == 200
     assert "attachment" in r.text
     assert "bild.png" in r.text
+
+
+def test_inbox_shows_channel_threads(memdb, monkeypatch):
+    _prime_manager()
+
+    async def fake_list_threads(limit=80):
+        return [{
+            "thread_id": "telegram:123",
+            "channel": "telegram",
+            "state": "answered",
+            "who": "Bahrian",
+            "trust_tier": 0,
+        }]
+
+    async def fake_recent_messages(thread_id, limit=80):
+        assert thread_id == "telegram:123"
+        return [
+            {"role": "owner", "content": "Telegram-Nachricht", "created_at": None},
+            {"role": "assistant", "content": "Antwort", "created_at": None},
+        ]
+
+    from app import db
+    monkeypatch.setattr(db, "list_threads", fake_list_threads)
+    monkeypatch.setattr(db, "recent_messages", fake_recent_messages)
+
+    c = TestClient(_app())
+    r = c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+
+    r = c.get("/admin/inbox")
+
+    assert r.status_code == 200
+    assert "Kanal-Inbox" in r.text
+    assert "Telegram-Nachricht" in r.text
+    assert "Telegram" in r.text

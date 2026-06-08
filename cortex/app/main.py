@@ -445,3 +445,30 @@ async def ingress_signal(
         sender_display=display_name,
     )
     return {"ok": True}
+
+
+# ─── E-Mail ingress ───────────────────────────────────────────────────────────
+
+@app.post("/ingress/email", tags=["ingress"])
+async def ingress_email(
+    request: Request,
+    x_astra_secret: str | None = Header(default=None),
+):
+    """Receives normalized inbound mail from n8n, IMAP pollers, or future plugins."""
+    _verify_secret(x_astra_secret)
+    body = await request.json()
+    sender_handle = body.get("from") or body.get("sender") or body.get("email") or ""
+    if not sender_handle:
+        return {"ok": True, "skipped": "no sender"}
+    subject = (body.get("subject") or "").strip()
+    text = (body.get("text") or body.get("body") or "").strip()
+    if not text and not subject:
+        return {"ok": True, "skipped": "empty email"}
+    content = f"Betreff: {subject}\n\n{text}".strip() if subject else text
+    await brain.handle_inbound(
+        channel="email",
+        sender_handle=sender_handle,
+        text=content,
+        sender_display=body.get("name") or sender_handle,
+    )
+    return {"ok": True}
