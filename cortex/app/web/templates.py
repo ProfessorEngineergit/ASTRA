@@ -388,6 +388,13 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
   border-color: #2b2b34; color: var(--text); }
 .thread span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; font-weight: 600; }
 .thread small, .arch-note { color: var(--text-faint); font-size: 11px; }
+.source-tag { display: inline-flex; align-items: center; width: fit-content; padding: 2px 7px;
+  border: 1px solid rgba(170,180,214,.24); border-radius: 999px; background: rgba(170,180,214,.08);
+  color: #c9d1ea; font-size: 10.5px; font-weight: 650; letter-spacing: 0; text-transform: none; }
+.thread .source-tag { margin-right: 5px; }
+.chat-title h1 .source-tag { display: inline-flex !important; vertical-align: middle; margin-left: 6px;
+  color: #c9d1ea !important; font-size: 10.5px !important; letter-spacing: 0 !important;
+  text-transform: none !important; }
 .perm-box { margin-top: auto; display: grid; gap: 12px; padding: 14px; background: #050507;
   border: 1px solid #24242c; border-radius: var(--r); box-shadow: inset 0 1px 0 rgba(255,255,255,.035); }
 .perm-head { display: flex; align-items: center; gap: 10px; }
@@ -506,6 +513,31 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
 .confirm-dialog p { margin: 0; color: var(--text-dim); font-size: 13px; line-height: 1.45; }
 .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 
+/* secretary */
+.secretary-grid { display: grid; grid-template-columns: minmax(0,1.2fr) minmax(320px,.8fr); gap: 16px; }
+.secretary-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px,1fr)); gap: 12px; }
+.secretary-card { display: grid; gap: 12px; padding: 16px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--r-lg); }
+.secretary-card h3 { margin: 0; font-size: 15px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.secretary-card p { margin: 0; color: var(--text-dim); font-size: 12.5px; line-height: 1.45; }
+.secretary-card .mini { color: var(--text-faint); font-size: 11px; }
+.secretary-row { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.secretary-row label, .secretary-card label { color: var(--text-faint); font-size: 10px;
+  text-transform: uppercase; letter-spacing: .07em; }
+.secretary-switch { display: inline-flex; align-items: center; gap: 8px; color: var(--text-dim);
+  font-size: 12px; text-transform: none !important; letter-spacing: 0 !important; }
+.secretary-switch input { width: auto; }
+.setup-chat { display: grid; gap: 10px; padding: 16px; background: #050507; border: 1px solid var(--border);
+  border-radius: var(--r-lg); }
+.setup-bubble { padding: 12px 13px; border: 1px solid var(--border-soft); border-radius: 14px;
+  background: rgba(255,255,255,.035); color: var(--text-dim); font-size: 13px; line-height: 1.48; }
+.setup-bubble strong { color: var(--text); }
+.policy-stack { display: grid; gap: 9px; }
+.policy-line { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px;
+  border: 1px solid var(--border-soft); border-radius: var(--r-sm); background: rgba(255,255,255,.025); }
+.policy-line b { color: var(--text); font-size: 12.5px; }
+.policy-line span { color: var(--text-dim); font-size: 12px; line-height: 1.35; }
+
 /* settings / labs */
 .settings-hero { display: flex; align-items: flex-start; justify-content: space-between;
   gap: 18px; margin: 6px 0 28px; }
@@ -602,6 +634,8 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
   .chat-input textarea { flex-basis: 100%; }
   .settings-hero { align-items: center; }
   .settings-tabs { top: 60px; overflow-x: auto; flex-wrap: nowrap; }
+  .secretary-grid { grid-template-columns: 1fr; }
+  .secretary-row { grid-template-columns: 1fr; }
   .location-row { flex-direction: column; align-items: stretch !important; }
   .address-box { width: 100%; min-width: 0; }
   .github-capsule { width: 38px; height: 38px; }
@@ -620,7 +654,7 @@ def page(title: str, body: str, *, nav: bool = True, active: str = "") -> str:
             '<nav>'
             f'{navlink("/admin", "Plugins", "plugins")}'
             f'{navlink("/admin/chat", "Chat", "chat")}'
-            f'{navlink("/admin/inbox", "Inbox", "inbox")}'
+            f'{navlink("/admin/secretary", "Secretary", "secretary")}'
             f'{navlink("/admin/system", "System", "system")}'
             f'{navlink("/admin/settings", "Einstellungen", "settings")}'
             f'{navlink("/admin/update", "Update", "update")}'

@@ -16,11 +16,12 @@ from . import db
 from .agent import generate_reply
 from .channels import get_channels
 from .config import get_settings
+from .context_ledger import record_interaction
 from .memory import get_memory
 from .models import get_gateway
 from .persona import TRIAGE_INSTRUCTIONS, Register
 from .policy import Mode, Sensitivity, TrustTier, reconcile
-from .secretary import SECRETARY_CHANNELS, plan_for, with_secretary_header
+from .secretary import SECRETARY_CHANNELS, is_group_context, plan_for, tone_instruction, with_secretary_header
 from .security import check_inbound, check_outbound
 from .state import Act, Signal, ThreadState, next_state
 
@@ -66,14 +67,27 @@ async def _app_settings() -> dict:
     return await db.get_setting("app_settings", {}) or {}
 
 
-def _secretary_system(channel: str, plan_reason: str = "") -> str:
+def _secretary_system(
+    channel: str,
+    plan_reason: str = "",
+    *,
+    app_settings: dict | None = None,
+    thread_meta: dict | None = None,
+) -> str:
     if channel not in SECRETARY_CHANNELS:
         return ""
+    tone = tone_instruction(app_settings, thread_meta)
+    group_note = (
+        "Dieser Thread ist ein Gruppenchat. Fuehre keine Aktionen aus und triff keine Zusagen, "
+        "wenn Bahrian das nicht fuer genau diese Gruppe freigegeben hat. "
+        if (thread_meta or {}).get("is_group") else ""
+    )
     return (
         "Du bist ASTRA im Secretary-Modus fuer Bahrians externe Kommunikation. "
         "Sprich transparent als ASTRA, nie als Bahrian. Antworte knapp, organisatorisch, "
         "ohne verbindliche Zusagen ohne Datenbasis. Wenn du Kalender/Stundenplan brauchst, "
         "nutze Tools oder bleibe vorsichtig. "
+        f"{tone} {group_note}"
         f"Policy-Grund: {plan_reason or 'secretary'}."
     )
 
@@ -115,6 +129,20 @@ async def _send_and_record(
         await db.merge_thread_meta(thread_id, {"secretary_announced": True})
     ok = await get_channels().send(channel, peer, text)
     await db.add_message(thread_id, "assistant", text)
+    try:
+        thread = await db.get_thread(thread_id)
+        meta = (thread or {}).get("meta") or {}
+        await record_interaction(
+            channel=channel,
+            thread_id=thread_id,
+            handle=peer,
+            role="assistant",
+            text=text,
+            display=contact.get("display_name") or contact.get("handle"),
+            meta=meta,
+        )
+    except Exception:  # noqa: BLE001
+        log.debug("Aegis context ledger write failed for outbound %s", thread_id, exc_info=True)
     await db.audit(
         "reply_sent",
         channel=channel,
@@ -148,10 +176,15 @@ async def handle_inbound(
     text: str,
     sender_display: str | None = None,
     force_owner: bool | None = None,
+    thread_meta: dict | None = None,
 ) -> None:
     """Process one inbound message. `force_owner` overrides owner detection — used
     by the WAHA ingress for `fromMe` messages (you replying yourself = stand-down)."""
     s = get_settings()
+    thread_meta = dict(thread_meta or {})
+    thread_meta.setdefault("source_channel", channel)
+    if is_group_context(channel, sender_handle, thread_meta):
+        thread_meta["is_group"] = True
     thread_id = f"{channel}:{sender_handle}"
 
     # Is the PEER (this thread's other party) the owner himself? → his own DM to ASTRA.
@@ -169,7 +202,22 @@ async def handle_inbound(
             trust_tier=0 if peer_is_owner else 3, is_owner=peer_is_owner,
         )
     thread = await db.ensure_thread(thread_id, channel, contact["id"])
+    if thread_meta:
+        await db.merge_thread_meta(thread_id, thread_meta)
+        thread = {**thread, "meta": {**(thread.get("meta") or {}), **thread_meta}}
     await db.add_message(thread_id, "owner" if author_is_owner else "user", text, sender_handle)
+    try:
+        await record_interaction(
+            channel=channel,
+            thread_id=thread_id,
+            handle=sender_handle,
+            role="owner" if author_is_owner else "user",
+            text=text,
+            display=sender_display,
+            meta=thread.get("meta") or {},
+        )
+    except Exception:  # noqa: BLE001
+        log.debug("Aegis context ledger write failed for inbound %s", thread_id, exc_info=True)
 
     # ── Owner's own conversation with ASTRA (peer IS the owner) ─────────────────
     if peer_is_owner:
@@ -195,6 +243,12 @@ async def handle_inbound(
     # ── Third party → triage + policy ──────────────────────────────────────────
     inbound_verdict = check_inbound(text, channel=channel)
     if not inbound_verdict.ok:
+        security_meta = {
+            "security_watch": True,
+            "security_reasons": inbound_verdict.reasons,
+            "tone_override": "firm",
+        }
+        await db.merge_thread_meta(thread_id, security_meta)
         await db.audit(
             "security_blocked_inbound",
             channel=channel,
@@ -216,6 +270,16 @@ async def handle_inbound(
         )
         return
     if inbound_verdict.reasons:
+        current_meta = (thread.get("meta") or {})
+        security_reasons = sorted(set((current_meta.get("security_reasons") or []) + inbound_verdict.reasons))
+        security_meta = {
+            "security_watch": True,
+            "security_reasons": security_reasons,
+            "security_strikes": int(current_meta.get("security_strikes") or 0) + 1,
+            "tone_override": "firm",
+        }
+        await db.merge_thread_meta(thread_id, security_meta)
+        thread = {**thread, "meta": {**current_meta, **security_meta}}
         await db.audit(
             "security_warn_inbound",
             channel=channel,
@@ -249,6 +313,7 @@ async def handle_inbound(
         max_sensitivity=decision.max_sensitivity,
         app_settings=appset,
         timezone=s.astra_timezone,
+        is_group=bool((thread.get("meta") or {}).get("is_group")),
     )
     mode = secretary_plan.mode
     auto = get_autonomy()
@@ -263,7 +328,12 @@ async def handle_inbound(
             register=Register.THIRD, contact=contact, thread_id=thread_id, channel=channel,
             history=history, summary=thread.get("summary") or "",
             max_sensitivity=decision.max_sensitivity.value,
-            extra_system=_secretary_system(channel, secretary_plan.reason),
+            extra_system=_secretary_system(
+                channel,
+                secretary_plan.reason,
+                app_settings=appset,
+                thread_meta=thread.get("meta") or {},
+            ),
         )
         await _send_and_record(
             channel, sender_handle, thread_id, reply, contact,
@@ -349,7 +419,12 @@ async def step_in(thread_id: str) -> None:
         history=history, summary=thread.get("summary") or "", max_sensitivity=ceiling,
         extra_system=(
             "Bahrian hat nicht selbst geantwortet. Antworte jetzt stellvertretend, knapp und souverän. "
-            + _secretary_system(thread["channel"], "defer-elapsed")
+            + _secretary_system(
+                thread["channel"],
+                "defer-elapsed",
+                app_settings=await _app_settings(),
+                thread_meta=thread.get("meta") or {},
+            )
         ),
     )
     await _send_and_record(
@@ -383,7 +458,12 @@ async def resume_after_approval(approval: dict, decision: str) -> None:
     reply = await generate_reply(
         register=Register.THIRD, contact=contact or {}, thread_id=thread_id, channel=thread["channel"],
         history=history, summary=thread.get("summary") or "", max_sensitivity=ceiling.value,
-        extra_system=instruction + " " + _secretary_system(thread["channel"], "owner-approved"),
+        extra_system=instruction + " " + _secretary_system(
+            thread["channel"],
+            "owner-approved",
+            app_settings=await _app_settings(),
+            thread_meta=thread.get("meta") or {},
+        ),
     )
     await _send_and_record(
         thread["channel"], _peer(thread_id), thread_id, reply, contact or {},

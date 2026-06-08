@@ -334,7 +334,7 @@ def test_chat_accepts_media_uploads(memdb, monkeypatch):
     assert "bild.png" in r.text
 
 
-def test_inbox_shows_channel_threads(memdb, monkeypatch):
+def test_secretary_shows_channel_threads_and_chat_import(memdb, monkeypatch):
     _prime_manager()
 
     async def fake_list_threads(limit=80):
@@ -363,9 +363,22 @@ def test_inbox_shows_channel_threads(memdb, monkeypatch):
     c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
                                  "confirm": "geheim123"}, follow_redirects=False)
 
-    r = c.get("/admin/inbox")
+    r = c.get("/admin/inbox", follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/admin/secretary"
+
+    r = c.get("/admin/secretary")
 
     assert r.status_code == 200
-    assert "Kanal-Inbox" in r.text
+    assert "Aegis Secretary" in r.text
+    assert "Channel Threads" in r.text
+    assert "WAHA Webhook" in r.text
     assert "Telegram-Nachricht" in r.text
     assert "Telegram" in r.text
+
+    chat_id = web_admin._channel_chat_id("telegram:123")
+    r = c.get(f"/admin/chat?chat={chat_id}")
+
+    assert r.status_code == 200
+    assert "from Telegram" in r.text
+    assert "Telegram-Nachricht" in r.text

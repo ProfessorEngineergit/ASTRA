@@ -58,7 +58,7 @@ def check_outbound(text: str, *, channel: str = "", max_sensitivity: str = "none
     lowered = text.lower()
     if _matches(_IMPERSONATION_PATTERNS, text):
         reasons.append("owner_impersonation")
-    if channel in ("waha", "signal", "email") and "-- astra" not in lowered:
+    if channel in ("waha", "signal", "email") and not re.search(r"--\s*astra\b", lowered):
         reasons.append("missing_agent_header")
     if max_sensitivity == "none" and re.search(r"\b\d{1,2}:\d{2}\b", text):
         reasons.append("time_detail_above_none")

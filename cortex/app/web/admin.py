@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ from ..config_store import SECRET_SENTINEL, get_config_store
 from ..google_oauth import authorization_url, exchange_code, token_patch, user_email
 from ..plugins.base import CATEGORY_LABELS, FieldType
 from ..plugins.registry import get_manager
+from ..secretary import CHANNEL_LABELS, secretary_settings
 from . import auth
 from ..models import set_model_override
 from ..plugins import extended_catalog
@@ -32,6 +34,7 @@ GH_REPO = "https://github.com/ProfessorEngineergit/ASTRA"
 GH_OWNER_REPO = "ProfessorEngineergit/ASTRA"
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[3]
 UPDATE_PULL_COMMAND = ["git", "pull", "--ff-only", "origin", "main"]
+UPDATE_FETCH_COMMAND = ["git", "fetch", "--tags", "origin", "main"]
 UPDATE_REBUILD_COMMAND = "docker compose up -d --build cortex"
 _GH_SVG = ('<svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor">'
            '<path d="M12 .5A12 12 0 0 0 8.2 23.9c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.5-1.4-1.3-1.8-1.3-1.8'
@@ -162,7 +165,7 @@ async def _git_update_status(*, fetch: bool = False) -> dict:
     fetch_result = None
     if fetch:
         fetch_result = await _run_update_cmd(
-            ["git", "fetch", "--tags", "origin", "main"], timeout=35, cwd=repo_root
+            UPDATE_FETCH_COMMAND, timeout=35, cwd=repo_root
         )
 
     local_full = (
@@ -179,6 +182,9 @@ async def _git_update_status(*, fetch: bool = False) -> dict:
     )["out"].strip()
     local_tag = (
         await _run_update_cmd(["git", "describe", "--tags", "--exact-match", "HEAD"], timeout=8, cwd=repo_root)
+    )["out"].strip()
+    local_nearest_tag = (
+        await _run_update_cmd(["git", "describe", "--tags", "--abbrev=0", "HEAD"], timeout=8, cwd=repo_root)
     )["out"].strip()
     latest_tag = (
         await _run_update_cmd(["git", "describe", "--tags", "--abbrev=0", "origin/main"], timeout=8, cwd=repo_root)
@@ -209,8 +215,12 @@ async def _git_update_status(*, fetch: bool = False) -> dict:
         parts = ahead_behind.split()
         if len(parts) == 2:
             ahead, behind = int(parts[0]), int(parts[1])
+    diverged = ahead > 0 and behind > 0
     target_version = latest_tag or remote_short or "unbekannt"
-    current_version = local_tag or (f"{ASTRA_VERSION}+{local_short}" if local_short else ASTRA_VERSION)
+    current_version = local_tag or (
+        f"{local_nearest_tag}+{local_short}" if local_nearest_tag and local_short else
+        f"v{ASTRA_VERSION}+{local_short}" if local_short else f"v{ASTRA_VERSION}"
+    )
     data = {
         "ok": True,
         "git_available": True,
@@ -224,6 +234,9 @@ async def _git_update_status(*, fetch: bool = False) -> dict:
         "target_version": target_version,
         "release_mode": "release-tag" if latest_tag else "commit-fallback",
         "update_available": behind > 0,
+        "diverged": diverged,
+        "can_update": behind > 0 and not dirty,
+        "sync_strategy": "backup-reset" if diverged else "fast-forward",
         "ahead": ahead,
         "behind": behind,
         "dirty": dirty,
@@ -231,11 +244,17 @@ async def _git_update_status(*, fetch: bool = False) -> dict:
         "untracked_count": len([line for line in untracked_status.splitlines() if line]),
         "commits": [line for line in commit_lines.splitlines() if line],
         "pull_command": " ".join(UPDATE_PULL_COMMAND),
+        "fetch_command": " ".join(UPDATE_FETCH_COMMAND),
         "rebuild_command": UPDATE_REBUILD_COMMAND,
         "release_note": (
             "Die Karte bevorzugt GitHub Releases/Tags. Ohne Tag nutzt ASTRA den neuesten Commit als Version."
         ),
     }
+    if diverged:
+        data["message"] = (
+            "Lokaler und entfernter Branch sind divergiert. ASTRA kann vor dem Sync eine Backup-Branch "
+            "anlegen und dann origin/main auschecken."
+        )
     if fetch_result is not None:
         data["fetch"] = {
             "ok": fetch_result["ok"],
@@ -247,7 +266,7 @@ async def _git_update_status(*, fetch: bool = False) -> dict:
 
 
 async def _git_pull_update() -> dict:
-    before = await _git_update_status(fetch=False)
+    before = await _git_update_status(fetch=True)
     if not before.get("ok"):
         return before
     if before.get("dirty"):
@@ -256,19 +275,55 @@ async def _git_pull_update() -> dict:
             "ok": False,
             "message": "Lokale Git-Änderungen blockieren den Pull. Erst committen, stashen oder bewusst aufräumen.",
         }
-    result = await _run_update_cmd(UPDATE_PULL_COMMAND, timeout=75, cwd=Path(before["repo_root"]))
+    if not before.get("update_available"):
+        return {**before, "ok": True, "message": "ASTRA ist bereits aktuell."}
+    repo_root = Path(before["repo_root"])
+    backup = None
+    steps: list[dict] = []
+    if before.get("diverged"):
+        backup = "server-backup/" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        branch_result = await _run_update_cmd(["git", "branch", backup, "HEAD"], timeout=12, cwd=repo_root)
+        steps.append({"step": "backup_branch", "branch": backup, **branch_result})
+        if not branch_result["ok"]:
+            after = await _git_update_status(fetch=False)
+            return {
+                **after,
+                "ok": False,
+                "backup_branch": backup,
+                "steps": steps,
+                "message": "Backup-Branch konnte nicht angelegt werden. Update abgebrochen.",
+            }
+        result = await _run_update_cmd(["git", "reset", "--hard", "origin/main"], timeout=45, cwd=repo_root)
+        steps.append({"step": "reset_origin_main", **result})
+    else:
+        result = await _run_update_cmd(UPDATE_PULL_COMMAND, timeout=75, cwd=repo_root)
+        steps.append({"step": "fast_forward_pull", **result})
     after = await _git_update_status(fetch=False)
     payload = {
         **after,
         "ok": result["ok"],
+        "sync_strategy": "backup-reset" if before.get("diverged") else "fast-forward",
+        "backup_branch": backup,
+        "steps": [
+            {k: (v[-3000:] if k in {"out", "err"} and isinstance(v, str) else v) for k, v in step.items()}
+            for step in steps
+        ],
         "pull": {
             "code": result["code"],
             "out": result["out"][-6000:],
             "err": result["err"][-6000:],
         },
-        "message": "Git pull abgeschlossen." if result["ok"] else "Git pull ist fehlgeschlagen.",
+        "message": (
+            "Update synchronisiert." if result["ok"] and not backup else
+            f"Update synchronisiert. Lokaler Altstand liegt auf {backup}." if result["ok"] else
+            "Update-Sync ist fehlgeschlagen."
+        ),
     }
-    await db.audit("self_update_pull", actor="owner", detail={"ok": result["ok"], "code": result["code"]})
+    await db.audit(
+        "self_update_pull",
+        actor="owner",
+        detail={"ok": result["ok"], "code": result["code"], "strategy": payload["sync_strategy"], "backup": backup},
+    )
     return payload
 
 
@@ -1729,15 +1784,9 @@ async def system_tool_test(request: Request, _: bool = Depends(auth.require_admi
     return RedirectResponse("/admin/system", status_code=303)
 
 
-# ─── Inbox: real channel threads from Telegram/WhatsApp/Signal/E-Mail ─────────
+# ─── Secretary: channel setup, policy, and live channel threads ───────────────
 def _channel_label(channel: str) -> str:
-    return {
-        "telegram": "Telegram",
-        "waha": "WhatsApp",
-        "signal": "Signal",
-        "email": "E-Mail",
-        "web": "Web",
-    }.get(channel, channel)
+    return {**CHANNEL_LABELS, "web": "Web"}.get(channel, channel)
 
 
 def _render_hub_messages(messages: list[dict]) -> str:
@@ -1754,8 +1803,59 @@ def _render_hub_messages(messages: list[dict]) -> str:
     return "".join(rows) if rows else '<div class="msg sys">Noch keine Nachrichten in diesem Thread.</div>'
 
 
+def _checked(value: bool) -> str:
+    return " checked" if value else ""
+
+
+def _select(name: str, value: str, options: list[tuple[str, str]]) -> str:
+    opts = "".join(
+        f'<option value="{esc(v)}" {"selected" if value == v else ""}>{esc(label)}</option>'
+        for v, label in options
+    )
+    return f'<select name="{esc(name)}">{opts}</select>'
+
+
+def _secretary_channel_card(channel: str, cfg: dict) -> str:
+    mode_options = {
+        "telegram": [("chat_import", "In Chat importieren"), ("off", "Nur speichern")],
+        "waha": [("school_direct", "Schulzeit direkt"), ("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
+        "signal": [("school_direct", "Schulzeit direkt"), ("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
+        "email": [("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
+    }[channel]
+    setup = {
+        "telegram": "Telegram wird in den normalen Chat gespiegelt und dort als from Telegram markiert.",
+        "waha": "WAHA Webhook: /ingress/waha mit X-Astra-Secret. Gruppen werden standardmaessig nur nach Freigabe bearbeitet.",
+        "signal": "signal-cli-rest-api Webhook: /ingress/signal mit X-Astra-Secret. groupInfo aktiviert Gruppenschutz.",
+        "email": "Mail-Ingress: /ingress/email fuer normalisierte IMAP/Gmail-Events. Senden bleibt bestaetigungspflichtig.",
+    }[channel]
+    return f"""
+      <div class="secretary-card">
+        <h3>{esc(cfg.get("label") or _channel_label(channel))}
+          <span class="source-tag">{'aktiv' if cfg.get("enabled") else 'aus'}</span></h3>
+        <label class="secretary-switch">
+          <input type="checkbox" name="sec_{esc(channel)}_enabled"{_checked(bool(cfg.get("enabled")))}>
+          Installation aktiv
+        </label>
+        <div>
+          <label>Modus</label>
+          {_select(f"sec_{channel}_mode", cfg.get("mode", "policy"), mode_options)}
+        </div>
+        <p>{esc(setup)}</p>
+        <div class="mini">{esc(channel)}</div>
+      </div>
+    """
+
+
 @router.get("/admin/inbox", response_class=HTMLResponse)
-async def inbox_page(request: Request, _: bool = Depends(auth.require_admin), thread: str = ""):
+async def inbox_legacy(_: bool = Depends(auth.require_admin), thread: str = ""):
+    suffix = f"?thread={esc(thread)}" if thread else ""
+    return RedirectResponse(f"/admin/secretary{suffix}", status_code=303)
+
+
+@router.get("/admin/secretary", response_class=HTMLResponse)
+async def secretary_page(request: Request, _: bool = Depends(auth.require_admin), thread: str = ""):
+    appset = await _app_settings()
+    settings = secretary_settings(appset)
     threads = await db.list_threads(80)
     selected = next((t for t in threads if t.get("thread_id") == thread), threads[0] if threads else None)
     active_id = selected.get("thread_id") if selected else ""
@@ -1765,27 +1865,127 @@ async def inbox_page(request: Request, _: bool = Depends(auth.require_admin), th
         active = " active" if tid == active_id else ""
         who = t.get("who") or tid
         side_rows.append(
-            f'<a class="thread{active}" href="/admin/inbox?thread={esc(tid)}">'
+            f'<a class="thread{active}" href="/admin/secretary?thread={esc(tid)}">'
             f'<span>{esc(who)}</span>'
             f'<small>{esc(_channel_label(t.get("channel", "")))} · {esc(t.get("state", ""))}</small></a>'
         )
     messages = await db.recent_messages(active_id, 80) if active_id else []
     title = selected.get("who") if selected else "Keine Threads"
+    token = await auth.issue_csrf()
+    channel_cards = "".join(
+        _secretary_channel_card(ch, settings["channels"][ch])
+        for ch in ("telegram", "waha", "signal", "email")
+    )
+    workdays = {int(v) for v in (settings.get("workdays") or []) if str(v).isdigit()}
+    weekday_checks = "".join(
+        f'<label class="secretary-switch"><input type="checkbox" name="workday" value="{i}"{_checked(i in workdays)}>{esc(label)}</label>'
+        for i, label in enumerate(["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"])
+    )
+    tone_options = [("warm", "Warm"), ("crisp", "Knapp"), ("formal", "Formell"), ("firm", "Klar distanziert")]
+    group_options = [("owner_grant", "Nur nach Auftrag"), ("always_ask", "Immer fragen"), ("auto", "Automatisch erlauben")]
     body = f"""
-    <div class="chat-shell">
+    <div class="hero">
+      <h1>{esc(settings.get("name", "Aegis"))} Secretary</h1>
+      <p>WhatsApp, Signal, Mail und Telegram-Kontext sicher einrichten, abstimmen und ueberwachen.</p>
+    </div>
+    <form method="post" action="/admin/secretary">
+      <input type="hidden" name="csrf" value="{esc(token)}">
+      <div class="secretary-grid">
+        <section class="panel">
+          <h2 style="margin:0 0 6px;font-size:17px">Kanäle</h2>
+          <p class="note" style="margin:0 0 14px">Nur die Aktivierung ist global. Jeder Kanal hat danach seine eigene Installation und Policy.</p>
+          <div class="secretary-cards">{channel_cards}</div>
+        </section>
+        <aside class="setup-chat">
+          <div class="setup-bubble"><strong>ASTRA Setup</strong><br>Verbinde WAHA, Signal oder Mail mit den Ingress-Endpunkten und nutze immer den Header <code>X-Astra-Secret</code>.</div>
+          <div class="setup-bubble"><strong>WAHA</strong><br><code>POST /ingress/waha</code> fuer WhatsApp-Nachrichten.</div>
+          <div class="setup-bubble"><strong>Signal</strong><br><code>POST /ingress/signal</code> aus signal-cli-rest-api.</div>
+          <div class="setup-bubble"><strong>Mail</strong><br><code>POST /ingress/email</code> mit <code>from</code>, <code>subject</code> und <code>text</code>.</div>
+        </aside>
+      </div>
+
+      <div class="panel" style="margin-top:16px">
+        <h2 style="margin:0 0 6px;font-size:17px">Aegis Policy</h2>
+        <div class="secretary-row">
+          <div><label>Name</label><input type="text" name="sec_name" value="{esc(settings.get("name"))}"></div>
+          <div><label>Tonfall</label>{_select("sec_tone", settings.get("tone", "warm"), tone_options)}</div>
+          <div><label>Security-Tonfall</label>{_select("sec_jailbreak_tone", settings.get("jailbreak_tone", "firm"), tone_options)}</div>
+          <div><label>Gruppenaktionen</label>{_select("sec_group_actions", settings.get("group_actions", "owner_grant"), group_options)}</div>
+          <div><label>Schulzeit Start</label><input type="text" name="sec_school_start" value="{esc(settings.get("school_start"))}"></div>
+          <div><label>Schulzeit Ende</label><input type="text" name="sec_school_end" value="{esc(settings.get("school_end"))}"></div>
+          <div><label>Nachfragen nach Minuten</label><input type="number" name="sec_confirm_after" min="1" max="240" value="{esc(settings.get("confirm_after_minutes"))}"></div>
+          <div><label>Warten bis Eingriff</label><input type="number" name="sec_wait_after" min="1" max="480" value="{esc(settings.get("wait_after_minutes"))}"></div>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:13px">
+          <label class="secretary-switch"><input type="checkbox" name="sec_enabled"{_checked(settings.get("enabled", True))}> Aegis aktiv</label>
+          <label class="secretary-switch"><input type="checkbox" name="sec_school_direct"{_checked(settings.get("school_direct", True))}> In Schulzeit direkt antworten</label>
+          {weekday_checks}
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:14px">
+          <div><label>Erste Nachricht</label><input type="text" name="sec_intro" value="{esc(settings.get("intro"))}"></div>
+          <div><label>Folge-Header</label><input type="text" name="sec_header" value="{esc(settings.get("header"))}"></div>
+        </div>
+        <button class="btn" type="submit" style="margin-top:14px">Secretary speichern</button>
+      </div>
+    </form>
+
+    <div class="chat-shell" style="height:auto;min-height:640px;margin-top:16px">
       <aside class="chat-side">
-        <div class="side-head"><b>Kanal-Inbox</b><span class="badge b-off">{len(threads)}</span></div>
+        <div class="side-head"><div><small>Live</small><b>Channel Threads</b></div><span class="badge b-off">{len(threads)}</span></div>
         <div class="threads">{''.join(side_rows) or '<div class="arch-note">Noch keine Kanal-Threads.</div>'}</div>
       </aside>
       <section class="chat-main">
         <div class="chat-title">
-          <div><span>{esc(_channel_label(selected.get("channel", "")) if selected else "Inbox")}</span>
-          <h1>{esc(title or active_id or "Inbox")}</h1></div>
+          <div><span>{esc(_channel_label(selected.get("channel", "")) if selected else "Secretary")}</span>
+          <h1>{esc(title or active_id or "Secretary")}</h1></div>
         </div>
         <div class="chat-log">{_render_hub_messages(messages)}</div>
       </section>
     </div>"""
-    return HTMLResponse(page("Inbox", body, active="inbox"))
+    return _html_with_csrf(page("Secretary", body, active="secretary"), token)
+
+
+@router.post("/admin/secretary")
+async def secretary_save(request: Request, _: bool = Depends(auth.require_admin)):
+    form = await request.form()
+    if not await _check_csrf(request, form):
+        return RedirectResponse("/admin/secretary", status_code=303)
+    appset = await _app_settings()
+    current = secretary_settings(appset)
+
+    def intval(name: str, fallback: int) -> int:
+        try:
+            return int(form.get(name) or fallback)
+        except (TypeError, ValueError):
+            return fallback
+
+    channels = {}
+    for ch in ("telegram", "waha", "signal", "email"):
+        channels[ch] = {
+            "enabled": form.get(f"sec_{ch}_enabled") == "on",
+            "mode": str(form.get(f"sec_{ch}_mode") or current["channels"][ch]["mode"]),
+            "label": current["channels"][ch].get("label") or _channel_label(ch),
+            "import_to_chat": ch == "telegram" and form.get("sec_telegram_mode") == "chat_import",
+        }
+    appset["secretary"] = {
+        "enabled": form.get("sec_enabled") == "on",
+        "name": str(form.get("sec_name") or "Aegis"),
+        "tone": str(form.get("sec_tone") or "warm"),
+        "jailbreak_tone": str(form.get("sec_jailbreak_tone") or "firm"),
+        "school_direct": form.get("sec_school_direct") == "on",
+        "school_start": str(form.get("sec_school_start") or "07:30"),
+        "school_end": str(form.get("sec_school_end") or "15:30"),
+        "workdays": [int(v) for v in form.getlist("workday") if str(v).isdigit()],
+        "confirm_after_minutes": intval("sec_confirm_after", 10),
+        "wait_after_minutes": intval("sec_wait_after", 45),
+        "group_actions": str(form.get("sec_group_actions") or "owner_grant"),
+        "intro": str(form.get("sec_intro") or current["intro"]),
+        "header": str(form.get("sec_header") or current["header"]),
+        "channels": channels,
+    }
+    await db.set_setting("app_settings", appset)
+    await db.audit("secretary_settings_saved", actor="owner", detail={"channels": list(channels)})
+    return RedirectResponse("/admin/secretary", status_code=303)
 
 
 # ─── Chat: multi-thread owner agent ────────────────────────────────────────────
@@ -1905,6 +2105,9 @@ def _title_from(text: str) -> str:
 def _normalize_chat(c: dict) -> dict:
     out = _new_chat(c.get("title") or "Neuer Chat")
     out.update({k: c.get(k, out[k]) for k in out})
+    for key in ("source_channel", "source_thread_id", "source_tag"):
+        if key in c:
+            out[key] = c[key]
     out["messages"] = [
         {**_msg(m.get("role", "assistant"), m.get("content", "")), **m}
         for m in (c.get("messages") or [])
@@ -1930,6 +2133,61 @@ async def _chat_store() -> dict:
     ]
     chat = _new_chat(_title_from(messages[0]["content"]) if messages else "Neuer Chat", messages=messages)
     return {"active_id": chat["id"], "chats": [chat]}
+
+
+def _channel_chat_id(thread_id: str) -> str:
+    return "channel_" + hashlib.sha1(thread_id.encode("utf-8")).hexdigest()[:12]
+
+
+def _channel_message(thread_id: str, idx: int, message: dict) -> dict:
+    role = "assistant" if message.get("role") == "assistant" else "user"
+    created = message.get("created_at")
+    seed = f"{thread_id}:{idx}:{message.get('role')}:{message.get('content')}"
+    return {
+        "id": f"m_{hashlib.sha1(seed.encode('utf-8')).hexdigest()[:10]}",
+        "role": role,
+        "content": message.get("content", ""),
+        "ts": created.isoformat() if hasattr(created, "isoformat") else (created or _now_iso()),
+        "source_channel": thread_id.split(":", 1)[0],
+    }
+
+
+async def _sync_channel_threads_into_chats(store: dict) -> None:
+    appset = await _app_settings()
+    sec = secretary_settings(appset)
+    if not sec["channels"].get("telegram", {}).get("import_to_chat", True):
+        return
+    try:
+        threads = await db.list_threads(80)
+    except Exception:  # noqa: BLE001
+        return
+    for t in threads:
+        if t.get("channel") != "telegram":
+            continue
+        tid = t.get("thread_id") or ""
+        if not tid:
+            continue
+        cid = _channel_chat_id(tid)
+        try:
+            messages = await db.recent_messages(tid, 80)
+        except Exception:  # noqa: BLE001
+            messages = []
+        mapped = [_channel_message(tid, i, m) for i, m in enumerate(messages)]
+        existing = next((c for c in store["chats"] if c.get("id") == cid), None)
+        if not existing:
+            existing = _new_chat(t.get("who") or tid, messages=[])
+            existing["id"] = cid
+            existing["source_channel"] = "telegram"
+            existing["source_thread_id"] = tid
+            existing["source_tag"] = "from Telegram"
+            store["chats"].append(existing)
+        existing["title"] = t.get("who") or existing.get("title") or tid
+        existing["source_channel"] = "telegram"
+        existing["source_thread_id"] = tid
+        existing["source_tag"] = "from Telegram"
+        existing["permission_mode"] = "ask"
+        existing["messages"] = mapped
+        existing["updated_at"] = _now_iso()
 
 
 async def _save_chat_store(store: dict) -> None:
@@ -2007,10 +2265,11 @@ def _render_chat_list(store: dict, active_id: str, *, archived: bool = False) ->
             continue
         active = " active" if c["id"] == active_id else ""
         href = f'/admin/chat?{"view=archive&" if archived else ""}chat={esc(c["id"])}'
+        source = f'<span class="source-tag">{esc(c.get("source_tag"))}</span>' if c.get("source_tag") else ""
         thread = (
             f'<a class="thread{active}" href="{href}">'
             f'<span>{esc(c.get("title") or "Neuer Chat")}</span>'
-            f'<small>{len(c.get("messages", []))} Nachrichten · {esc(_mode_label(c.get("permission_mode", "ask")))}</small>'
+            f'<small>{source}{len(c.get("messages", []))} Nachrichten · {esc(_mode_label(c.get("permission_mode", "ask")))}</small>'
             '</a>'
         )
         if archived:
@@ -2102,6 +2361,7 @@ async def chat_page(
     view: str = "",
 ):
     store = await _chat_store()
+    await _sync_channel_threads_into_chats(store)
     archive_view = view == "archive"
     active = _select_chat(store, chat or None, archived=archive_view)
     await _save_chat_store(store)
@@ -2110,6 +2370,7 @@ async def chat_page(
     mode = (active or {}).get("permission_mode", "ask")
     active_id = (active or {}).get("id", "")
     title = (active or {}).get("title") or "Archiv"
+    source_tag = (active or {}).get("source_tag")
     mode_cls = mode if mode in ("ask", "auto", "bypass") else "auto"
     autonomy_cls = autonomy if autonomy in ("ask", "confident", "full") else "ask"
     active_count = sum(1 for c in store["chats"] if not c.get("archived"))
@@ -2178,7 +2439,7 @@ async def chat_page(
       </aside>
       <section class="chat-main">
         <div class="chat-title">
-          <div><span>{"Archivierter Thread" if archive_view else "Thread"}</span><h1>{esc(title)}</h1>
+          <div><span>{"Archivierter Thread" if archive_view else "Thread"}</span><h1>{esc(title)} {f'<span class="source-tag">{esc(source_tag)}</span>' if source_tag else ''}</h1>
             <div class="chat-state">
               <span class="mode-pill mode-{esc(mode_cls)}">{esc(_mode_label(mode))}</span>
               <span class="mode-pill autonomy-{esc(autonomy_cls)}">Autonomie {esc(autonomy)}</span>
@@ -2947,7 +3208,10 @@ async def updates_page(request: Request, _: bool = Depends(auth.require_admin)):
           <h2 style="margin:0 0 6px;font-size:15px">Manuelles Update</h2>
           <p class="note" style="margin:0 0 8px">Auf dem Server im Terminal ausführen:</p>
           <pre style="background:var(--bg-2);border:1px solid var(--border);border-radius:var(--r-sm);
-            padding:12px 14px;font-family:'JetBrains Mono',monospace;font-size:13px;overflow-x:auto;margin:0">cd /opt/astra &amp;&amp; git pull origin main &amp;&amp; docker compose up -d --build cortex</pre>
+            padding:12px 14px;font-family:'JetBrains Mono',monospace;font-size:13px;overflow-x:auto;margin:0">cd /opt/astra &amp;&amp; git pull --ff-only origin main &amp;&amp; docker compose up -d --build cortex
+
+# Falls der Server divergiert ist:
+cd /opt/astra &amp;&amp; git fetch --tags origin main &amp;&amp; git branch server-backup/$(date -u +%Y%m%d-%H%M%S) HEAD &amp;&amp; git reset --hard origin/main &amp;&amp; docker compose up -d --build cortex</pre>
         </div>
 
     </div>
@@ -3065,6 +3329,8 @@ async def updates_page(request: Request, _: bool = Depends(auth.require_admin)):
             mainUpdateBtn.textContent = d.update_available ? 'Update starten' : d.dirty ? 'Lokale Änderungen' : 'Aktuell';
             if (d.dirty) {{
                 cardSubtitle.textContent = 'Getrackte lokale Git-Änderungen blockieren Pulls. Erst committen/stashen/aufräumen.';
+            }} else if (d.diverged) {{
+                cardSubtitle.textContent += ' · Divergenz erkannt: ASTRA legt beim Update eine Backup-Branch an und synchronisiert origin/main.';
             }} else if (d.untracked_count) {{
                 cardSubtitle.textContent += ` · ${{d.untracked_count}} ungetrackte Datei(en) ignoriert.`;
             }}

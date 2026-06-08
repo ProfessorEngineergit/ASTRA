@@ -139,11 +139,21 @@ async def _handle_tg_update(
         else:
             # Unrecognised button — forward as text from the owner
             text = cb.get("message", {}).get("text") or data
+            chat = (cb.get("message") or {}).get("chat") or {}
+            chat_type = chat.get("type", "private")
+            is_group = chat_type in {"group", "supergroup"}
             await brain.handle_inbound(
                 channel="telegram",
-                sender_handle=sender_id,
+                sender_handle=str(chat.get("id") or sender_id) if is_group else sender_id,
                 text=text,
-                sender_display=_tg_display(cb["from"]),
+                sender_display=chat.get("title") if is_group else _tg_display(cb["from"]),
+                thread_meta={
+                    "is_group": is_group,
+                    "chat_type": chat_type,
+                    "participant_handle": sender_id,
+                    "participant_display": _tg_display(cb["from"]),
+                    "source_tag": "from Telegram",
+                },
             )
         return
 
@@ -162,11 +172,21 @@ async def _handle_tg_update(
 
         sender = msg["from"]
         sender_id = str(sender["id"])
+        chat = msg.get("chat") or {}
+        chat_type = chat.get("type", "private")
+        is_group = chat_type in {"group", "supergroup"}
         await brain.handle_inbound(
             channel="telegram",
-            sender_handle=sender_id,
+            sender_handle=str(chat.get("id") or sender_id) if is_group else sender_id,
             text=text,
-            sender_display=_tg_display(sender),
+            sender_display=chat.get("title") if is_group else _tg_display(sender),
+            thread_meta={
+                "is_group": is_group,
+                "chat_type": chat_type,
+                "participant_handle": sender_id,
+                "participant_display": _tg_display(sender),
+                "source_tag": "from Telegram",
+            },
         )
 
 
@@ -386,10 +406,12 @@ async def ingress_waha(
 
     from_jid: str = payload.get("from", "")
     from_me: bool = bool(payload.get("fromMe", False))
+    raw_data = payload.get("_data") or {}
 
     # WhatsApp JID looks like "4915212345678@c.us" — use as handle
     sender_handle = from_jid
-    display_name: str | None = (payload.get("_data") or {}).get("notifyName")
+    display_name: str | None = raw_data.get("chatName") or raw_data.get("notifyName")
+    is_group = from_jid.endswith("@g.us")
 
     await brain.handle_inbound(
         channel="waha",
@@ -397,6 +419,13 @@ async def ingress_waha(
         text=text,
         sender_display=display_name,
         force_owner=from_me,   # fromMe=True → owner sent this himself
+        thread_meta={
+            "is_group": is_group,
+            "group_id": from_jid if is_group else None,
+            "participant_handle": payload.get("participant") or raw_data.get("participant"),
+            "participant_display": raw_data.get("notifyName"),
+            "source_tag": "from WhatsApp",
+        },
     )
     return {"ok": True}
 
@@ -437,12 +466,23 @@ async def ingress_signal(
         return {"ok": True, "skipped": "no source"}
 
     display_name: str | None = envelope.get("sourceName")
+    group_info = data_msg.get("groupInfo") or {}
+    group_id = group_info.get("groupId") or group_info.get("group_id")
+    is_group = bool(group_id)
 
     await brain.handle_inbound(
         channel="signal",
-        sender_handle=sender_handle,
+        sender_handle=group_id or sender_handle,
         text=text,
-        sender_display=display_name,
+        sender_display=group_info.get("name") or display_name,
+        thread_meta={
+            "is_group": is_group,
+            "group_id": group_id,
+            "group_name": group_info.get("name"),
+            "participant_handle": sender_handle,
+            "participant_display": display_name,
+            "source_tag": "from Signal",
+        },
     )
     return {"ok": True}
 
@@ -470,5 +510,6 @@ async def ingress_email(
         sender_handle=sender_handle,
         text=content,
         sender_display=body.get("name") or sender_handle,
+        thread_meta={"source_tag": "from Mail"},
     )
     return {"ok": True}

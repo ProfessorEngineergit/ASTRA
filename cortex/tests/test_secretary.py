@@ -4,7 +4,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from app.policy import Mode, Sensitivity
-from app.secretary import plan_for, with_secretary_header
+from app.secretary import plan_for, tone_instruction, with_secretary_header
 
 
 def test_secretary_auto_replies_during_school_window_for_waha_defer():
@@ -44,3 +44,27 @@ def test_secretary_header_intro_then_short_header():
     assert with_secretary_header("Hallo", first_interaction=False, app_settings=app_settings).startswith(
         "--ASTRA--"
     )
+
+
+def test_secretary_group_requires_owner_grant_by_default():
+    plan = plan_for(
+        channel="waha",
+        mode=Mode.AUTO,
+        max_sensitivity=Sensitivity.FREEBUSY,
+        app_settings={"secretary": {"enabled": True}},
+        timezone="Europe/Berlin",
+        now=datetime(2026, 6, 8, 10, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+        is_group=True,
+    )
+
+    assert plan.mode == Mode.ASK
+    assert plan.reason == "group-action-requires-owner-grant"
+
+
+def test_secretary_security_watch_uses_thread_local_firm_tone():
+    text = tone_instruction(
+        {"secretary": {"tone": "warm", "jailbreak_tone": "firm"}},
+        {"security_watch": True},
+    )
+
+    assert "distanziert" in text
