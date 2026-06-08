@@ -10,6 +10,8 @@ from datetime import time
 from app import tools
 from app.config_store import get_config_store
 from app.plugins.builtin.edupage import EduPagePlugin
+from app.plugins.builtin.google_calendar import GoogleCalendarPlugin
+from app.plugins.builtin.google_tasks import GoogleTasksPlugin
 from app.plugins.builtin.home_assistant import HomeAssistantPlugin
 from app.plugins.registry import _discover_classes, get_manager
 from app.tools import ToolContext
@@ -114,6 +116,63 @@ def test_home_assistant_read_tools_search_and_areas(monkeypatch):
     }, ctx))
     assert "Wohnzimmer Temperatur" in area
     assert {"home_assistant_state", "search_home_assistant", "list_home_assistant_areas"} <= set(tool_map)
+
+
+def test_google_tasks_native_add_uses_tasks_api(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def json(self):
+            return {"id": "task1", "title": "Mathe"}
+
+    async def fake_google_api(plugin, method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setattr("app.plugins.builtin.google_tasks.google_api", fake_google_api)
+    plugin = GoogleTasksPlugin({
+        "__enabled": True,
+        "backend": "native",
+        "client_id": "cid",
+        "client_secret": "sec",
+        "refresh_token": "ref",
+        "list": "@default",
+    })
+
+    result = asyncio.run(plugin.add("Mathe", notes="S. 42"))
+
+    assert result["id"] == "task1"
+    assert calls[0][0] == "POST"
+    assert "tasks.googleapis.com/tasks/v1/lists/%40default/tasks" in calls[0][1]
+    assert calls[0][2]["json"]["notes"] == "S. 42"
+
+
+def test_google_calendar_native_today_uses_calendar_api(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def json(self):
+            return {"items": [{"summary": "Schule", "start": {"dateTime": "2026-06-08T08:00:00+02:00"}}]}
+
+    async def fake_google_api(plugin, method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setattr("app.plugins.builtin.google_calendar.google_api", fake_google_api)
+    plugin = GoogleCalendarPlugin({
+        "__enabled": True,
+        "backend": "native",
+        "client_id": "cid",
+        "client_secret": "sec",
+        "refresh_token": "ref",
+        "calendar_id": "primary",
+    })
+
+    events = asyncio.run(plugin.today())
+
+    assert events[0]["summary"] == "Schule"
+    assert calls[0][0] == "GET"
+    assert "www.googleapis.com/calendar/v3/calendars/primary/events" in calls[0][1]
 
 
 def test_edupage_auto_scans_for_next_lesson(monkeypatch):

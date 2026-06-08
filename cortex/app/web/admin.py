@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from shutil import which
@@ -17,6 +18,7 @@ from .. import __version__ as ASTRA_VERSION
 from .. import db, sysinfo
 from ..config import get_settings
 from ..config_store import SECRET_SENTINEL, get_config_store
+from ..google_oauth import authorization_url, exchange_code, token_patch, user_email
 from ..plugins.base import CATEGORY_LABELS, FieldType
 from ..plugins.registry import get_manager
 from . import auth
@@ -847,6 +849,22 @@ async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.requir
             f'<span>{esc(state)} · {esc(p.runtime_slug)}</span></a>'
         )
     create_href = f"/admin/plugin/{esc(slug)}/installation/new"
+    oauth_html = ""
+    scopes = getattr(cls, "google_scopes", [])
+    if scopes:
+        connected = active_inst.get("account_email") or ("Token gesetzt" if meta.get("refresh_token") else "nicht verbunden")
+        oauth_html = f"""
+        <div class="panel" style="margin-top:14px">
+          <div class="row" style="justify-content:space-between;align-items:center">
+            <div><h2 style="margin:0;font-size:16px">Google OAuth</h2>
+              <div class="note">Status: {esc(connected)} · Redirect: {esc(str(request.url_for("oauth_google_callback")))}</div></div>
+            <form method="post" action="/admin/plugin/{esc(slug)}/oauth/google/start" style="margin:0">
+              <input type="hidden" name="csrf" value="{esc(token)}">
+              <input type="hidden" name="installation_id" value="{esc(active_inst.installation_id)}">
+              <button class="btn sm" type="submit">Mit Google verbinden</button>
+            </form>
+          </div>
+        </div>"""
     test_btn = ('' if soon else
                 '<button class="btn secondary" type="button" id="testbtn">Verbindung testen</button>'
                 '<span id="testresult" class="note"></span>')
@@ -855,7 +873,7 @@ async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.requir
     <script>
       document.getElementById('testbtn').onclick=async()=>{{
         const out=document.getElementById('testresult'); out.textContent='Teste…';
-        const fd=new FormData(document.querySelector('form'));
+        const fd=new FormData(document.getElementById('plugin-config-form'));
         fd.set('installation_id','{esc(active_inst.installation_id)}');
         const r=await fetch('/admin/plugin/{esc(slug)}/test',{{method:'POST',body:fd}});
         const d=await r.json();
@@ -902,7 +920,8 @@ async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.requir
       </div>
       <div class="install-grid">{''.join(install_rows)}</div>
     </div>
-    <form method="post" action="/admin/plugin/{esc(slug)}">
+    {oauth_html}
+    <form id="plugin-config-form" method="post" action="/admin/plugin/{esc(slug)}">
       <input type="hidden" name="csrf" value="{esc(token)}">
       <input type="hidden" name="installation_id" value="{esc(active_inst.installation_id)}">
       <div class="panel" style="margin-top:14px">
@@ -1008,6 +1027,87 @@ async def plugin_test(slug: str, request: Request, _: bool = Depends(auth.requir
         return JSONResponse({"state": status.state.value, "message": status.message})
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"state": "error", "message": str(e)})
+
+
+def _config_values_from_cfg(cls, cfg: dict) -> dict:
+    return {f.key: cfg.get(f.key, f.default) for f in cls.config_fields}
+
+
+@router.post("/admin/plugin/{slug}/oauth/google/start")
+async def plugin_google_oauth_start(slug: str, request: Request, _: bool = Depends(auth.require_admin)):
+    mgr = get_manager()
+    cls = mgr.plugin_class(slug)
+    if not cls or not getattr(cls, "google_scopes", None):
+        return RedirectResponse(f"/admin/plugin/{slug}", status_code=303)
+    form = await request.form()
+    if not await _check_csrf(request, form):
+        return RedirectResponse(f"/admin/plugin/{slug}", status_code=303)
+    install_id = str(form.get("installation_id") or "default")
+    store = get_config_store()
+    cfg = next(
+        (i for i in await store.load_installations(cls) if i.get("__installation_id") == install_id),
+        await store.load(cls),
+    )
+    client_id = str(cfg.get("client_id") or "").strip()
+    client_secret = str(cfg.get("client_secret") or "").strip()
+    if not client_id or not client_secret:
+        return RedirectResponse(f"/admin/plugin/{slug}?installation={install_id}&oauth=missing_client", status_code=303)
+    state = secrets.token_urlsafe(24)
+    await db.set_setting(f"oauth_state:{state}", {
+        "provider": "google",
+        "slug": slug,
+        "installation_id": install_id,
+        "redirect_uri": str(request.url_for("oauth_google_callback")),
+        "ts": _now_iso(),
+    })
+    url = authorization_url(
+        client_id=client_id,
+        redirect_uri=str(request.url_for("oauth_google_callback")),
+        scopes=list(getattr(cls, "google_scopes", [])),
+        state=state,
+    )
+    return RedirectResponse(url, status_code=303)
+
+
+@router.get("/admin/oauth/google/callback", name="oauth_google_callback")
+async def oauth_google_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    if error:
+        return HTMLResponse(page("OAuth", f'<div class="flash err">Google OAuth: {esc(error)}</div>'), 400)
+    state_data = await db.get_setting(f"oauth_state:{state}", None)
+    if not state_data or state_data.get("provider") != "google":
+        return HTMLResponse(page("OAuth", '<div class="flash err">OAuth-State ungueltig oder abgelaufen.</div>'), 400)
+    mgr = get_manager()
+    cls = mgr.plugin_class(state_data.get("slug", ""))
+    if not cls:
+        return HTMLResponse(page("OAuth", '<div class="flash err">Plugin nicht gefunden.</div>'), 404)
+    store = get_config_store()
+    install_id = str(state_data.get("installation_id") or "default")
+    cfg = next(
+        (i for i in await store.load_installations(cls) if i.get("__installation_id") == install_id),
+        await store.load(cls),
+    )
+    try:
+        token_data = await exchange_code(
+            client_id=str(cfg.get("client_id") or ""),
+            client_secret=str(cfg.get("client_secret") or ""),
+            code=code,
+            redirect_uri=str(state_data.get("redirect_uri") or request.url_for("oauth_google_callback")),
+        )
+        email = await user_email(str(token_data.get("access_token") or ""))
+    except Exception as e:  # noqa: BLE001
+        return HTMLResponse(page("OAuth", f'<div class="flash err">Token-Austausch fehlgeschlagen: {esc(e)}</div>'), 400)
+    values = _config_values_from_cfg(cls, cfg)
+    values.update(token_patch(token_data, email=email))
+    saved_id = await store.save_installation(
+        cls,
+        install_id,
+        values,
+        bool(cfg.get("__instance_enabled", cfg.get("__enabled"))),
+        name=str(cfg.get("__installation_name") or "Standard"),
+    )
+    await mgr.rebuild()
+    await db.audit("oauth_connected", actor="owner", detail={"provider": "google", "plugin": cls.slug})
+    return RedirectResponse(f"/admin/plugin/{cls.slug}?installation={saved_id}&saved=1", status_code=303)
 
 
 @router.post("/admin/favorite/{slug}")

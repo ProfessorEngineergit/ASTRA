@@ -73,6 +73,22 @@ def test_login_required_for_plugin_config(memdb):
     assert r.status_code == 303 and r.headers["location"] == "/admin/login"
 
 
+def test_google_plugin_page_shows_oauth_connect(memdb):
+    _prime_manager()
+    c = TestClient(_app())
+    r = c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+
+    r = c.get("/admin/plugin/google_tasks")
+
+    assert r.status_code == 200
+    assert "Google OAuth" in r.text
+    assert "Mit Google verbinden" in r.text
+    assert "/admin/plugin/google_tasks/oauth/google/start" in r.text
+
+
 def test_settings_labs_and_region_save(memdb):
     _prime_manager()
     c = TestClient(_app())
