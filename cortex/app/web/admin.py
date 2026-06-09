@@ -1946,7 +1946,7 @@ def _field(name: str, label: str, value: str = "", *, placeholder: str = "", typ
     )
 
 
-def _channel_setup_fields(channel: str, inst: dict) -> str:
+def _channel_setup_fields(channel: str, inst: dict, connected: bool = False) -> str:
     # Auto-fill the boring technical values from the known Docker service config,
     # so the owner normally only has to scan the QR.
     s = get_settings()
@@ -1954,16 +1954,29 @@ def _channel_setup_fields(channel: str, inst: dict) -> str:
         base = inst.get("base_url") or s.waha_base_url or "http://waha:3000"
         session = inst.get("session") or s.waha_session or "default"
         api_key = inst.get("api_key") or s.waha_api_key or ""
+        if connected:
+            pairing = (
+                '<div class="pairing-panel primary is-connected" data-waha-pairing data-connected="1">'
+                '<div><b>✓ WhatsApp verbunden</b><span>Diese Session ist mit deinem WhatsApp-Profil '
+                'gekoppelt. ASTRA empfängt und beantwortet Nachrichten gemäß deiner Policy.</span></div>'
+                '<div class="pairing-actions">'
+                '<button class="btn sm ghost" type="button" data-waha-qr>Neu koppeln (QR)</button></div>'
+                '<div class="qr-box" data-qr-box></div></div>'
+            )
+        else:
+            pairing = (
+                '<div class="pairing-panel primary" data-waha-pairing>'
+                '<div><b>WhatsApp verbinden</b><span>1 · Session starten &nbsp;→&nbsp; 2 · in WhatsApp unter '
+                '<i>Verknüpfte Geräte</i> den QR scannen. Server, Key &amp; Session sind schon '
+                'automatisch gesetzt — mehr brauchst du nicht.</span></div>'
+                '<div class="pairing-actions">'
+                '<button class="btn sm" type="button" data-waha-start>1 · Session starten</button>'
+                '<button class="btn sm" type="button" data-waha-qr>2 · QR anzeigen</button></div>'
+                '<div class="qr-box" data-qr-box></div></div>'
+            )
         return (
-            '<div class="pairing-panel primary" data-waha-pairing>'
-            '<div><b>WhatsApp verbinden</b><span>1 · Session starten &nbsp;→&nbsp; 2 · in WhatsApp unter '
-            '<i>Verknüpfte Geräte</i> den QR scannen. Server, Key &amp; Session sind schon '
-            'automatisch gesetzt — mehr brauchst du nicht.</span></div>'
-            '<div class="pairing-actions">'
-            '<button class="btn sm" type="button" data-waha-start>1 · Session starten</button>'
-            '<button class="btn sm" type="button" data-waha-qr>2 · QR anzeigen</button></div>'
-            '<div class="qr-box" data-qr-box></div></div>'
-            '<details class="adv"><summary>Erweiterte Einstellungen (automatisch befüllt)</summary>'
+            pairing
+            + '<details class="adv"><summary>Erweiterte Einstellungen (automatisch befüllt)</summary>'
             '<div class="install-fields">'
             + _field("sec_waha_title", "Titel", inst.get("title", ""), placeholder="WhatsApp via WAHA")
             + _field("sec_waha_base_url", "WAHA Base URL", base, placeholder="http://waha:3000")
@@ -2033,21 +2046,30 @@ def _secretary_channel_card(channel: str, cfg: dict, inst: dict) -> str:
         "email": "Mail-Ingress: /ingress/email fuer normalisierte IMAP/Gmail-Events. Senden bleibt bestaetigungspflichtig.",
     }[channel]
     setup_store = cfg.get("_setup_store") or {}
+    live = cfg.get("_live") or {}
+    connected = bool(live.get("connected"))
     meta = SECRETARY_CHANNEL_SETUP[channel]
     status = "konfiguriert" if any(inst.get(k) for k in ("base_url", "imap_host", "bot_token")) else "offen"
+    if connected:
+        status = "verbunden" + (f" · {live.get('me')}" if live.get("me") else "")
+    if connected:
+        tag = '<span class="source-tag" style="color:#34d399;border-color:#34d399">verbunden</span>'
+    else:
+        tag = f'<span class="source-tag">{"aktiv" if cfg.get("enabled") else "aus"}</span>'
+    setup_label = "Verbindung verwalten" if connected else "Einrichten"
     return f"""
-      <div class="secretary-card install-card" data-install="{esc(channel)}">
+      <div class="secretary-card install-card{' is-connected' if connected else ''}" data-install="{esc(channel)}">
         <div class="install-head">
           <div><span>{esc(meta["kind"])}</span><h3>{esc(inst.get("title") or meta["title"])}</h3></div>
-          <span class="source-tag">{'aktiv' if cfg.get("enabled") else 'aus'}</span>
+          {tag}
         </div>
         <p>{esc(setup)}</p>
         <div class="install-actions">
-          <button class="btn sm" type="button" data-open-setup="{esc(channel)}">Einrichten</button>
+          <button class="btn sm" type="button" data-open-setup="{esc(channel)}">{esc(setup_label)}</button>
           <span class="mini">{esc(status)} · {esc(meta["summary"])}</span>
         </div>
         <div class="install-config" data-config="{esc(channel)}">
-          {_channel_setup_fields(channel, inst)}
+          {_channel_setup_fields(channel, inst, connected=connected)}
           <div class="install-policy">
             <label class="secretary-switch">
               <input type="checkbox" name="sec_{esc(channel)}_enabled"{_checked(bool(cfg.get("enabled")))}>
@@ -2094,8 +2116,23 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
     token = await auth.issue_csrf()
     setup_store = await db.get_setting("secretary_setup_chats", {}) or {}
     installations = _secretary_installations(settings)
+    live_status = {}
+    try:
+        s = get_settings()
+        w = installations["waha"]
+        live_status["waha"] = await _waha_session_status(
+            w.get("base_url") or s.waha_base_url or "http://waha:3000",
+            w.get("session") or s.waha_session or "default",
+            w.get("api_key") or s.waha_api_key or "",
+        )
+    except Exception:  # noqa: BLE001
+        live_status["waha"] = {"ok": False, "connected": False}
     channel_cards = "".join(
-        _secretary_channel_card(ch, {**settings["channels"][ch], "_setup_store": setup_store}, installations[ch])
+        _secretary_channel_card(
+            ch,
+            {**settings["channels"][ch], "_setup_store": setup_store, "_live": live_status.get(ch) or {}},
+            installations[ch],
+        )
         for ch in SECRETARY_SETUP_CHANNELS
     )
     workdays = {int(v) for v in (settings.get("workdays") or []) if str(v).isdigit()}
@@ -2233,9 +2270,27 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
           method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(formContext('waha'))
         }});
         const d = await r.json();
-        if (d.image) box.innerHTML = `<img src="${{d.image}}" alt="WhatsApp QR"><small>${{d.source || ''}}</small>`;
-        else box.textContent = d.message || d.error || 'Kein QR verfuegbar.';
+        if (d.image) {{
+          box.innerHTML = `<img src="${{d.image}}" alt="WhatsApp QR"><small>Nach dem Scannen bestätigt sich die Verbindung automatisch…</small>`;
+          pollWahaStatus();
+        }} else box.textContent = d.message || d.error || 'Kein QR verfuegbar.';
       }};
+      let wahaPoll = null;
+      function pollWahaStatus() {{
+        if (wahaPoll) return;
+        let tries = 0;
+        wahaPoll = setInterval(async () => {{
+          tries++;
+          try {{
+            const r = await fetch('/admin/secretary/waha/status', {{
+              method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(formContext('waha'))
+            }});
+            const d = await r.json();
+            if (d.connected) {{ clearInterval(wahaPoll); wahaPoll = null; location.reload(); }}
+          }} catch (e) {{}}
+          if (tries > 40) {{ clearInterval(wahaPoll); wahaPoll = null; }}
+        }}, 3000);
+      }}
       const startBtn = document.querySelector('[data-waha-start]');
       if (startBtn) startBtn.onclick = async () => {{
         const box = document.querySelector('[data-qr-box]');
@@ -2325,7 +2380,60 @@ async def secretary_save(request: Request, _: bool = Depends(auth.require_admin)
     }
     await db.set_setting("app_settings", appset)
     await db.audit("secretary_settings_saved", actor="owner", detail={"channels": list(channels)})
+    try:
+        await _mirror_secretary_to_plugins(installations, channels)
+    except Exception:  # noqa: BLE001
+        log.warning("Secretary→Plugin mirror failed", exc_info=True)
     return RedirectResponse("/admin/secretary", status_code=303)
+
+
+async def _mirror_secretary_to_plugins(installations: dict, channels: dict) -> None:
+    """Propagate Secretary channel credentials into the normal plugin store so the
+    standard ASTRA agent can use the same accounts. Only channels that have a native
+    plugin counterpart are mirrored (Slack, IMAP, SMTP)."""
+    store = get_config_store()
+    changed = False
+
+    slack = installations.get("slack") or {}
+    if (slack.get("bot_token") or "").strip():
+        from ..plugins.builtin.slack import SlackPlugin
+        await store.save(
+            SlackPlugin,
+            {"bot_token": slack.get("bot_token", ""),
+             "default_channel": slack.get("default_channel") or "#general"},
+            enabled=bool(channels.get("slack", {}).get("enabled")),
+        )
+        changed = True
+
+    email = installations.get("email") or {}
+    email_enabled = bool(channels.get("email", {}).get("enabled"))
+    if (email.get("imap_host") or "").strip():
+        from ..plugins.builtin.imap_email import ImapEmailPlugin
+        await store.save(
+            ImapEmailPlugin,
+            {"host": email.get("imap_host", ""),
+             "port": email.get("imap_port") or "993",
+             "username": email.get("imap_user", ""),
+             "mailbox": email.get("imap_mailbox") or "INBOX"},
+            enabled=email_enabled,
+        )
+        changed = True
+    if (email.get("smtp_host") or "").strip():
+        from ..plugins.builtin.smtp_mail import SmtpPlugin
+        await store.save(
+            SmtpPlugin,
+            {"email": email.get("from_address") or email.get("smtp_user") or "",
+             "host": email.get("smtp_host", ""),
+             "port": email.get("smtp_port") or "465"},
+            enabled=email_enabled,
+        )
+        changed = True
+
+    if changed:
+        try:
+            await get_manager().rebuild()
+        except Exception:  # noqa: BLE001
+            log.debug("manager rebuild after secretary mirror failed", exc_info=True)
 
 
 def _setup_fallback_reply(channel: str, message: str) -> str:
@@ -2444,6 +2552,32 @@ async def _waha_request(base_url: str, path: str, *, api_key: str = "", method: 
     }
 
 
+_WAHA_CONNECTED_STATES = {"WORKING", "CONNECTED", "AUTHENTICATED"}
+
+
+async def _waha_session_status(base_url: str, session: str, api_key: str) -> dict:
+    """Query WAHA for the live session state. connected == True means a phone is paired."""
+    result = await _waha_request(base_url, f"/api/sessions/{session}", api_key=api_key)
+    if not result.get("ok"):
+        return {"ok": False, "connected": False, "state": "", "me": "",
+                "message": result.get("text") or result.get("message") or ""}
+    try:
+        data = json.loads(result.get("text") or "{}")
+    except json.JSONDecodeError:
+        data = {}
+    state = str(data.get("status") or data.get("state") or "").upper()
+    me = data.get("me") or {}
+    label = ""
+    if isinstance(me, dict):
+        label = me.get("pushName") or me.get("id") or ""
+    return {
+        "ok": True,
+        "connected": state in _WAHA_CONNECTED_STATES,
+        "state": state,
+        "me": str(label),
+    }
+
+
 def _image_payload(result: dict, *, source: str) -> dict | None:
     content_type = result.get("content_type", "")
     content = result.get("content") or b""
@@ -2474,6 +2608,16 @@ async def secretary_waha_start(request: Request, _: bool = Depends(auth.require_
     if result["ok"]:
         return JSONResponse({"ok": True, "message": f"WAHA-Session {session} wurde gestartet."})
     return JSONResponse({"ok": False, "message": result.get("text") or result.get("message") or "Start fehlgeschlagen."})
+
+
+@router.post("/admin/secretary/waha/status")
+async def secretary_waha_status(request: Request, _: bool = Depends(auth.require_admin)):
+    data = await request.json()
+    s = get_settings()
+    base_url = str(data.get("waha_base_url") or data.get("base_url") or s.waha_base_url or "http://waha:3000")
+    session = str(data.get("waha_session") or data.get("session") or s.waha_session or "default")
+    api_key = str(data.get("waha_api_key") or data.get("api_key") or s.waha_api_key or "")
+    return JSONResponse(await _waha_session_status(base_url, session, api_key))
 
 
 @router.post("/admin/secretary/waha/qr")
