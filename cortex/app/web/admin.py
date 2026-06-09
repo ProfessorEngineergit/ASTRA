@@ -652,6 +652,9 @@ def _card_html(p, is_fav: bool, installation_count: int = 1) -> str:
         f'<span class="badge b-off">{installation_count} Installationen</span>'
         if installation_count > 1 else ""
     )
+    # Messenger plugins double as Secretary channels — flag them.
+    sec_tag = ('<span class="tag-katalog" title="Auch als Secretary-Kanal nutzbar">Secretary</span>'
+               if getattr(p.category, "value", "") == "comms" else "")
     return f"""
         <div class="card {'on' if p.enabled else ''}"
              data-slug="{esc(p.slug)}"
@@ -661,7 +664,7 @@ def _card_html(p, is_fav: bool, installation_count: int = 1) -> str:
           <div class="top">
             {icon_html(p.slug, p.icon)}
             <div class="meta">
-              <h3>{esc(p.name)} <span class="tag-nativ">nativ</span></h3>
+              <h3>{esc(p.name)} <span class="tag-nativ">nativ</span>{sec_tag}</h3>
               <div class="cat">{cat_label}</div>
             </div>
             <button class="star {'on' if is_fav else ''}" data-slug="{esc(p.slug)}"
@@ -1816,7 +1819,7 @@ def _select(name: str, value: str, options: list[tuple[str, str]]) -> str:
     return f'<select name="{esc(name)}">{opts}</select>'
 
 
-SECRETARY_SETUP_CHANNELS = ("waha", "signal", "email")
+SECRETARY_SETUP_CHANNELS = ("waha", "signal", "slack", "email")
 SECRETARY_CHANNEL_SETUP = {
     "waha": {
         "title": "WhatsApp via WAHA",
@@ -1827,6 +1830,11 @@ SECRETARY_CHANNEL_SETUP = {
         "title": "Signal",
         "kind": "Signal",
         "summary": "signal-cli-rest-api, Account und Gruppenmetadaten.",
+    },
+    "slack": {
+        "title": "Slack",
+        "kind": "Slack",
+        "summary": "Bot-Token, Standard-Kanal und Freigabegrenzen.",
     },
     "email": {
         "title": "Mail",
@@ -1853,6 +1861,13 @@ def _secretary_installations(settings: dict) -> dict:
             "base_url": "",
             "account": "",
             "webhook_url": "/ingress/signal",
+            "status": "not_configured",
+        },
+        "slack": {
+            "title": "Slack",
+            "bot_token": "",
+            "default_channel": "#general",
+            "webhook_url": "/ingress/slack",
             "status": "not_configured",
         },
         "email": {
@@ -1974,6 +1989,19 @@ def _channel_setup_fields(channel: str, inst: dict) -> str:
             + _field("sec_signal_webhook", "ASTRA Webhook", inst.get("webhook_url", "/ingress/signal"))
             + "</div></details>"
         )
+    if channel == "slack":
+        return (
+            '<div class="pairing-panel primary">'
+            '<div><b>Slack verbinden</b><span>Auf api.slack.com eine App anlegen, Bot-Token '
+            '(<code>xoxb-…</code>, Scope <code>chat:write</code>) hier eintragen. Eingehende Nachrichten '
+            'laufen über die Slack Events API auf <code>/ingress/slack</code>.</span></div></div>'
+            '<details class="adv" open><summary>Slack-Zugang</summary><div class="install-fields">'
+            + _field("sec_slack_title", "Titel", inst.get("title", ""), placeholder="Slack")
+            + _field("sec_slack_bot_token", "Bot-Token (xoxb-…)", inst.get("bot_token", ""), placeholder="xoxb-…")
+            + _field("sec_slack_channel", "Standard-Kanal", inst.get("default_channel", "#general"), placeholder="#general")
+            + _field("sec_slack_webhook", "ASTRA Webhook", inst.get("webhook_url", "/ingress/slack"))
+            + "</div></details>"
+        )
     return (
         '<details class="adv" open><summary>IMAP / SMTP einrichten</summary><div class="install-fields">'
         + _field("sec_email_title", "Titel", inst.get("title", ""), placeholder="Mail")
@@ -1995,16 +2023,18 @@ def _secretary_channel_card(channel: str, cfg: dict, inst: dict) -> str:
     mode_options = {
         "waha": [("school_direct", "Schulzeit direkt"), ("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
         "signal": [("school_direct", "Schulzeit direkt"), ("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
+        "slack": [("school_direct", "Schulzeit direkt"), ("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
         "email": [("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
     }[channel]
     setup = {
         "waha": "WAHA Webhook: /ingress/waha mit X-Astra-Secret. Gruppen werden standardmaessig nur nach Freigabe bearbeitet.",
         "signal": "signal-cli-rest-api Webhook: /ingress/signal mit X-Astra-Secret. groupInfo aktiviert Gruppenschutz.",
+        "slack": "Slack-Bot (xoxb-Token, Scope chat:write). Eingang via Slack Events API auf /ingress/slack.",
         "email": "Mail-Ingress: /ingress/email fuer normalisierte IMAP/Gmail-Events. Senden bleibt bestaetigungspflichtig.",
     }[channel]
     setup_store = cfg.get("_setup_store") or {}
     meta = SECRETARY_CHANNEL_SETUP[channel]
-    status = "konfiguriert" if any(inst.get(k) for k in ("base_url", "imap_host")) else "offen"
+    status = "konfiguriert" if any(inst.get(k) for k in ("base_url", "imap_host", "bot_token")) else "offen"
     return f"""
       <div class="secretary-card install-card" data-install="{esc(channel)}">
         <div class="install-head">
@@ -2082,18 +2112,13 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
     </div>
     <form method="post" action="/admin/secretary">
       <input type="hidden" name="csrf" value="{esc(token)}">
-      <div class="secretary-grid">
-        <section class="panel">
-          <h2 style="margin:0 0 6px;font-size:17px">Kanäle</h2>
-          <p class="note" style="margin:0 0 14px">Jede Installation hat eigene Zugangsdaten, Pairing und Policy. Klicke auf Einrichten, dann coacht ASTRA rechts mit Blick auf diese Felder.</p>
-          <div class="secretary-cards">{channel_cards}</div>
-        </section>
-        <aside class="setup-chat setup-coach" id="setupCoach">
-          <div class="setup-bubble"><strong>ASTRA Setup Coach</strong><br><span id="coachIntro">Wähle links WhatsApp, Signal oder Mail. ASTRA sieht dann die aktuellen Felder und kann gezielt helfen.</span></div>
-          <div class="setup-bubble" id="coachAwareness"><strong>On-screen</strong><br>Noch keine Installation ausgewählt.</div>
-          <div class="setup-bubble"><strong>Ingress</strong><br><code>/ingress/waha</code>, <code>/ingress/signal</code>, <code>/ingress/email</code> brauchen <code>X-Astra-Secret</code>.</div>
-        </aside>
-      </div>
+      <section class="panel">
+        <h2 style="margin:0 0 6px;font-size:17px">Kanäle</h2>
+        <p class="note" style="margin:0 0 14px">Server, Keys und Sessions sind – wo möglich –
+          automatisch befüllt. Meist musst du nur den QR scannen oder den Token einfügen. Pro Karte
+          hilft dir ASTRA direkt im kleinen Setup-Chat.</p>
+        <div class="secretary-cards">{channel_cards}</div>
+      </section>
 
       <div class="panel" style="margin-top:16px">
         <h2 style="margin:0 0 6px;font-size:17px">Secretary Policy</h2>
@@ -2134,7 +2159,7 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
     </div>''' if threads else ''}
     <script>
       const activeSetup = {{channel: 'waha'}};
-      const labels = {{waha:'WhatsApp / WAHA', signal:'Signal', email:'Mail'}};
+      const labels = {{waha:'WhatsApp / WAHA', signal:'Signal', slack:'Slack', email:'Mail'}};
       function formContext(channel) {{
         const card = document.querySelector(`[data-install="${{channel}}"]`);
         const out = {{}};
@@ -2151,11 +2176,15 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
         document.querySelectorAll('.install-card').forEach(card => card.classList.toggle('active', card.dataset.install === channel));
         document.querySelectorAll('.install-config').forEach(cfg => cfg.hidden = cfg.dataset.config !== channel);
         document.querySelectorAll('.setup-chatbox').forEach(box => box.hidden = box.dataset.setupChannel !== channel);
-        const ctx = formContext(channel);
-        document.getElementById('coachIntro').textContent = `Einrichtung fuer ${{labels[channel]}}. Frag rechts im Chat nach naechsten Schritten oder Fehlern.`;
-        const visible = Object.entries(ctx).filter(([,v]) => v !== '' && v !== false).slice(0, 7)
-          .map(([k,v]) => `${{k}}=${{String(v).slice(0, 42)}}`).join(' · ');
-        document.getElementById('coachAwareness').innerHTML = '<strong>On-screen</strong><br>' + (visible || 'Noch keine Felder ausgefuellt.');
+        const ci = document.getElementById('coachIntro');
+        if (ci) ci.textContent = `Einrichtung fuer ${{labels[channel]}}.`;
+        const ca = document.getElementById('coachAwareness');
+        if (ca) {{
+          const ctx = formContext(channel);
+          const visible = Object.entries(ctx).filter(([,v]) => v !== '' && v !== false).slice(0, 7)
+            .map(([k,v]) => `${{k}}=${{String(v).slice(0, 42)}}`).join(' · ');
+          ca.innerHTML = '<strong>On-screen</strong><br>' + (visible || 'Noch keine Felder ausgefuellt.');
+        }}
       }}
       document.querySelectorAll('[data-open-setup]').forEach(btn => btn.onclick = () => updateCoach(btn.dataset.openSetup));
       document.querySelectorAll('.install-card input,.install-card select').forEach(el => el.addEventListener('input', () => updateCoach(activeSetup.channel)));
@@ -2256,6 +2285,12 @@ async def secretary_save(request: Request, _: bool = Depends(auth.require_admin)
             "base_url": str(form.get("sec_signal_base_url") or ""),
             "account": str(form.get("sec_signal_account") or ""),
             "webhook_url": str(form.get("sec_signal_webhook") or "/ingress/signal"),
+        },
+        "slack": {
+            "title": str(form.get("sec_slack_title") or "Slack"),
+            "bot_token": str(form.get("sec_slack_bot_token") or ""),
+            "default_channel": str(form.get("sec_slack_channel") or "#general"),
+            "webhook_url": str(form.get("sec_slack_webhook") or "/ingress/slack"),
         },
         "email": {
             "title": str(form.get("sec_email_title") or "Mail"),

@@ -7,11 +7,12 @@ from zoneinfo import ZoneInfo
 
 from .policy import Mode, Sensitivity
 
-SECRETARY_CHANNELS = {"waha", "signal", "email"}
+SECRETARY_CHANNELS = {"waha", "signal", "slack", "email"}
 CHANNEL_LABELS = {
     "telegram": "Telegram",
     "waha": "WhatsApp",
     "signal": "Signal",
+    "slack": "Slack",
     "email": "Mail",
 }
 
@@ -62,6 +63,7 @@ def secretary_settings(app_settings: dict | None) -> dict:
         "channels": {
             "waha": chan("waha", enabled=True, mode="school_direct"),
             "signal": chan("signal", enabled=True, mode="school_direct"),
+            "slack": chan("slack", enabled=True, mode="school_direct"),
             "email": chan("email", enabled=True, mode="always_ask"),
         },
     }

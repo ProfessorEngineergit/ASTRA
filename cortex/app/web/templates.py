@@ -529,7 +529,8 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
 
 /* secretary */
 .secretary-grid { display: grid; grid-template-columns: minmax(0,1.2fr) minmax(320px,.8fr); gap: 16px; }
-.secretary-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px,1fr)); gap: 12px; }
+.secretary-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+@media (max-width: 720px) { .secretary-cards { grid-template-columns: 1fr; } }
 .secretary-card { display: grid; gap: 12px; padding: 16px; background: var(--surface);
   border: 1px solid var(--border); border-radius: var(--r-lg); }
 .secretary-card.active { border-color: rgba(170,180,214,.34); box-shadow: inset 0 1px 0 rgba(255,255,255,.04), 0 18px 42px rgba(0,0,0,.28); }

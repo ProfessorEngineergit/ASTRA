@@ -386,7 +386,7 @@ def test_secretary_shows_channel_threads_and_chat_import(memdb, monkeypatch):
     assert "sec_waha_base_url" in r.text
     assert "sec_email_imap_host" in r.text
     assert "sec_signal_base_url" in r.text
-    assert "ASTRA Setup Coach" in r.text
+    assert "sec_slack_bot_token" in r.text  # Slack is a Secretary channel now
     assert "QR anzeigen" in r.text
     assert "WhatsApp-Nachricht" in r.text
     assert "Telegram-Nachricht" not in r.text
