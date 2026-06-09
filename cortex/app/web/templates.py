@@ -631,6 +631,10 @@ details.adv[open] > summary { margin-bottom: 12px; }
   margin-bottom: 12px; background: rgba(255,255,255,0.02); }
 .email-account-head { display: flex; justify-content: space-between; align-items: center;
   margin-bottom: 10px; font-size: 13px; }
+.contact-rule-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+  margin-bottom: 6px; }
+.contact-rule-row select { flex: 1; min-width: 100px; }
+.contact-rule-row input { min-width: 80px; }
 .install-policy { display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
   margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--hair); }
 .install-policy .setup-field { margin: 0; }

@@ -8,6 +8,29 @@ from zoneinfo import ZoneInfo
 from .policy import Mode, Sensitivity
 
 SECRETARY_CHANNELS = {"waha", "signal", "slack", "email"}
+
+# Contact rule values
+CONTACT_RULES = ("block", "allow", "ask", "direct")
+
+
+def contact_rules(app_settings: dict | None) -> list[dict]:
+    """Return the contact-level rules list. Each entry: {channel, id, rule, note}."""
+    return list((app_settings or {}).get("secretary", {}).get("contact_rules") or [])
+
+
+def contact_rule_for(app_settings: dict | None, channel: str, sender_id: str) -> str | None:
+    """Return the rule ('block'|'allow'|'ask'|'direct') for this sender, or None if unknown."""
+    for entry in contact_rules(app_settings):
+        if entry.get("channel") in (channel, "*") and entry.get("id") == sender_id:
+            return entry.get("rule")
+    return None
+
+
+def unknown_sender_action(app_settings: dict | None) -> str:
+    """What to do when a sender has no contact rule: 'ask_owner'|'policy'|'block'."""
+    return str(
+        (app_settings or {}).get("secretary", {}).get("unknown_sender_action") or "policy"
+    )
 CHANNEL_LABELS = {
     "telegram": "Telegram",
     "waha": "WhatsApp",

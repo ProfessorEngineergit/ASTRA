@@ -2105,6 +2105,32 @@ def _channel_setup_fields(channel: str, inst: dict, connected: bool = False) -> 
     )
 
 
+def _contact_rule_row(i: int, rule: dict) -> str:
+    channel_opts = [("waha", "WhatsApp"), ("signal", "Signal"), ("slack", "Slack"),
+                    ("email", "Mail"), ("*", "Alle Kanäle")]
+    rule_opts = [("block", "Blockieren"), ("ask", "Owner fragen"), ("allow", "Erlauben (Policy)"),
+                 ("direct", "Direkt antworten")]
+    return (
+        f'<div class="contact-rule-row" data-rule-row>'
+        + _select(f"cr_{i}_channel", rule.get("channel", "waha"), channel_opts)
+        + f'<input type="text" name="cr_{i}_id" value="{esc(rule.get("id",""))}" '
+          f'placeholder="+491234… / ID@c.us" style="flex:2">'
+        + _select(f"cr_{i}_rule", rule.get("rule", "block"), rule_opts)
+        + f'<input type="text" name="cr_{i}_note" value="{esc(rule.get("note",""))}" '
+          f'placeholder="Notiz (optional)" style="flex:2">'
+        + f'<button class="btn sm ghost" type="button" onclick="this.closest(\'[data-rule-row]\').remove()" '
+          f'style="padding:4px 10px">✕</button>'
+        + f'</div>'
+    )
+
+
+def _render_contact_rules(rules: list) -> str:
+    if not rules:
+        return '<div data-contact-rule-list></div>'
+    rows = "".join(_contact_rule_row(i, r) for i, r in enumerate(rules))
+    return f'<div data-contact-rule-list>{rows}</div>'
+
+
 def _secretary_channel_card(channel: str, cfg: dict, inst: dict) -> str:
     mode_options = {
         "waha": [("school_direct", "Schulzeit direkt"), ("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
@@ -2264,6 +2290,30 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
         </div>
         <button class="btn" type="submit" style="margin-top:14px">Secretary speichern</button>
       </div>
+
+      <div class="panel" style="margin-top:16px">
+        <h2 style="margin:0 0 4px;font-size:17px">Kontaktregeln</h2>
+        <p class="note" style="margin:0 0 12px">Legt fest, wie ASTRA mit einzelnen Absendern umgeht.
+          Unbekannte Sender werden nach der Standardregel behandelt.</p>
+        <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+          <label>Unbekannter Absender:</label>
+          {_select("sec_unknown_sender_action",
+            str((appset or {}).get("secretary", {}).get("unknown_sender_action") or "policy"),
+            [("policy", "Normale Policy anwenden"),
+             ("ask_owner", "Owner benachrichtigen &amp; fragen"),
+             ("block", "Stillschweigend blockieren")])}
+          <button class="btn sm ghost" type="button" data-waha-import-contacts>
+            Kontakte aus WhatsApp importieren
+          </button>
+        </div>
+        {_render_contact_rules(raw_secretary.get("contact_rules") or [])}
+        <div data-contact-rule-list>
+        </div>
+        <button class="btn sm ghost" type="button" data-contact-rule-add style="margin-top:8px">
+          + Regel hinzufügen
+        </button>
+        <button class="btn" type="submit" style="margin-top:12px">Regeln speichern</button>
+      </div>
     </form>
 
     {f'''<div class="chat-shell" style="height:auto;min-height:640px;margin-top:16px">
@@ -2322,6 +2372,51 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
       updateCoach('waha');
       document.querySelectorAll('.install-config').forEach(cfg => cfg.hidden = true);
 
+      const ruleChannelOpts = '<option value="waha">WhatsApp</option><option value="signal">Signal</option><option value="slack">Slack</option><option value="email">Mail</option><option value="*">Alle Kanäle</option>';
+      const ruleActionOpts = '<option value="block">Blockieren</option><option value="ask">Owner fragen</option><option value="allow">Erlauben (Policy)</option><option value="direct">Direkt antworten</option>';
+      function makeRuleRow() {{
+        const row = document.createElement('div');
+        row.className = 'contact-rule-row'; row.setAttribute('data-rule-row','');
+        const idx = document.querySelectorAll('[data-rule-row]').length;
+        row.innerHTML = `<select name="cr_${{idx}}_channel">${{ruleChannelOpts}}</select>`
+          + `<input type="text" name="cr_${{idx}}_id" placeholder="+491234… / ID@c.us" style="flex:2">`
+          + `<select name="cr_${{idx}}_rule">${{ruleActionOpts}}</select>`
+          + `<input type="text" name="cr_${{idx}}_note" placeholder="Notiz" style="flex:2">`
+          + `<button class="btn sm ghost" type="button" style="padding:4px 10px" onclick="this.closest('[data-rule-row]').remove()">✕</button>`;
+        return row;
+      }}
+      const ruleAdd = document.querySelector('[data-contact-rule-add]');
+      if (ruleAdd) ruleAdd.onclick = () => {{
+        document.querySelector('[data-contact-rule-list]').appendChild(makeRuleRow());
+      }};
+      const wahaImport = document.querySelector('[data-waha-import-contacts]');
+      if (wahaImport) wahaImport.onclick = async () => {{
+        wahaImport.disabled = true; wahaImport.textContent = 'Lade Kontakte…';
+        try {{
+          const r = await fetch('/admin/secretary/waha/contacts', {{
+            method:'POST', headers:{{'Content-Type':'application/json'}},
+            body: JSON.stringify(formContext('waha'))
+          }});
+          const d = await r.json();
+          if (!d.ok) {{ alert(d.message || 'Fehler beim Importieren.'); }}
+          else {{
+            const list = document.querySelector('[data-contact-rule-list]');
+            (d.rules || []).forEach(rule => {{
+              const row = makeRuleRow();
+              const idx = document.querySelectorAll('[data-rule-row]').length - 1;
+              row.querySelector(`[name="cr_${{idx}}_channel"]`).value = rule.channel;
+              row.querySelector(`[name="cr_${{idx}}_id"]`).value = rule.id;
+              row.querySelector(`[name="cr_${{idx}}_rule"]`).value = rule.rule;
+              row.querySelector(`[name="cr_${{idx}}_note"]`).value = rule.note || '';
+              list.appendChild(row);
+            }});
+            wahaImport.textContent = `${{d.count}} Kontakte importiert ✓`;
+          }}
+        }} catch(e) {{
+          alert('Import fehlgeschlagen.');
+        }}
+        wahaImport.disabled = false;
+      }};
       document.querySelectorAll('[data-email-test]').forEach(btn => {{
         btn.onclick = async () => {{
           const idx = btn.dataset.emailTest;
@@ -2631,6 +2726,20 @@ async def secretary_save(request: Request, _: bool = Depends(auth.require_admin)
             "poll_minutes": str(form.get(f"sec_email_{i}_poll") or "5"),
             "webhook_url": "/ingress/email",
         })
+    # Parse contact rules (cr_{i}_channel/id/rule/note)
+    contact_rules_list = []
+    i = 0
+    while form.get(f"cr_{i}_id") is not None:
+        cid = str(form.get(f"cr_{i}_id") or "").strip()
+        if cid:
+            contact_rules_list.append({
+                "channel": str(form.get(f"cr_{i}_channel") or "waha"),
+                "id": cid,
+                "rule": str(form.get(f"cr_{i}_rule") or "block"),
+                "note": str(form.get(f"cr_{i}_note") or ""),
+            })
+        i += 1
+
     appset["secretary"] = {
         "enabled": form.get("sec_enabled") == "on",
         "tone": str(form.get("sec_tone") or "warm"),
@@ -2647,6 +2756,8 @@ async def secretary_save(request: Request, _: bool = Depends(auth.require_admin)
         "channels": channels,
         "installations": installations,
         "email_accounts": email_accounts,
+        "contact_rules": contact_rules_list,
+        "unknown_sender_action": str(form.get("sec_unknown_sender_action") or "policy"),
     }
     await db.set_setting("app_settings", appset)
     await db.audit("secretary_settings_saved", actor="owner",
@@ -2914,6 +3025,31 @@ async def _signal_status(base_url: str, account: str) -> dict:
     connected = (account in accounts) if account else bool(accounts)
     return {"ok": True, "connected": connected, "accounts": accounts,
             "me": account or (accounts[0] if accounts else "")}
+
+
+@router.post("/admin/secretary/waha/contacts")
+async def secretary_waha_contacts(request: Request, _: bool = Depends(auth.require_admin)):
+    """Fetch contact list from WAHA and return as contact rules (default: ask)."""
+    data = await request.json()
+    s = get_settings()
+    base_url = str(data.get("waha_base_url") or data.get("base_url") or s.waha_base_url or "http://waha:3000")
+    session = str(data.get("waha_session") or data.get("session") or s.waha_session or "default")
+    api_key = str(data.get("waha_api_key") or data.get("api_key") or s.waha_api_key or "")
+    result = await _waha_request(base_url, f"/api/contacts?session={session}", api_key=api_key)
+    if not result.get("ok"):
+        return JSONResponse({"ok": False, "message": result.get("text") or "Kontakte konnten nicht geladen werden."})
+    try:
+        contacts = json.loads(result.get("text") or "[]")
+    except json.JSONDecodeError:
+        contacts = []
+    rules = []
+    for c in contacts if isinstance(contacts, list) else []:
+        cid = str(c.get("id") or c.get("jid") or "")
+        name = str(c.get("name") or c.get("pushname") or c.get("notify") or "")
+        if not cid or cid.endswith("@g.us"):
+            continue
+        rules.append({"channel": "waha", "id": cid, "rule": "ask", "note": name})
+    return JSONResponse({"ok": True, "count": len(rules), "rules": rules})
 
 
 @router.post("/admin/secretary/signal/status")

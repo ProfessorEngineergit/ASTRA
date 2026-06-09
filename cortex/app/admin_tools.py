@@ -386,6 +386,70 @@ async def _secretary_email_set(args: dict, ctx: ToolContext) -> str:
     return f"{len(merged)} Mail-Konto/Konten gespeichert: {', '.join(str(t) for t in titles)}"
 
 
+async def _secretary_contact_rules_get(args: dict, ctx: ToolContext) -> str:
+    """List current contact rules + unknown_sender_action setting."""
+    appset = await _settings()
+    sec = appset.get("secretary") or {}
+    rules = sec.get("contact_rules") or []
+    action = sec.get("unknown_sender_action") or "policy"
+    if not rules:
+        return f"Keine Kontaktregeln gesetzt. Unbekannte Sender: {action}."
+    rows = [f"Unbekannte Sender: {action}", ""]
+    for r in rules:
+        rows.append(f"[{r.get('channel','?')}] {r.get('id','?')} → {r.get('rule','?')}"
+                    + (f"  ({r.get('note')})" if r.get("note") else ""))
+    return "\n".join(rows)
+
+
+async def _secretary_contact_rules_set(args: dict, ctx: ToolContext) -> str:
+    """Add, update or remove contact rules. action=add|remove|set_unknown."""
+    if not await _writes_allowed(ctx):
+        return "Schreiben ist deaktiviert (allow_self_config)."
+    appset = await _settings()
+    sec = appset.setdefault("secretary", {})
+    rules: list = list(sec.get("contact_rules") or [])
+
+    op = str(args.get("action") or "add")
+    if op == "set_unknown":
+        val = str(args.get("unknown_sender_action") or "policy")
+        if val not in ("policy", "ask_owner", "block"):
+            return "Ungültiger Wert. Erlaubt: policy, ask_owner, block."
+        sec["unknown_sender_action"] = val
+        appset["secretary"] = sec
+        await db.set_setting("app_settings", appset)
+        return f"Unbekannte Sender: {val}"
+
+    channel = str(args.get("channel") or "waha")
+    cid = str(args.get("id") or "").strip()
+    if not cid:
+        return "Bitte 'id' (Telefonnummer oder JID) angeben."
+
+    if op == "remove":
+        before = len(rules)
+        rules = [r for r in rules if not (r.get("channel") == channel and r.get("id") == cid)]
+        sec["contact_rules"] = rules
+        appset["secretary"] = sec
+        await db.set_setting("app_settings", appset)
+        removed = before - len(rules)
+        return f"{removed} Regel(n) entfernt für {channel}:{cid}."
+
+    # add / update
+    rule = str(args.get("rule") or "block")
+    note = str(args.get("note") or "")
+    existing = next((r for r in rules if r.get("channel") == channel and r.get("id") == cid), None)
+    if existing:
+        existing["rule"] = rule
+        existing["note"] = note
+    else:
+        rules.append({"channel": channel, "id": cid, "rule": rule, "note": note})
+    sec["contact_rules"] = rules
+    appset["secretary"] = sec
+    await db.set_setting("app_settings", appset)
+    await db.audit("secretary_contact_rule_set", actor="astra",
+                   detail={"channel": channel, "id": cid, "rule": rule})
+    return f"Regel gesetzt: [{channel}] {cid} → {rule}" + (f" ({note})" if note else "")
+
+
 async def _secretary_email_get(args: dict, ctx: ToolContext) -> str:
     """Read back the current email_accounts config (passwords masked)."""
     appset = await _settings()
@@ -464,6 +528,21 @@ def register_admin_tools() -> None:
         ("astra_brain_add_person", "Lege eine neue Personen-Brain-Datei an (people/<slug>.md).",
          {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
          _brain_add_person),
+        ("astra_secretary_contacts_get",
+         "Zeige alle Secretary-Kontaktregeln und die Standardaktion für unbekannte Sender.",
+         {"type": "object", "properties": {}}, _secretary_contact_rules_get),
+        ("astra_secretary_contacts_set",
+         "Füge eine Kontaktregel hinzu/aktualisiere sie (action=add), entferne sie (action=remove), "
+         "oder setze die Unbekannt-Sender-Aktion (action=set_unknown, unknown_sender_action=policy|ask_owner|block). "
+         "Felder: channel(waha|signal|slack|email|*), id(Nummer/JID), rule(block|ask|allow|direct), note.",
+         {"type": "object", "properties": {
+             "action": {"type": "string", "enum": ["add", "remove", "set_unknown"]},
+             "channel": {"type": "string"},
+             "id": {"type": "string"},
+             "rule": {"type": "string", "enum": ["block", "ask", "allow", "direct"]},
+             "note": {"type": "string"},
+             "unknown_sender_action": {"type": "string"}}},
+         _secretary_contact_rules_set),
         ("astra_secretary_email_get",
          "Zeige die aktuell konfigurierten Mail-Konten im Secretary (Passwörter maskiert).",
          {"type": "object", "properties": {}}, _secretary_email_get),
@@ -501,7 +580,7 @@ def register_admin_tools() -> None:
         safety = "mutation" if name in {
             "astra_configure_integration", "astra_update_settings", "astra_test_capability",
             "astra_create_plugin_module", "astra_brain_write", "astra_brain_append",
-            "astra_brain_add_person", "astra_secretary_email_set",
+            "astra_brain_add_person", "astra_secretary_email_set", "astra_secretary_contacts_set",
         } else "private_read"
         intents = ["status", "list"] if "list" in name or "status" in name else ["control"] if safety == "mutation" else ["status"]
         register(Tool(name=name, description=desc, parameters=params, handler=handler,

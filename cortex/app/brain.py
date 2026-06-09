@@ -21,7 +21,10 @@ from .memory import get_memory
 from .models import get_gateway
 from .persona import TRIAGE_INSTRUCTIONS, Register
 from .policy import Mode, Sensitivity, TrustTier, reconcile
-from .secretary import SECRETARY_CHANNELS, is_group_context, plan_for, tone_instruction, with_secretary_header
+from .secretary import (
+    SECRETARY_CHANNELS, contact_rule_for, is_group_context, plan_for,
+    tone_instruction, unknown_sender_action, with_secretary_header,
+)
 from .security import check_inbound, check_outbound
 from .state import Act, Signal, ThreadState, next_state
 
@@ -249,6 +252,71 @@ async def handle_inbound(
             log.info("Owner stepped in on %s → stand down.", thread_id)
         _remember(contact, text, owner=True)
         return
+
+    # ── Third party → contact rules ────────────────────────────────────────────
+    appset_pre = await _app_settings()
+    contact_rule = contact_rule_for(appset_pre, channel, sender_handle)
+    if contact_rule is None:
+        # Unknown sender — apply the configured default action
+        action = unknown_sender_action(appset_pre)
+        if action == "block":
+            log.info("Unknown sender %s on %s — blocked by unknown_sender_action.", sender_handle, channel)
+            await db.audit("contact_blocked_unknown", channel=channel, thread_id=thread_id,
+                           contact_id=contact["id"])
+            return
+        if action == "ask_owner":
+            log.info("Unknown sender %s on %s — asking owner.", sender_handle, channel)
+            name = contact.get("display_name") or sender_handle
+            if s.telegram_enabled and s.telegram_owner_chat_id:
+                approval_id = await db.create_approval(
+                    thread_id=thread_id, contact_id=contact["id"], kind="unknown_sender",
+                    question=text, payload={"channel": channel, "sender": sender_handle},
+                )
+                await db.set_thread_state(thread_id, ThreadState.AWAITING_APPROVAL.value)
+                buttons = [
+                    {"text": "✅ Erlauben", "callback_data": f"apv:{approval_id}:yes"},
+                    {"text": "📋 Nur einmal", "callback_data": f"apv:{approval_id}:busy_only"},
+                    {"text": "🚫 Blockieren", "callback_data": f"apv:{approval_id}:no"},
+                ]
+                channel_label = {"waha": "WhatsApp", "signal": "Signal", "slack": "Slack",
+                                 "email": "Mail"}.get(channel, channel)
+                await get_channels().send_telegram(
+                    s.telegram_owner_chat_id,
+                    f"\U0001f514 Unbekannter Kontakt auf {channel_label}: {name}\n„{text[:800]}“\n\n"
+                    "Regel festlegen — gilt ab sofort für diesen Kontakt:",
+                    buttons=buttons,
+                )
+            await db.audit("contact_ask_unknown", channel=channel, thread_id=thread_id,
+                           contact_id=contact["id"], detail={"sender": sender_handle})
+            return
+        # action == "policy" → fall through to normal triage
+    elif contact_rule == "block":
+        log.info("Contact %s on %s blocked by rule.", sender_handle, channel)
+        await db.audit("contact_blocked", channel=channel, thread_id=thread_id,
+                       contact_id=contact["id"])
+        return
+    elif contact_rule == "ask":
+        await _ask_owner(channel, sender_handle, thread_id, contact, text,
+                         type("_D", (), {"mode": Mode.ASK, "max_sensitivity": Sensitivity.FREEBUSY,
+                                         "reason": "contact-rule-ask"})())
+        return
+    elif contact_rule == "direct":
+        # Force AUTO regardless of triage
+        appset_for_reply = appset_pre
+        history = await db.recent_messages(thread_id)
+        reply = await generate_reply(
+            register=Register.THIRD, contact=contact, thread_id=thread_id, channel=channel,
+            history=history, summary=thread.get("summary") or "",
+            max_sensitivity=Sensitivity.DETAILS.value,
+            extra_system=_secretary_system(channel, "contact-rule-direct",
+                                           app_settings=appset_for_reply,
+                                           thread_meta=thread.get("meta") or {}),
+        )
+        await _send_and_record(channel, sender_handle, thread_id, reply, contact,
+                               max_sensitivity=Sensitivity.DETAILS.value)
+        await db.set_thread_state(thread_id, ThreadState.ANSWERED.value)
+        return
+    # contact_rule == "allow" → fall through to normal triage (policy decides mode)
 
     # ── Third party → triage + policy ──────────────────────────────────────────
     inbound_verdict = check_inbound(text, channel=channel)
