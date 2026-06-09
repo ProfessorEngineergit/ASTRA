@@ -605,11 +605,24 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
   transform: rotate(45deg); }
 .github-capsule:hover .gh-pop { opacity: 1; transform: translateY(0); }
 .gh-pop b { font-size: 13px; } .gh-pop small { color: var(--text-dim); font-size: 11px; }
+/* plain OLED panel — no decorative wash (matches channels / setup coach) */
 .labs-console { overflow: hidden; position: relative; }
-.labs-console::before { content: ''; position: absolute; inset: 0; pointer-events: none;
-  background: linear-gradient(135deg, rgba(244,245,248,.075), transparent 34%),
-              radial-gradient(circle at 88% 12%, rgba(170,180,214,.09), transparent 30%); opacity: .72; }
 .labs-console > * { position: relative; z-index: 1; }
+
+/* QR-first channel pairing + collapsible advanced fields */
+.pairing-panel.primary { background: var(--surface-2); border: 1px solid var(--border-soft);
+  border-radius: var(--r); padding: 15px; display: grid; gap: 12px; margin: 4px 0 2px; }
+.pairing-panel.primary span { color: var(--text-dim); font-size: 12.5px; line-height: 1.5; }
+.qr-box { display: grid; place-items: center; gap: 6px; min-height: 8px; }
+.qr-box img { width: 232px; height: 232px; border-radius: 12px; background: #fff; padding: 8px; }
+.qr-box small { color: var(--text-faint); font-size: 11px; }
+details.adv { margin-top: 12px; border-top: 1px solid var(--hair); padding-top: 10px; }
+details.adv > summary { cursor: pointer; list-style: none; font-size: 13px; font-weight: 600;
+  color: var(--text-dim); }
+details.adv > summary::-webkit-details-marker { display: none; }
+details.adv > summary::before { content: '▸ '; color: var(--text-faint); }
+details.adv[open] > summary::before { content: '▾ '; }
+details.adv[open] > summary { margin-bottom: 12px; }
 .labs-head { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; }
 .labs-head .beaker { color: #d8dbe3; flex-shrink: 0; filter: drop-shadow(0 0 16px rgba(216,219,227,.16)); }
 .labs-head h2 { margin: 0 0 4px; font-size: 19px; }
@@ -618,9 +631,9 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
   text-transform: uppercase; margin-bottom: 5px; }
 .labs-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
 .lab-tile { min-height: 174px; display: flex; flex-direction: column; gap: 8px; padding: 15px;
-  background: rgba(255,255,255,.028); border: 1px solid var(--border-soft); border-radius: var(--r);
+  background: var(--surface-2); border: 1px solid var(--border-soft); border-radius: var(--r);
   transition: border-color .16s, background .16s, transform .16s; }
-.lab-tile:hover { transform: translateY(-2px); border-color: #30303a; background: rgba(255,255,255,.045); }
+.lab-tile:hover { transform: translateY(-2px); border-color: #30303a; background: var(--surface-3); }
 .lab-title { font-weight: 650; font-size: 14px; }
 .lab-tile p { margin: 0 0 auto; color: var(--text-dim); font-size: 12.5px; line-height: 1.45; }
 .font-preview { display: grid; gap: 5px; margin: 0 0 14px; padding: 13px 15px;

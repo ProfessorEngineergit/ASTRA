@@ -1933,33 +1933,38 @@ def _field(name: str, label: str, value: str = "", *, placeholder: str = "", typ
 
 def _channel_setup_fields(channel: str, inst: dict) -> str:
     if channel == "waha":
+        # QR-first: scanning is the whole flow. Everything technical lives under "Erweitert".
         return (
-            '<div class="install-fields">'
+            '<div class="pairing-panel primary" data-waha-pairing>'
+            '<div><b>WhatsApp verbinden</b><span>1 · Session starten &nbsp;→&nbsp; 2 · in WhatsApp unter '
+            '<i>Verknüpfte Geräte</i> den QR scannen. Mehr brauchst du normalerweise nicht.</span></div>'
+            '<div class="pairing-actions">'
+            '<button class="btn sm" type="button" data-waha-start>1 · Session starten</button>'
+            '<button class="btn sm" type="button" data-waha-qr>2 · QR anzeigen</button></div>'
+            '<div class="qr-box" data-qr-box></div></div>'
+            '<details class="adv"><summary>Erweiterte Einstellungen</summary><div class="install-fields">'
             + _field("sec_waha_title", "Titel", inst.get("title", ""), placeholder="WhatsApp via WAHA")
             + _field("sec_waha_base_url", "WAHA Base URL", inst.get("base_url", ""), placeholder="http://waha:3000")
             + _field("sec_waha_session", "Session", inst.get("session", "default"), placeholder="default")
             + _field("sec_waha_api_key", "API Key optional", inst.get("api_key", ""), placeholder="X-Api-Key")
             + _field("sec_waha_events", "Hook Events", inst.get("events", "message"), placeholder="message")
             + _field("sec_waha_webhook", "ASTRA Webhook", inst.get("webhook_url", "/ingress/waha"))
-            + "</div>"
-            '<div class="pairing-panel" data-waha-pairing>'
-            '<div><b>Pairing</b><span>Session starten, dann QR mit WhatsApp scannen.</span></div>'
-            '<div class="pairing-actions"><button class="btn ghost sm" type="button" data-waha-start>Session starten</button>'
-            '<button class="btn sm" type="button" data-waha-qr>QR laden</button></div>'
-            '<div class="qr-box" data-qr-box></div></div>'
+            + "</div></details>"
         )
     if channel == "signal":
         return (
-            '<div class="install-fields">'
+            '<div class="pairing-panel primary">'
+            '<div><b>Signal verbinden</b><span>Im signal-cli-rest-api als verknüpftes Gerät registrieren '
+            '(QR dort scannen). ASTRA empfängt danach Webhooks auf <code>/ingress/signal</code>.</span></div></div>'
+            '<details class="adv"><summary>Erweiterte Einstellungen</summary><div class="install-fields">'
             + _field("sec_signal_title", "Titel", inst.get("title", ""), placeholder="Signal")
             + _field("sec_signal_base_url", "signal-cli API URL", inst.get("base_url", ""), placeholder="http://signal-api:8080")
             + _field("sec_signal_account", "Account / Nummer", inst.get("account", ""), placeholder="+491...")
             + _field("sec_signal_webhook", "ASTRA Webhook", inst.get("webhook_url", "/ingress/signal"))
-            + "</div>"
-            '<div class="pairing-panel"><div><b>Pairing</b><span>Registrierung oder Linked-Device-QR erfolgt im signal-cli-rest-api Dienst; ASTRA erwartet danach Webhooks mit groupInfo.</span></div></div>'
+            + "</div></details>"
         )
     return (
-        '<div class="install-fields">'
+        '<details class="adv" open><summary>IMAP / SMTP einrichten</summary><div class="install-fields">'
         + _field("sec_email_title", "Titel", inst.get("title", ""), placeholder="Mail")
         + _field("sec_email_imap_host", "IMAP Host", inst.get("imap_host", ""), placeholder="imap.example.com")
         + _field("sec_email_imap_port", "IMAP Port", inst.get("imap_port", "993"))
@@ -1971,7 +1976,7 @@ def _channel_setup_fields(channel: str, inst: dict) -> str:
         + _field("sec_email_from", "Absender", inst.get("from_address", ""), placeholder="Bahrian <...>")
         + _field("sec_email_poll", "Poll Minuten", inst.get("poll_minutes", "5"), typ="number")
         + _field("sec_email_webhook", "ASTRA Webhook", inst.get("webhook_url", "/ingress/email"))
-        + "</div>"
+        + "</div></details>"
     )
 
 

@@ -387,7 +387,7 @@ def test_secretary_shows_channel_threads_and_chat_import(memdb, monkeypatch):
     assert "sec_email_imap_host" in r.text
     assert "sec_signal_base_url" in r.text
     assert "ASTRA Setup Coach" in r.text
-    assert "QR laden" in r.text
+    assert "QR anzeigen" in r.text
     assert "WhatsApp-Nachricht" in r.text
     assert "Telegram-Nachricht" not in r.text
     assert "sec_telegram_mode" not in r.text
