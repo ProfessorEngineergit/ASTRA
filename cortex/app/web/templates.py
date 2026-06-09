@@ -627,6 +627,10 @@ details.adv[open] > summary { margin-bottom: 12px; }
 .waha-test-box .setup-log { display: flex; flex-direction: column; gap: 6px; margin-top: 8px;
   max-height: 280px; overflow-y: auto; }
 .waha-test-box .setup-msg.user { align-self: flex-end; }
+.email-account { border: 1px solid var(--hair); border-radius: 12px; padding: 12px;
+  margin-bottom: 12px; background: rgba(255,255,255,0.02); }
+.email-account-head { display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 10px; font-size: 13px; }
 .install-policy { display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
   margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--hair); }
 .install-policy .setup-field { margin: 0; }

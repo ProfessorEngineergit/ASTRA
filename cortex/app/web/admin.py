@@ -1893,6 +1893,40 @@ def _secretary_installations(settings: dict) -> dict:
     return out
 
 
+def _email_accounts(raw_secretary: dict) -> list[dict]:
+    """Return the configured email accounts. Migrates a legacy single 'email'
+    installation into the list form on first read."""
+    accounts = raw_secretary.get("email_accounts")
+    if isinstance(accounts, list) and accounts:
+        return accounts
+    legacy = (raw_secretary.get("installations") or {}).get("email") or {}
+    if legacy.get("imap_host") or legacy.get("smtp_host"):
+        return [legacy]
+    return []
+
+
+def _email_account_block(i: int, acc: dict) -> str:
+    title = acc.get("title", "") or (f"Konto {i + 1}")
+    return (
+        f'<div class="email-account" data-email-account>'
+        f'<div class="email-account-head"><b>Mail-Konto {i + 1}</b>'
+        f'<label class="secretary-switch"><input type="checkbox" name="sec_email_{i}_enabled"'
+        f'{_checked(bool(acc.get("enabled", True)))}> aktiv</label></div>'
+        '<div class="install-fields">'
+        + _field(f"sec_email_{i}_title", "Bezeichnung", title, placeholder="z. B. Privat / Schule")
+        + _field(f"sec_email_{i}_from", "Absender-Adresse", acc.get("from_address", ""), placeholder="name@example.com")
+        + _field(f"sec_email_{i}_imap_host", "IMAP Host", acc.get("imap_host", ""), placeholder="imap.example.com")
+        + _field(f"sec_email_{i}_imap_port", "IMAP Port", acc.get("imap_port", "993"))
+        + _field(f"sec_email_{i}_imap_user", "IMAP User", acc.get("imap_user", ""), placeholder="name@example.com")
+        + _field(f"sec_email_{i}_password", "Passwort / App-Passwort", "", placeholder="••• (leer = unverändert)", typ="password")
+        + _field(f"sec_email_{i}_imap_mailbox", "Postfach", acc.get("imap_mailbox", "INBOX"))
+        + _field(f"sec_email_{i}_smtp_host", "SMTP Host", acc.get("smtp_host", ""), placeholder="smtp.example.com")
+        + _field(f"sec_email_{i}_smtp_port", "SMTP Port", acc.get("smtp_port", "587"))
+        + _field(f"sec_email_{i}_poll", "Poll Minuten", acc.get("poll_minutes", "5"), typ="number")
+        + '</div></div>'
+    )
+
+
 def _setup_seed(channel: str) -> list[dict]:
     label = _channel_label(channel)
     guides = {
@@ -2019,20 +2053,18 @@ def _channel_setup_fields(channel: str, inst: dict, connected: bool = False) -> 
             + _field("sec_slack_webhook", "ASTRA Webhook", inst.get("webhook_url", "/ingress/slack"))
             + "</div></details>"
         )
+    # Email: multiple accounts. Render one block per saved account + one blank.
+    accounts = list(inst.get("_accounts") or [])
+    accounts.append({})  # always offer a fresh blank block at the end
+    blocks = "".join(_email_account_block(i, acc) for i, acc in enumerate(accounts))
     return (
-        '<details class="adv" open><summary>IMAP / SMTP einrichten</summary><div class="install-fields">'
-        + _field("sec_email_title", "Titel", inst.get("title", ""), placeholder="Mail")
-        + _field("sec_email_imap_host", "IMAP Host", inst.get("imap_host", ""), placeholder="imap.example.com")
-        + _field("sec_email_imap_port", "IMAP Port", inst.get("imap_port", "993"))
-        + _field("sec_email_imap_user", "IMAP User", inst.get("imap_user", ""), placeholder="bahrian@example.com")
-        + _field("sec_email_imap_mailbox", "Mailbox", inst.get("imap_mailbox", "INBOX"))
-        + _field("sec_email_smtp_host", "SMTP Host", inst.get("smtp_host", ""), placeholder="smtp.example.com")
-        + _field("sec_email_smtp_port", "SMTP Port", inst.get("smtp_port", "587"))
-        + _field("sec_email_smtp_user", "SMTP User", inst.get("smtp_user", ""), placeholder="bahrian@example.com")
-        + _field("sec_email_from", "Absender", inst.get("from_address", ""), placeholder="Bahrian <...>")
-        + _field("sec_email_poll", "Poll Minuten", inst.get("poll_minutes", "5"), typ="number")
-        + _field("sec_email_webhook", "ASTRA Webhook", inst.get("webhook_url", "/ingress/email"))
-        + "</div></details>"
+        '<details class="adv" open><summary>Mail-Konten (IMAP / SMTP)</summary>'
+        '<p class="note" style="margin:0 0 10px">Du kannst beliebig viele Konten anlegen. '
+        'Für SMTP wird – wenn leer – derselbe Server/User wie für IMAP angenommen.</p>'
+        f'<input type="hidden" name="sec_email_count" data-email-count value="{len(accounts)}">'
+        f'<div data-email-list>{blocks}</div>'
+        '<button class="btn sm ghost" type="button" data-email-add>+ Weiteres Konto</button>'
+        '</details>'
     )
 
 
@@ -2119,7 +2151,9 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
     title = selected.get("who") if selected else "Keine Threads"
     token = await auth.issue_csrf()
     setup_store = await db.get_setting("secretary_setup_chats", {}) or {}
-    installations = _secretary_installations(settings)
+    raw_secretary = (appset or {}).get("secretary", {}) or {}
+    installations = _secretary_installations(raw_secretary)
+    installations["email"]["_accounts"] = _email_accounts(raw_secretary)
     live_status = {}
     try:
         s = get_settings()
@@ -2240,6 +2274,23 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
       document.querySelectorAll('.install-card input,.install-card select').forEach(el => el.addEventListener('input', () => updateCoach(activeSetup.channel)));
       updateCoach('waha');
       document.querySelectorAll('.install-config').forEach(cfg => cfg.hidden = true);
+
+      const emailAdd = document.querySelector('[data-email-add]');
+      if (emailAdd) emailAdd.onclick = () => {{
+        const list = document.querySelector('[data-email-list]');
+        const countEl = document.querySelector('[data-email-count]');
+        const blocks = list.querySelectorAll('[data-email-account]');
+        const idx = blocks.length;
+        const tpl = blocks[blocks.length - 1].cloneNode(true);
+        tpl.querySelectorAll('input').forEach(el => {{
+          if (el.name) el.name = el.name.replace(/sec_email_\\d+_/, 'sec_email_' + idx + '_');
+          if (el.type === 'checkbox') el.checked = true; else el.value = '';
+        }});
+        const head = tpl.querySelector('.email-account-head b');
+        if (head) head.textContent = 'Mail-Konto ' + (idx + 1);
+        list.appendChild(tpl);
+        if (countEl) countEl.value = idx + 1;
+      }};
 
       document.querySelectorAll('.setup-chatbox').forEach(box => {{
         const channel = box.dataset.setupChannel;
@@ -2398,21 +2449,39 @@ async def secretary_save(request: Request, _: bool = Depends(auth.require_admin)
             "default_channel": str(form.get("sec_slack_channel") or "#general"),
             "webhook_url": str(form.get("sec_slack_webhook") or "/ingress/slack"),
         },
-        "email": {
-            "title": str(form.get("sec_email_title") or "Mail"),
-            "provider": "imap_smtp",
-            "imap_host": str(form.get("sec_email_imap_host") or ""),
-            "imap_port": str(form.get("sec_email_imap_port") or "993"),
-            "imap_user": str(form.get("sec_email_imap_user") or ""),
-            "imap_mailbox": str(form.get("sec_email_imap_mailbox") or "INBOX"),
-            "smtp_host": str(form.get("sec_email_smtp_host") or ""),
-            "smtp_port": str(form.get("sec_email_smtp_port") or "587"),
-            "smtp_user": str(form.get("sec_email_smtp_user") or ""),
-            "from_address": str(form.get("sec_email_from") or ""),
-            "poll_minutes": str(form.get("sec_email_poll") or "5"),
-            "webhook_url": str(form.get("sec_email_webhook") or "/ingress/email"),
-        },
     }
+    # Multiple email accounts (indexed sec_email_{i}_*). Keep existing passwords
+    # when the field is left blank.
+    prev_accounts = _email_accounts((appset or {}).get("secretary", {}) or {})
+    try:
+        email_count = int(form.get("sec_email_count") or 0)
+    except (TypeError, ValueError):
+        email_count = 0
+    email_accounts = []
+    for i in range(max(email_count, len(prev_accounts)) + 1):
+        imap_host = str(form.get(f"sec_email_{i}_imap_host") or "").strip()
+        from_addr = str(form.get(f"sec_email_{i}_from") or "").strip()
+        smtp_host = str(form.get(f"sec_email_{i}_smtp_host") or "").strip()
+        if not (imap_host or from_addr or smtp_host):
+            continue
+        prev = prev_accounts[i] if i < len(prev_accounts) else {}
+        password = str(form.get(f"sec_email_{i}_password") or "")
+        if not password:
+            password = prev.get("password", "")
+        email_accounts.append({
+            "title": str(form.get(f"sec_email_{i}_title") or f"Konto {i + 1}"),
+            "enabled": form.get(f"sec_email_{i}_enabled") == "on",
+            "from_address": from_addr,
+            "imap_host": imap_host,
+            "imap_port": str(form.get(f"sec_email_{i}_imap_port") or "993"),
+            "imap_user": str(form.get(f"sec_email_{i}_imap_user") or from_addr),
+            "password": password,
+            "imap_mailbox": str(form.get(f"sec_email_{i}_imap_mailbox") or "INBOX"),
+            "smtp_host": smtp_host or imap_host.replace("imap", "smtp"),
+            "smtp_port": str(form.get(f"sec_email_{i}_smtp_port") or "587"),
+            "poll_minutes": str(form.get(f"sec_email_{i}_poll") or "5"),
+            "webhook_url": "/ingress/email",
+        })
     appset["secretary"] = {
         "enabled": form.get("sec_enabled") == "on",
         "tone": str(form.get("sec_tone") or "warm"),
@@ -2428,20 +2497,24 @@ async def secretary_save(request: Request, _: bool = Depends(auth.require_admin)
         "header": str(form.get("sec_header") or current["header"]),
         "channels": channels,
         "installations": installations,
+        "email_accounts": email_accounts,
     }
     await db.set_setting("app_settings", appset)
-    await db.audit("secretary_settings_saved", actor="owner", detail={"channels": list(channels)})
+    await db.audit("secretary_settings_saved", actor="owner",
+                   detail={"channels": list(channels), "email_accounts": len(email_accounts)})
     try:
-        await _mirror_secretary_to_plugins(installations, channels)
+        await _mirror_secretary_to_plugins(installations, channels, email_accounts)
     except Exception:  # noqa: BLE001
         log.warning("Secretary→Plugin mirror failed", exc_info=True)
     return RedirectResponse("/admin/secretary", status_code=303)
 
 
-async def _mirror_secretary_to_plugins(installations: dict, channels: dict) -> None:
+async def _mirror_secretary_to_plugins(installations: dict, channels: dict,
+                                       email_accounts: list | None = None) -> None:
     """Propagate Secretary channel credentials into the normal plugin store so the
     standard ASTRA agent can use the same accounts. Only channels that have a native
-    plugin counterpart are mirrored (Slack, IMAP, SMTP)."""
+    plugin counterpart are mirrored (Slack, IMAP, SMTP). Each mail account becomes a
+    separate, stably-keyed installation of the imap_email and smtp plugins."""
     store = get_config_store()
     changed = False
 
@@ -2456,29 +2529,33 @@ async def _mirror_secretary_to_plugins(installations: dict, channels: dict) -> N
         )
         changed = True
 
-    email = installations.get("email") or {}
     email_enabled = bool(channels.get("email", {}).get("enabled"))
-    if (email.get("imap_host") or "").strip():
-        from ..plugins.builtin.imap_email import ImapEmailPlugin
-        await store.save(
-            ImapEmailPlugin,
-            {"host": email.get("imap_host", ""),
-             "port": email.get("imap_port") or "993",
-             "username": email.get("imap_user", ""),
-             "mailbox": email.get("imap_mailbox") or "INBOX"},
-            enabled=email_enabled,
-        )
-        changed = True
-    if (email.get("smtp_host") or "").strip():
-        from ..plugins.builtin.smtp_mail import SmtpPlugin
-        await store.save(
-            SmtpPlugin,
-            {"email": email.get("from_address") or email.get("smtp_user") or "",
-             "host": email.get("smtp_host", ""),
-             "port": email.get("smtp_port") or "465"},
-            enabled=email_enabled,
-        )
-        changed = True
+    for idx, acc in enumerate(email_accounts or []):
+        name = acc.get("title") or acc.get("from_address") or f"Mail {idx + 1}"
+        acc_enabled = email_enabled and bool(acc.get("enabled", True))
+        if (acc.get("imap_host") or "").strip():
+            from ..plugins.builtin.imap_email import ImapEmailPlugin
+            await store.save_installation(
+                ImapEmailPlugin, f"sec-mail-{idx}",
+                {"host": acc.get("imap_host", ""),
+                 "port": acc.get("imap_port") or "993",
+                 "username": acc.get("imap_user") or acc.get("from_address", ""),
+                 "password": acc.get("password", ""),
+                 "mailbox": acc.get("imap_mailbox") or "INBOX"},
+                acc_enabled, name=name,
+            )
+            changed = True
+        if (acc.get("smtp_host") or "").strip():
+            from ..plugins.builtin.smtp_mail import SmtpPlugin
+            await store.save_installation(
+                SmtpPlugin, f"sec-mail-{idx}",
+                {"email": acc.get("from_address") or acc.get("imap_user", ""),
+                 "password": acc.get("password", ""),
+                 "host": acc.get("smtp_host", ""),
+                 "port": acc.get("smtp_port") or "465"},
+                acc_enabled, name=name,
+            )
+            changed = True
 
     if changed:
         try:

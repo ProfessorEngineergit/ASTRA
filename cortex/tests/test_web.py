@@ -384,7 +384,7 @@ def test_secretary_shows_channel_threads_and_chat_import(memdb, monkeypatch):
     assert "Channel Threads" in r.text
     assert "WAHA Webhook" in r.text
     assert "sec_waha_base_url" in r.text
-    assert "sec_email_imap_host" in r.text
+    assert "sec_email_0_imap_host" in r.text
     assert "sec_signal_base_url" in r.text
     assert "sec_slack_bot_token" in r.text  # Slack is a Secretary channel now
     assert "QR anzeigen" in r.text
@@ -469,3 +469,40 @@ def test_secretary_waha_qr_endpoint_returns_image(memdb, monkeypatch):
 
     assert r.status_code == 200
     assert r.json()["image"].startswith("data:image/png;base64,")
+
+
+def test_secretary_saves_multiple_email_accounts(memdb, monkeypatch):
+    _prime_manager()
+
+    async def _no_threads(*a, **k):
+        return []
+
+    from app import db
+    monkeypatch.setattr(db, "list_threads", _no_threads)
+    c = TestClient(_app())
+    c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    r = c.post("/admin/secretary", data={
+        "csrf": csrf,
+        "sec_enabled": "on",
+        "sec_email_enabled": "on",
+        "sec_email_count": "2",
+        "sec_email_0_from": "privat@example.com",
+        "sec_email_0_imap_host": "imap.example.com",
+        "sec_email_0_password": "pw1",
+        "sec_email_0_enabled": "on",
+        "sec_email_1_from": "schule@example.org",
+        "sec_email_1_imap_host": "imap.example.org",
+        "sec_email_1_password": "pw2",
+        "sec_email_1_enabled": "on",
+    }, follow_redirects=False)
+    assert r.status_code == 303
+
+    r = c.get("/admin/secretary")
+    assert "imap.example.com" in r.text
+    assert "imap.example.org" in r.text
+    # second saved account + one fresh blank block => index 2 fields rendered
+    assert "sec_email_2_imap_host" in r.text
