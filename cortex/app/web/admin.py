@@ -2152,6 +2152,7 @@ def _secretary_channel_card(channel: str, cfg: dict, inst: dict) -> str:
               <label>Modus</label>
               {_select(f"sec_{channel}_mode", cfg.get("mode", "policy"), mode_options)}
             </div>
+            <button class="btn sm" type="submit" style="margin-left:auto">Speichern ↑</button>
           </div>
         </div>
         {_render_setup_chat(channel, _setup_messages(setup_store, channel))}
