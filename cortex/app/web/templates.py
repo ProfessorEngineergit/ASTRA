@@ -623,6 +623,9 @@ details.adv > summary::-webkit-details-marker { display: none; }
 details.adv > summary::before { content: '▸ '; color: var(--text-faint); }
 details.adv[open] > summary::before { content: '▾ '; }
 details.adv[open] > summary { margin-bottom: 12px; }
+.install-policy { display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
+  margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--hair); }
+.install-policy .setup-field { margin: 0; }
 .labs-head { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; }
 .labs-head .beaker { color: #d8dbe3; flex-shrink: 0; filter: drop-shadow(0 0 16px rgba(216,219,227,.16)); }
 .labs-head h2 { margin: 0 0 4px; font-size: 19px; }
