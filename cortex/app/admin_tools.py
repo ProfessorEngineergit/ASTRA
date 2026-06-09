@@ -13,7 +13,7 @@ import logging
 import re
 from pathlib import Path
 
-from . import db, sysinfo
+from . import db, knowledge, sysinfo
 from .config_store import SECRET_SENTINEL, get_config_store
 from .models import set_model_override
 from .plugins.base import CATEGORY_LABELS
@@ -292,6 +292,64 @@ async def _system_status(args: dict, ctx: ToolContext) -> str:
             f"CPU {pc(c['load_pct'])} ({c['count']} Kerne) · Uptime {snap['uptime_h']}\n{recs}")
 
 
+# ─── Brain files: read & write ASTRA's memory about people ─────────────────────
+async def _brain_list(args: dict, ctx: ToolContext) -> str:
+    q = (args.get("query") or "").lower()
+    files = knowledge.list_files()
+    rows = []
+    for e in files:
+        if q and q not in (e["title"] + " " + e["rel"] + " " + e["preview"]).lower():
+            continue
+        rows.append(f"• {e['rel']} — {e['title']} [{e['tag']}] ({e['lines']} Z., {e['mtime']})")
+    if not rows:
+        return "Keine Brain-Dateien gefunden."
+    return f"{len(rows)} Brain-Dateien:\n" + "\n".join(rows)
+
+
+async def _brain_read(args: dict, ctx: ToolContext) -> str:
+    rel = args.get("file", "")
+    text = knowledge.read_file(rel)
+    if not text:
+        return f"'{rel}' ist leer oder existiert nicht. Nutze astra_brain_list."
+    return f"# {rel}\n{text}"
+
+
+async def _brain_write(args: dict, ctx: ToolContext) -> str:
+    if not await _writes_allowed(ctx):
+        return "Schreiben in Brain-Dateien ist deaktiviert (allow_self_config)."
+    rel, content = args.get("file", ""), args.get("content")
+    if content is None:
+        return "Kein 'content' übergeben."
+    if knowledge.write_file(rel, str(content)):
+        await db.audit("brain_write", actor="astra", detail={"file": rel})
+        return f"'{rel}' gespeichert ({len(str(content))} Zeichen)."
+    return f"Konnte '{rel}' nicht schreiben (ungültiger Pfad?)."
+
+
+async def _brain_append(args: dict, ctx: ToolContext) -> str:
+    if not await _writes_allowed(ctx):
+        return "Schreiben in Brain-Dateien ist deaktiviert (allow_self_config)."
+    rel, text = args.get("file", ""), (args.get("text") or "").strip()
+    if not text:
+        return "Kein 'text' übergeben."
+    cur = knowledge.read_file(rel)
+    new = (cur.rstrip() + f"\n- {text}\n") if cur else f"- {text}\n"
+    if knowledge.write_file(rel, new):
+        await db.audit("brain_append", actor="astra", detail={"file": rel})
+        return f"An '{rel}' angehängt."
+    return f"Konnte '{rel}' nicht ergänzen."
+
+
+async def _brain_add_person(args: dict, ctx: ToolContext) -> str:
+    if not await _writes_allowed(ctx):
+        return "Anlegen ist deaktiviert (allow_self_config)."
+    rel = knowledge.create_person(args.get("name", ""))
+    if not rel:
+        return "Ungültiger Name."
+    await db.audit("brain_add_person", actor="astra", detail={"file": rel})
+    return f"Personen-Datei angelegt: {rel} — jetzt mit astra_brain_write füllen."
+
+
 def register_admin_tools() -> None:
     """Register all self-admin tools as owner-only core tools (idempotent)."""
     defs = [
@@ -336,6 +394,22 @@ def register_admin_tools() -> None:
              "allow_self_config": {"type": "boolean"}}}, _update_settings),
         ("astra_system_status", "Container-Leistung (RAM/CPU/Disk/Uptime) + Empfehlungen.",
          {"type": "object", "properties": {}}, _system_status),
+        ("astra_brain_list", "Liste alle Brain-/Wissens-Dateien (über mich + pro Person).",
+         {"type": "object", "properties": {"query": {"type": "string"}}}, _brain_list),
+        ("astra_brain_read", "Lies eine Brain-Datei (z. B. facts.md oder people/<slug>.md).",
+         {"type": "object", "properties": {"file": {"type": "string"}}, "required": ["file"]},
+         _brain_read),
+        ("astra_brain_write", "Überschreibe eine Brain-Datei komplett mit neuem Markdown.",
+         {"type": "object", "properties": {
+             "file": {"type": "string"}, "content": {"type": "string"}},
+          "required": ["file", "content"]}, _brain_write),
+        ("astra_brain_append", "Hänge eine Notiz (Bullet) an eine Brain-Datei an.",
+         {"type": "object", "properties": {
+             "file": {"type": "string"}, "text": {"type": "string"}},
+          "required": ["file", "text"]}, _brain_append),
+        ("astra_brain_add_person", "Lege eine neue Personen-Brain-Datei an (people/<slug>.md).",
+         {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+         _brain_add_person),
         ("astra_list_capabilities", "Liste verfügbare Agentenfähigkeiten mit Safety/Intent.",
          {"type": "object", "properties": {"query": {"type": "string"}}}, _list_capabilities),
         ("astra_explain_capability", "Erkläre eine Integration oder ein Tool aus dem Capability-Manifest.",
@@ -350,7 +424,8 @@ def register_admin_tools() -> None:
     for name, desc, params, handler in defs:
         safety = "mutation" if name in {
             "astra_configure_integration", "astra_update_settings", "astra_test_capability",
-            "astra_create_plugin_module"
+            "astra_create_plugin_module", "astra_brain_write", "astra_brain_append",
+            "astra_brain_add_person",
         } else "private_read"
         intents = ["status", "list"] if "list" in name or "status" in name else ["control"] if safety == "mutation" else ["status"]
         register(Tool(name=name, description=desc, parameters=params, handler=handler,

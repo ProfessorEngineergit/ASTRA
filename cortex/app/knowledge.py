@@ -15,6 +15,7 @@ Layout:
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -99,6 +100,9 @@ def _read(name: str) -> str:
 def owner_context() -> str:
     """Concatenated private knowledge for the OWNER register (system prompt block)."""
     parts = [c for name in _PRIVATE if (c := _read(name))]
+    idx = people_index()
+    if idx:
+        parts.append(idx + "\n(Mit astra_brain_read/-write kannst du sie lesen & pflegen.)")
     return "\n\n".join(parts).strip()
 
 
@@ -117,3 +121,121 @@ def append_fact(text: str, *, file: str = "facts.md") -> bool:
     except Exception as e:  # noqa: BLE001
         log.warning("append_fact failed: %s", e)
         return False
+
+
+# ─── Brain files: live-editable markdown (owner + per person) ───────────────────
+# Display title + tag for the core files; person files live under people/<slug>.md.
+_TITLES: dict[str, tuple[str, str]] = {
+    "facts.md": ("Über mich", "über mich"),
+    "persona.md": ("Persona & Ton", "persona"),
+    "routines.md": ("Routinen", "routinen"),
+    "people.md": ("Personen – Übersicht", "personen"),
+}
+_PEOPLE_DIR = "people"
+
+
+def _safe_path(rel: str) -> Path | None:
+    """Resolve a relative brain path safely (only *.md inside BRAIN_DATA_DIR)."""
+    rel = (rel or "").strip().lstrip("/")
+    if not rel.endswith(".md") or ".." in rel or not re.fullmatch(r"[A-Za-z0-9 _\-./]+", rel):
+        return None
+    base = _dir().resolve()
+    p = (base / rel).resolve()
+    return p if str(p) == str(base) or str(p).startswith(str(base) + "/") else None
+
+
+def _preview(text: str) -> str:
+    for line in text.splitlines():
+        s = line.strip().lstrip("#-* ").strip()
+        if s:
+            return s[:120]
+    return ""
+
+
+def list_files() -> list[dict]:
+    """All brain files with metadata (for the admin UI + agent index)."""
+    ensure_seeded()
+    base = _dir().resolve()
+    out: list[dict] = []
+    try:
+        for f in sorted(base.rglob("*.md")):
+            rel = str(f.relative_to(base))
+            try:
+                txt = f.read_text(encoding="utf-8")
+            except Exception:  # noqa: BLE001
+                continue
+            if rel.startswith(f"{_PEOPLE_DIR}/"):
+                title, tag = f.stem.replace("_", " ").title(), "person"
+            else:
+                title, tag = _TITLES.get(rel, (f.stem.replace("_", " ").title(), "sonstiges"))
+            out.append({
+                "rel": rel, "title": title, "tag": tag, "preview": _preview(txt),
+                "size": len(txt), "lines": txt.count("\n") + 1,
+                "mtime": datetime.fromtimestamp(f.stat().st_mtime).strftime("%d.%m %H:%M"),
+            })
+    except Exception as e:  # noqa: BLE001
+        log.warning("knowledge.list_files failed: %s", e)
+    # Core files first (canonical order), then people alphabetically.
+    order = list(_TITLES)
+    out.sort(key=lambda e: (e["rel"] not in order, order.index(e["rel"]) if e["rel"] in order else 0, e["rel"]))
+    return out
+
+
+def read_file(rel: str) -> str:
+    p = _safe_path(rel)
+    if not p or not p.exists():
+        return ""
+    try:
+        return p.read_text(encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        log.warning("knowledge.read_file %s failed: %s", rel, e)
+        return ""
+
+
+def write_file(rel: str, content: str) -> bool:
+    p = _safe_path(rel)
+    if not p:
+        return False
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        log.info("Brain file written: %s (%d chars)", rel, len(content))
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("knowledge.write_file %s failed: %s", rel, e)
+        return False
+
+
+def create_person(name: str) -> str | None:
+    """Create people/<slug>.md from a template; returns the relative path."""
+    slug = re.sub(r"[^a-z0-9]+", "_", (name or "").lower()).strip("_")
+    if not slug:
+        return None
+    rel = f"{_PEOPLE_DIR}/{slug}.md"
+    p = _safe_path(rel)
+    if not p:
+        return None
+    if not p.exists():
+        write_file(rel, f"""# {name.strip()}
+
+- **Beziehung:**
+- **Trust-Tier:** (0 = ich · 1 = eng · 2 = bekannt · 3 = fremd)
+- **Kanäle:** (Telegram / WhatsApp / Signal / E-Mail …)
+
+## Darf wissen / teilen
+
+
+## Nicht teilen
+
+
+## Notizen
+""")
+    return rel
+
+
+def people_index() -> str:
+    """One-line index of available person files (so ASTRA knows they exist)."""
+    people = [e for e in list_files() if e["tag"] == "person"]
+    if not people:
+        return ""
+    return "Personen-Dateien: " + ", ".join(f"{e['title']} ({e['rel']})" for e in people)
