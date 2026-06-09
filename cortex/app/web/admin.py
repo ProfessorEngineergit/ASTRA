@@ -2027,12 +2027,29 @@ def _channel_setup_fields(channel: str, inst: dict, connected: bool = False) -> 
     if channel == "signal":
         base = inst.get("base_url") or s.signal_base_url or "http://signal-cli:8080"
         account = inst.get("account") or s.signal_phone_number or ""
+        if connected:
+            pairing = (
+                '<div class="pairing-panel primary is-connected" data-signal-pairing data-connected="1">'
+                '<div><b>✓ Signal verbunden</b><span>ASTRA ist als verknüpftes Gerät an deinem '
+                'Signal-Account angemeldet und empfängt Nachrichten auf <code>/ingress/signal</code>.'
+                '</span></div>'
+                '<div class="pairing-actions">'
+                '<button class="btn sm ghost" type="button" data-signal-recouple>Neu koppeln (QR)</button></div>'
+                '<div class="qr-box" data-signal-qr-box></div></div>'
+            )
+        else:
+            pairing = (
+                '<div class="pairing-panel primary" data-signal-pairing>'
+                '<div><b>Signal verbinden</b><span>QR anzeigen &nbsp;→&nbsp; in Signal unter '
+                '<i>Einstellungen · Verknüpfte Geräte · Gerät verknüpfen</i> scannen. Server-URL ist '
+                'automatisch gesetzt; ASTRA empfängt danach Webhooks auf <code>/ingress/signal</code>.</span></div>'
+                '<div class="pairing-actions">'
+                '<button class="btn sm" type="button" data-signal-qr>QR anzeigen</button></div>'
+                '<div class="qr-box" data-signal-qr-box></div></div>'
+            )
         return (
-            '<div class="pairing-panel primary">'
-            '<div><b>Signal verbinden</b><span>Im signal-cli-rest-api als verknüpftes Gerät registrieren '
-            '(QR dort scannen). Server-URL ist automatisch gesetzt; ASTRA empfängt danach Webhooks auf '
-            '<code>/ingress/signal</code>.</span></div></div>'
-            '<details class="adv"><summary>Erweiterte Einstellungen (automatisch befüllt)</summary>'
+            pairing
+            + '<details class="adv"><summary>Erweiterte Einstellungen (automatisch befüllt)</summary>'
             '<div class="install-fields">'
             + _field("sec_signal_title", "Titel", inst.get("title", ""), placeholder="Signal")
             + _field("sec_signal_base_url", "signal-cli API URL", base, placeholder="http://signal-cli:8080")
@@ -2165,6 +2182,15 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
         )
     except Exception:  # noqa: BLE001
         live_status["waha"] = {"ok": False, "connected": False}
+    try:
+        s = get_settings()
+        sig = installations["signal"]
+        live_status["signal"] = await _signal_status(
+            sig.get("base_url") or s.signal_base_url or "http://signal-cli:8080",
+            sig.get("account") or s.signal_phone_number or "",
+        )
+    except Exception:  # noqa: BLE001
+        live_status["signal"] = {"ok": False, "connected": False}
     channel_cards = "".join(
         _secretary_channel_card(
             ch,
@@ -2377,6 +2403,42 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
         }}
         testBtn.disabled = false;
       }};
+      async function loadSignalQr() {{
+        const box = document.querySelector('[data-signal-qr-box]');
+        if (!box) return;
+        box.textContent = 'QR wird geladen...';
+        const r = await fetch('/admin/secretary/signal/qr', {{
+          method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(formContext('signal'))
+        }});
+        const d = await r.json();
+        if (d.image) {{
+          box.innerHTML = `<img src="${{d.image}}" alt="Signal QR"><small>In Signal · Verknüpfte Geräte scannen — die Verbindung bestätigt sich automatisch…</small>`;
+          pollSignalStatus();
+        }} else box.textContent = d.message || d.error || 'Kein QR verfuegbar.';
+      }}
+      const signalQrBtn = document.querySelector('[data-signal-qr]');
+      if (signalQrBtn) signalQrBtn.onclick = loadSignalQr;
+      const signalRecouple = document.querySelector('[data-signal-recouple]');
+      if (signalRecouple) signalRecouple.onclick = () => {{
+        if (!confirm('Signal wirklich neu koppeln? Die aktuelle Geräte-Verknüpfung bleibt bestehen, bis du den neuen QR-Code scannst.')) return;
+        loadSignalQr();
+      }};
+      let signalPoll = null;
+      function pollSignalStatus() {{
+        if (signalPoll) return;
+        let tries = 0;
+        signalPoll = setInterval(async () => {{
+          tries++;
+          try {{
+            const r = await fetch('/admin/secretary/signal/status', {{
+              method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(formContext('signal'))
+            }});
+            const d = await r.json();
+            if (d.connected) {{ clearInterval(signalPoll); signalPoll = null; location.reload(); }}
+          }} catch (e) {{}}
+          if (tries > 40) {{ clearInterval(signalPoll); signalPoll = null; }}
+        }}, 3000);
+      }}
       let wahaPoll = null;
       function pollWahaStatus() {{
         if (wahaPoll) return;
@@ -2750,6 +2812,48 @@ async def secretary_waha_status(request: Request, _: bool = Depends(auth.require
     session = str(data.get("waha_session") or data.get("session") or s.waha_session or "default")
     api_key = str(data.get("waha_api_key") or data.get("api_key") or s.waha_api_key or "")
     return JSONResponse(await _waha_session_status(base_url, session, api_key))
+
+
+async def _signal_status(base_url: str, account: str) -> dict:
+    """signal-cli-rest-api: GET /v1/accounts lists registered/linked numbers."""
+    result = await _waha_request(base_url, "/v1/accounts")
+    if not result.get("ok"):
+        return {"ok": False, "connected": False, "accounts": []}
+    try:
+        accounts = json.loads(result.get("text") or "[]")
+    except json.JSONDecodeError:
+        accounts = []
+    accounts = [str(a) for a in accounts] if isinstance(accounts, list) else []
+    connected = (account in accounts) if account else bool(accounts)
+    return {"ok": True, "connected": connected, "accounts": accounts,
+            "me": account or (accounts[0] if accounts else "")}
+
+
+@router.post("/admin/secretary/signal/status")
+async def secretary_signal_status(request: Request, _: bool = Depends(auth.require_admin)):
+    data = await request.json()
+    s = get_settings()
+    base_url = str(data.get("signal_base_url") or data.get("base_url") or s.signal_base_url or "http://signal-cli:8080")
+    account = str(data.get("signal_account") or data.get("account") or s.signal_phone_number or "")
+    return JSONResponse(await _signal_status(base_url, account))
+
+
+@router.post("/admin/secretary/signal/qr")
+async def secretary_signal_qr(request: Request, _: bool = Depends(auth.require_admin)):
+    data = await request.json()
+    s = get_settings()
+    base_url = str(data.get("signal_base_url") or data.get("base_url") or s.signal_base_url or "http://signal-cli:8080")
+    device = str(data.get("signal_title") or data.get("title") or "ASTRA").strip() or "ASTRA"
+    from urllib.parse import quote
+    result = await _waha_request(base_url, f"/v1/qrcodelink?device_name={quote(device)}")
+    if result.get("ok"):
+        payload = _image_payload(result, source="signal-link")
+        if payload:
+            return JSONResponse(payload)
+    return JSONResponse({
+        "ok": False,
+        "message": "Kein QR von signal-cli erhalten. Läuft der Container im json-rpc/native-Modus und stimmt die URL?",
+    })
 
 
 @router.post("/admin/secretary/waha/test")
