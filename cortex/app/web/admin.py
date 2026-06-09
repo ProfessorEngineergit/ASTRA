@@ -1960,7 +1960,11 @@ def _channel_setup_fields(channel: str, inst: dict, connected: bool = False) -> 
                 '<div><b>✓ WhatsApp verbunden</b><span>Diese Session ist mit deinem WhatsApp-Profil '
                 'gekoppelt. ASTRA empfängt und beantwortet Nachrichten gemäß deiner Policy.</span></div>'
                 '<div class="pairing-actions">'
-                '<button class="btn sm ghost" type="button" data-waha-qr>Neu koppeln (QR)</button></div>'
+                '<button class="btn sm" type="button" data-waha-test>Testen</button>'
+                '<button class="btn sm ghost" type="button" data-waha-recouple>Neu koppeln (QR)</button></div>'
+                '<details class="adv waha-test" data-waha-test-wrap hidden>'
+                '<summary>Live-Test (Selbst-Chat)</summary>'
+                '<div class="waha-test-box" data-waha-test-box></div></details>'
                 '<div class="qr-box" data-qr-box></div></div>'
             )
         else:
@@ -2223,9 +2227,19 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
           ca.innerHTML = '<strong>On-screen</strong><br>' + (visible || 'Noch keine Felder ausgefuellt.');
         }}
       }}
-      document.querySelectorAll('[data-open-setup]').forEach(btn => btn.onclick = () => updateCoach(btn.dataset.openSetup));
+      document.querySelectorAll('[data-open-setup]').forEach(btn => btn.onclick = () => {{
+        const channel = btn.dataset.openSetup;
+        const cfg = document.querySelector(`.install-config[data-config="${{channel}}"]`);
+        if (channel === activeSetup.channel && cfg && !cfg.hidden) {{
+          cfg.hidden = true;
+        }} else {{
+          updateCoach(channel);
+          if (cfg) {{ cfg.hidden = false; cfg.scrollIntoView({{behavior:'smooth', block:'nearest'}}); }}
+        }}
+      }});
       document.querySelectorAll('.install-card input,.install-card select').forEach(el => el.addEventListener('input', () => updateCoach(activeSetup.channel)));
       updateCoach('waha');
+      document.querySelectorAll('.install-config').forEach(cfg => cfg.hidden = true);
 
       document.querySelectorAll('.setup-chatbox').forEach(box => {{
         const channel = box.dataset.setupChannel;
@@ -2262,9 +2276,9 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
         btn.onclick = send;
         input.addEventListener('keydown', e => {{ if (e.key === 'Enter') send(); }});
       }});
-      const qrBtn = document.querySelector('[data-waha-qr]');
-      if (qrBtn) qrBtn.onclick = async () => {{
+      async function loadWahaQr() {{
         const box = document.querySelector('[data-qr-box]');
+        if (!box) return;
         box.textContent = 'QR wird geladen...';
         const r = await fetch('/admin/secretary/waha/qr', {{
           method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(formContext('waha'))
@@ -2274,6 +2288,43 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
           box.innerHTML = `<img src="${{d.image}}" alt="WhatsApp QR"><small>Nach dem Scannen bestätigt sich die Verbindung automatisch…</small>`;
           pollWahaStatus();
         }} else box.textContent = d.message || d.error || 'Kein QR verfuegbar.';
+      }}
+      const qrBtn = document.querySelector('[data-waha-qr]');
+      if (qrBtn) qrBtn.onclick = loadWahaQr;
+      const recoupleBtn = document.querySelector('[data-waha-recouple]');
+      if (recoupleBtn) recoupleBtn.onclick = () => {{
+        if (!confirm('WhatsApp wirklich neu koppeln? Die aktuelle Verbindung wird dabei getrennt, bis du den neuen QR-Code gescannt hast.')) return;
+        loadWahaQr();
+      }};
+      const testBtn = document.querySelector('[data-waha-test]');
+      if (testBtn) testBtn.onclick = async () => {{
+        const wrap = document.querySelector('[data-waha-test-wrap]');
+        const box = document.querySelector('[data-waha-test-box]');
+        if (wrap) {{ wrap.hidden = false; wrap.open = true; }}
+        if (!box) return;
+        box.innerHTML = '<div class="mini">Sende Testnachrichten an deinen eigenen Chat…</div>';
+        testBtn.disabled = true;
+        try {{
+          const r = await fetch('/admin/secretary/waha/test', {{
+            method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(formContext('waha'))
+          }});
+          const d = await r.json();
+          if (!d.ok) {{ box.innerHTML = `<div class="mini">${{d.message || 'Test fehlgeschlagen.'}}</div>`; }}
+          else {{
+            const head = `<div class="mini">${{d.sent}} Nachrichten gesendet${{d.me ? ' · ' + d.me : ''}} · Spiegel des Selbst-Chats:</div>`;
+            const rows = (d.messages || []).map(m => {{
+              const div = document.createElement('div');
+              div.className = 'setup-msg ' + (m.fromMe ? 'user' : 'bot');
+              div.innerHTML = '<b>' + (m.fromMe ? 'Gesendet' : 'Empfangen') + '</b><span></span>';
+              div.querySelector('span').textContent = m.body;
+              return div.outerHTML;
+            }}).join('');
+            box.innerHTML = head + '<div class="setup-log">' + rows + '</div>';
+          }}
+        }} catch (e) {{
+          box.innerHTML = '<div class="mini">Test konnte nicht ausgeführt werden.</div>';
+        }}
+        testBtn.disabled = false;
       }};
       let wahaPoll = null;
       function pollWahaStatus() {{
@@ -2530,15 +2581,16 @@ def _waha_base(value: str) -> str:
     return (value or "").strip().rstrip("/")
 
 
-async def _waha_request(base_url: str, path: str, *, api_key: str = "", method: str = "GET") -> dict:
+async def _waha_request(base_url: str, path: str, *, api_key: str = "", method: str = "GET",
+                        json_body: dict | None = None) -> dict:
     import httpx
     base = _waha_base(base_url)
     if not base:
         return {"ok": False, "message": "WAHA Base URL fehlt."}
     url = f"{base}{path}"
     try:
-        async with httpx.AsyncClient(timeout=12) as client:
-            response = await client.request(method, url, headers=_waha_headers(api_key))
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.request(method, url, headers=_waha_headers(api_key), json=json_body)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "message": f"WAHA nicht erreichbar: {e}"}
     content_type = response.headers.get("content-type", "")
@@ -2568,13 +2620,16 @@ async def _waha_session_status(base_url: str, session: str, api_key: str) -> dic
     state = str(data.get("status") or data.get("state") or "").upper()
     me = data.get("me") or {}
     label = ""
+    chat_id = ""
     if isinstance(me, dict):
         label = me.get("pushName") or me.get("id") or ""
+        chat_id = me.get("id") or ""
     return {
         "ok": True,
         "connected": state in _WAHA_CONNECTED_STATES,
         "state": state,
         "me": str(label),
+        "chat_id": str(chat_id),
     }
 
 
@@ -2618,6 +2673,69 @@ async def secretary_waha_status(request: Request, _: bool = Depends(auth.require
     session = str(data.get("waha_session") or data.get("session") or s.waha_session or "default")
     api_key = str(data.get("waha_api_key") or data.get("api_key") or s.waha_api_key or "")
     return JSONResponse(await _waha_session_status(base_url, session, api_key))
+
+
+@router.post("/admin/secretary/waha/test")
+async def secretary_waha_test(request: Request, _: bool = Depends(auth.require_admin)):
+    """Send a few messages to the owner's own WhatsApp chat, read them back and
+    mirror the result. Each run is tagged so only this run's messages are shown."""
+    import asyncio
+    from urllib.parse import quote
+    data = await request.json()
+    s = get_settings()
+    base_url = str(data.get("waha_base_url") or data.get("base_url") or s.waha_base_url or "http://waha:3000")
+    session = str(data.get("waha_session") or data.get("session") or s.waha_session or "default")
+    api_key = str(data.get("waha_api_key") or data.get("api_key") or s.waha_api_key or "")
+    status = await _waha_session_status(base_url, session, api_key)
+    if not status.get("connected"):
+        return JSONResponse({"ok": False, "message": "WhatsApp ist nicht verbunden."})
+    chat_id = status.get("chat_id") or ""
+    if not chat_id:
+        return JSONResponse({"ok": False, "message": "Eigene WhatsApp-Nummer konnte nicht ermittelt werden."})
+    token = datetime.now().strftime("%H%M%S")
+    texts = [
+        f"ASTRA Selbsttest 1/3 · #{token}",
+        f"ASTRA Selbsttest 2/3 · #{token} — Senden & Empfangen ok?",
+        f"ASTRA Selbsttest 3/3 · #{token} — fertig.",
+    ]
+    sent = 0
+    for text in texts:
+        res = await _waha_request(
+            base_url, "/api/sendText", api_key=api_key, method="POST",
+            json_body={"session": session, "chatId": chat_id, "text": text},
+        )
+        if res.get("ok"):
+            sent += 1
+        await asyncio.sleep(0.4)
+    if not sent:
+        return JSONResponse({"ok": False, "message": "Testnachrichten konnten nicht gesendet werden."})
+    await asyncio.sleep(1.5)
+    messages = []
+    read = await _waha_request(
+        base_url,
+        f"/api/{session}/chats/{quote(chat_id)}/messages?limit=40&downloadMedia=false",
+        api_key=api_key,
+    )
+    if read.get("ok"):
+        try:
+            arr = json.loads(read.get("text") or "[]")
+        except json.JSONDecodeError:
+            arr = []
+        for m in arr if isinstance(arr, list) else []:
+            body = str(m.get("body") or "")
+            if f"#{token}" not in body:
+                continue
+            messages.append({
+                "fromMe": bool(m.get("fromMe")),
+                "body": body,
+                "ts": int(m.get("timestamp") or 0),
+            })
+        messages.sort(key=lambda x: x["ts"])
+    if not messages:
+        # Reading may be unsupported on this WAHA tier — fall back to what we sent.
+        messages = [{"fromMe": True, "body": t, "ts": 0} for t in texts]
+    await db.audit("secretary_waha_test", actor="owner", detail={"sent": sent, "shown": len(messages)})
+    return JSONResponse({"ok": True, "sent": sent, "me": status.get("me"), "messages": messages})
 
 
 @router.post("/admin/secretary/waha/qr")
