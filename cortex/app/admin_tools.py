@@ -350,6 +350,60 @@ async def _brain_add_person(args: dict, ctx: ToolContext) -> str:
     return f"Personen-Datei angelegt: {rel} — jetzt mit astra_brain_write füllen."
 
 
+async def _secretary_email_set(args: dict, ctx: ToolContext) -> str:
+    """Set/overwrite the Secretary email_accounts list in app_settings."""
+    if not await _writes_allowed(ctx):
+        return "Schreiben ist deaktiviert (allow_self_config)."
+    accounts = args.get("accounts")
+    if not isinstance(accounts, list):
+        return "Erwarte 'accounts' als Liste von Objekten (from_address, imap_host, …)."
+    appset = await _settings()
+    secretary = appset.get("secretary") or {}
+    # Preserve existing passwords for entries where password is blank/omitted
+    prev = secretary.get("email_accounts") or []
+    merged = []
+    for i, acc in enumerate(accounts):
+        prev_acc = prev[i] if i < len(prev) else {}
+        merged.append({
+            "title": acc.get("title") or f"Konto {i + 1}",
+            "enabled": bool(acc.get("enabled", True)),
+            "from_address": acc.get("from_address", ""),
+            "imap_host": acc.get("imap_host", ""),
+            "imap_port": str(acc.get("imap_port") or "993"),
+            "imap_user": acc.get("imap_user") or acc.get("from_address", ""),
+            "password": acc.get("password") or prev_acc.get("password", ""),
+            "imap_mailbox": acc.get("imap_mailbox") or "INBOX",
+            "smtp_host": acc.get("smtp_host", ""),
+            "smtp_port": str(acc.get("smtp_port") or "587"),
+            "poll_minutes": str(acc.get("poll_minutes") or "5"),
+            "webhook_url": "/ingress/email",
+        })
+    secretary["email_accounts"] = merged
+    appset["secretary"] = secretary
+    await db.set_setting("app_settings", appset)
+    await db.audit("secretary_email_set", actor="astra", detail={"count": len(merged)})
+    titles = [a.get("title") or a.get("from_address") for a in merged]
+    return f"{len(merged)} Mail-Konto/Konten gespeichert: {', '.join(str(t) for t in titles)}"
+
+
+async def _secretary_email_get(args: dict, ctx: ToolContext) -> str:
+    """Read back the current email_accounts config (passwords masked)."""
+    appset = await _settings()
+    accounts = (appset.get("secretary") or {}).get("email_accounts") or []
+    if not accounts:
+        return "Keine Mail-Konten konfiguriert."
+    rows = []
+    for i, a in enumerate(accounts):
+        pw = "✓ gesetzt" if a.get("password") else "— leer"
+        rows.append(
+            f"{i+1}. {a.get('title','?')} | {a.get('from_address','')} | "
+            f"IMAP {a.get('imap_host','')}:{a.get('imap_port','')} | "
+            f"SMTP {a.get('smtp_host','')}:{a.get('smtp_port','')} | "
+            f"Passwort: {pw} | aktiv: {a.get('enabled', True)}"
+        )
+    return "\n".join(rows)
+
+
 def register_admin_tools() -> None:
     """Register all self-admin tools as owner-only core tools (idempotent)."""
     defs = [
@@ -410,6 +464,28 @@ def register_admin_tools() -> None:
         ("astra_brain_add_person", "Lege eine neue Personen-Brain-Datei an (people/<slug>.md).",
          {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
          _brain_add_person),
+        ("astra_secretary_email_get",
+         "Zeige die aktuell konfigurierten Mail-Konten im Secretary (Passwörter maskiert).",
+         {"type": "object", "properties": {}}, _secretary_email_get),
+        ("astra_secretary_email_set",
+         "Speichere die Secretary Mail-Konten-Liste. Jedes Konto: from_address, imap_host, imap_port, "
+         "imap_user, password (leer=behalten), smtp_host, smtp_port, title, enabled, poll_minutes.",
+         {"type": "object", "properties": {
+             "accounts": {
+                 "type": "array",
+                 "items": {"type": "object", "properties": {
+                     "title": {"type": "string"},
+                     "from_address": {"type": "string"},
+                     "imap_host": {"type": "string"},
+                     "imap_port": {"type": "string"},
+                     "imap_user": {"type": "string"},
+                     "password": {"type": "string"},
+                     "imap_mailbox": {"type": "string"},
+                     "smtp_host": {"type": "string"},
+                     "smtp_port": {"type": "string"},
+                     "poll_minutes": {"type": "string"},
+                     "enabled": {"type": "boolean"}}}}},
+          "required": ["accounts"]}, _secretary_email_set),
         ("astra_list_capabilities", "Liste verfügbare Agentenfähigkeiten mit Safety/Intent.",
          {"type": "object", "properties": {"query": {"type": "string"}}}, _list_capabilities),
         ("astra_explain_capability", "Erkläre eine Integration oder ein Tool aus dem Capability-Manifest.",
@@ -425,7 +501,7 @@ def register_admin_tools() -> None:
         safety = "mutation" if name in {
             "astra_configure_integration", "astra_update_settings", "astra_test_capability",
             "astra_create_plugin_module", "astra_brain_write", "astra_brain_append",
-            "astra_brain_add_person",
+            "astra_brain_add_person", "astra_secretary_email_set",
         } else "private_read"
         intents = ["status", "list"] if "list" in name or "status" in name else ["control"] if safety == "mutation" else ["status"]
         register(Tool(name=name, description=desc, parameters=params, handler=handler,

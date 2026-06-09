@@ -1907,23 +1907,35 @@ def _email_accounts(raw_secretary: dict) -> list[dict]:
 
 def _email_account_block(i: int, acc: dict) -> str:
     title = acc.get("title", "") or (f"Konto {i + 1}")
+    has_imap = bool(acc.get("imap_host"))
+    test_btn = (
+        f'<button class="btn sm" type="button" data-email-test="{i}">Testen</button>'
+        if has_imap else ""
+    )
     return (
-        f'<div class="email-account" data-email-account>'
+        f'<div class="email-account" data-email-account data-email-idx="{i}">'
         f'<div class="email-account-head"><b>Mail-Konto {i + 1}</b>'
-        f'<label class="secretary-switch"><input type="checkbox" name="sec_email_{i}_enabled"'
-        f'{_checked(bool(acc.get("enabled", True)))}> aktiv</label></div>'
-        '<div class="install-fields">'
-        + _field(f"sec_email_{i}_title", "Bezeichnung", title, placeholder="z. B. Privat / Schule")
+        f'<div style="display:flex;gap:8px;align-items:center">'
+        + test_btn
+        + f'<label class="secretary-switch"><input type="checkbox" name="sec_email_{i}_enabled"'
+        f'{_checked(bool(acc.get("enabled", True)))}> aktiv</label></div></div>'
+        + f'<div class="install-fields">'
+        + _field(f"sec_email_{i}_title", "Bezeichnung", title, placeholder="z. B. iCloud / Schule / Google")
         + _field(f"sec_email_{i}_from", "Absender-Adresse", acc.get("from_address", ""), placeholder="name@example.com")
         + _field(f"sec_email_{i}_imap_host", "IMAP Host", acc.get("imap_host", ""), placeholder="imap.example.com")
         + _field(f"sec_email_{i}_imap_port", "IMAP Port", acc.get("imap_port", "993"))
-        + _field(f"sec_email_{i}_imap_user", "IMAP User", acc.get("imap_user", ""), placeholder="name@example.com")
+        + _field(f"sec_email_{i}_imap_user", "IMAP User", acc.get("imap_user", ""), placeholder="name@example.com  –oder–  haupt@s.de\\freigabe@s.de")
         + _field(f"sec_email_{i}_password", "Passwort / App-Passwort", "", placeholder="••• (leer = unverändert)", typ="password")
         + _field(f"sec_email_{i}_imap_mailbox", "Postfach", acc.get("imap_mailbox", "INBOX"))
-        + _field(f"sec_email_{i}_smtp_host", "SMTP Host", acc.get("smtp_host", ""), placeholder="smtp.example.com")
+        + _field(f"sec_email_{i}_smtp_host", "SMTP Host", acc.get("smtp_host", ""), placeholder="smtp.example.com  (leer = aus IMAP-Host ableiten)")
         + _field(f"sec_email_{i}_smtp_port", "SMTP Port", acc.get("smtp_port", "587"))
         + _field(f"sec_email_{i}_poll", "Poll Minuten", acc.get("poll_minutes", "5"), typ="number")
-        + '</div></div>'
+        + f'</div>'
+        + f'<details class="adv" data-email-test-wrap-{i} hidden>'
+        + f'<summary>Live-Test Konto {i + 1}</summary>'
+        + f'<div class="waha-test-box" data-email-test-box="{i}"></div>'
+        + f'</details>'
+        + f'</div>'
     )
 
 
@@ -2081,10 +2093,14 @@ def _channel_setup_fields(channel: str, inst: dict, connected: bool = False) -> 
     return (
         '<details class="adv" open><summary>Mail-Konten (IMAP / SMTP)</summary>'
         '<p class="note" style="margin:0 0 10px">Du kannst beliebig viele Konten anlegen. '
-        'Für SMTP wird – wenn leer – derselbe Server/User wie für IMAP angenommen.</p>'
+        'Für SMTP wird – wenn leer – derselbe Server/User wie für IMAP angenommen. '
+        'Passwort leer lassen = unverändert.</p>'
         f'<input type="hidden" name="sec_email_count" data-email-count value="{len(accounts)}">'
         f'<div data-email-list>{blocks}</div>'
+        '<div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap">'
         '<button class="btn sm ghost" type="button" data-email-add>+ Weiteres Konto</button>'
+        '<button class="btn sm" type="submit" style="margin-left:auto">Mail-Konten speichern ↑</button>'
+        '</div>'
         '</details>'
     )
 
@@ -2305,6 +2321,42 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
       updateCoach('waha');
       document.querySelectorAll('.install-config').forEach(cfg => cfg.hidden = true);
 
+      document.querySelectorAll('[data-email-test]').forEach(btn => {{
+        btn.onclick = async () => {{
+          const idx = btn.dataset.emailTest;
+          const wrap = document.querySelector(`[data-email-test-wrap-${{idx}}]`);
+          const box  = document.querySelector(`[data-email-test-box="${{idx}}"]`);
+          if (wrap) {{ wrap.hidden = false; wrap.open = true; }}
+          if (!box) return;
+          box.innerHTML = '<div class="mini">Sende Test-Mail an eigene Adresse und prüfe IMAP…</div>';
+          btn.disabled = true;
+          try {{
+            const r = await fetch('/admin/secretary/email/test', {{
+              method:'POST', headers:{{'Content-Type':'application/json'}},
+              body: JSON.stringify({{idx: parseInt(idx)}})
+            }});
+            const d = await r.json();
+            if (!d.ok) {{
+              box.innerHTML = `<div class="mini" style="color:#f87171">${{d.message || 'Test fehlgeschlagen.'}}</div>`;
+            }} else {{
+              const info = d.imap_ok
+                ? `<div class="mini" style="color:#34d399">✓ SMTP gesendet &amp; IMAP empfangen (${{d.found}} Treffer) · ${{d.from}}</div>`
+                : `<div class="mini" style="color:#fbbf24">SMTP ok, IMAP-Abruf schlug fehl: ${{d.imap_error || '?'}}</div>`;
+              const rows = (d.messages || []).map(m => {{
+                const div = document.createElement('div');
+                div.className = 'setup-msg ' + (m.dir === 'sent' ? 'user' : 'bot');
+                div.innerHTML = '<b>' + (m.dir === 'sent' ? 'Gesendet' : 'Empfangen') + '</b><span></span>';
+                div.querySelector('span').textContent = m.body;
+                return div.outerHTML;
+              }}).join('');
+              box.innerHTML = info + '<div class="setup-log">' + rows + '</div>';
+            }}
+          }} catch(e) {{
+            box.innerHTML = '<div class="mini">Test konnte nicht ausgeführt werden.</div>';
+          }}
+          btn.disabled = false;
+        }};
+      }});
       const emailAdd = document.querySelector('[data-email-add]');
       if (emailAdd) emailAdd.onclick = () => {{
         const list = document.querySelector('[data-email-list]');
@@ -2887,6 +2939,96 @@ async def secretary_signal_qr(request: Request, _: bool = Depends(auth.require_a
     return JSONResponse({
         "ok": False,
         "message": "Kein QR von signal-cli erhalten. Läuft der Container im json-rpc/native-Modus und stimmt die URL?",
+    })
+
+
+@router.post("/admin/secretary/email/test")
+async def secretary_email_test(request: Request, _: bool = Depends(auth.require_admin)):
+    """Send a test e-mail to the account's own address via SMTP, then check IMAP for it."""
+    import asyncio, imaplib, smtplib, ssl
+    from email.message import EmailMessage
+    data = await request.json()
+    idx = int(data.get("idx", 0))
+    appset = await _app_settings()
+    accounts = _email_accounts((appset or {}).get("secretary", {}) or {})
+    if idx >= len(accounts):
+        return JSONResponse({"ok": False, "message": "Konto nicht gefunden — bitte zuerst speichern."})
+    acc = accounts[idx]
+    imap_host = (acc.get("imap_host") or "").strip()
+    imap_port = int(acc.get("imap_port") or 993)
+    imap_user = (acc.get("imap_user") or acc.get("from_address") or "").strip()
+    password  = (acc.get("password") or "").strip()
+    smtp_host = (acc.get("smtp_host") or "").strip()
+    smtp_port = int(acc.get("smtp_port") or 587)
+    from_addr = (acc.get("from_address") or imap_user).strip()
+    if not (imap_host and imap_user and password):
+        return JSONResponse({"ok": False, "message": "IMAP-Host, User und Passwort müssen gesetzt sein."})
+    token = datetime.now().strftime("%H%M%S")
+    subject = f"ASTRA Selbsttest #{token}"
+    body    = f"ASTRA Mail-Test 1/1 · #{token}\nDieser Test bestätigt, dass SMTP-Senden und IMAP-Empfangen für dieses Konto funktionieren."
+
+    def _smtp_send() -> str:
+        msg = EmailMessage()
+        msg["From"] = from_addr
+        msg["To"]   = from_addr
+        msg["Subject"] = subject
+        msg.set_content(body)
+        try:
+            ctx = ssl.create_default_context()
+            if smtp_port == 465:
+                with smtplib.SMTP_SSL(smtp_host or imap_host.replace("imap", "smtp"), smtp_port, context=ctx, timeout=15) as s:
+                    s.login(imap_user, password)
+                    s.send_message(msg)
+            else:
+                with smtplib.SMTP(smtp_host or imap_host.replace("imap", "smtp"), smtp_port, timeout=15) as s:
+                    s.ehlo(); s.starttls(context=ctx); s.ehlo()
+                    s.login(imap_user, password)
+                    s.send_message(msg)
+            return ""
+        except Exception as e:
+            return str(e)
+
+    def _imap_check() -> dict:
+        try:
+            ctx = ssl.create_default_context()
+            M = imaplib.IMAP4_SSL(imap_host, imap_port, ssl_context=ctx)
+            M.login(imap_user, password)
+            M.select("INBOX")
+            _typ, data = M.search(None, f'SUBJECT "#{token}"')
+            ids = (data[0] or b"").split()
+            msgs = []
+            for mid in ids[-3:]:
+                _t2, raw = M.fetch(mid, "(BODY[TEXT])")
+                text = ""
+                if raw and raw[0]:
+                    part = raw[0][1] if isinstance(raw[0], tuple) else raw[0]
+                    text = part.decode(errors="replace")[:300] if isinstance(part, bytes) else str(part)[:300]
+                msgs.append({"id": mid.decode(), "body": text.strip()})
+            M.logout()
+            return {"ok": True, "found": len(ids), "messages": msgs}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    loop = asyncio.get_event_loop()
+    smtp_err = await loop.run_in_executor(None, _smtp_send)
+    if smtp_err:
+        return JSONResponse({"ok": False, "sent": False,
+                             "message": f"SMTP-Fehler: {smtp_err}"})
+    await asyncio.sleep(3)
+    imap_result = await loop.run_in_executor(None, _imap_check)
+    await db.audit("secretary_email_test", actor="owner",
+                   detail={"account": idx, "found": imap_result.get("found", 0)})
+    messages = []
+    messages.append({"dir": "sent", "body": f"[SMTP → {from_addr}] {subject}"})
+    for m in imap_result.get("messages", []):
+        messages.append({"dir": "received", "body": m.get("body") or "(leer)"})
+    return JSONResponse({
+        "ok": True, "sent": True,
+        "imap_ok": imap_result.get("ok"),
+        "found": imap_result.get("found", 0),
+        "from": from_addr,
+        "messages": messages,
+        "imap_error": imap_result.get("error"),
     })
 
 
