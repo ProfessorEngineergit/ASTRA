@@ -123,7 +123,7 @@ class CalDavPlugin(Plugin):
         ConfigField("username", "Benutzername / Apple-ID"),
         ConfigField("password", "Passwort / App-Passwort", secret=True,
                     help="iCloud: App-spezifisches Passwort von appleid.apple.com"),
-        ConfigField("calendar_name", "Kalender-Name (leer = erster)", default=""),
+        ConfigField("calendar_name", "Kalender-Namen (kommagetrennt, leer = alle)", default=""),
         ConfigField("days_ahead", "Tage voraus", type=FieldType.NUMBER, default=14),
     ]
 
@@ -133,7 +133,12 @@ class CalDavPlugin(Plugin):
     def _base(self) -> str:
         return (self.get("url") or _ICLOUD_BASE).rstrip("/")
 
-    async def _discover_calendar_url(self, client: httpx.AsyncClient) -> str | None:
+    def _wanted_names(self) -> list[str]:
+        raw = (self.get("calendar_name") or "").strip()
+        return [n.strip().lower() for n in raw.split(",") if n.strip()] if raw else []
+
+    async def _discover_calendar_urls(self, client: httpx.AsyncClient) -> list[tuple[str, str]]:
+        """Return list of (url, display_name) for all matching calendars."""
         base = self._base()
         r = await client.request(
             "PROPFIND", f"{base}/",
@@ -155,19 +160,26 @@ class CalDavPlugin(Plugin):
             content=_PROPFIND_CALS.encode(),
             headers={"Depth": "1", "Content-Type": "application/xml"},
         )
-        wanted = (self.get("calendar_name") or "").lower().strip()
+        wanted = self._wanted_names()
         hrefs = re.findall(r"<[^:>]*:?href[^>]*>([^<]+)</", r2.text)
         names = re.findall(r"<[^:>]*:?displayname[^>]*>([^<]*)</", r2.text)
+        results: list[tuple[str, str]] = []
         for i, href in enumerate(hrefs):
             if href == home:
                 continue
             if "principals" in href or "notification" in href.lower():
                 continue
             display = names[i].strip() if i < len(names) else ""
-            if wanted and display.lower() != wanted:
+            if wanted and display.lower() not in wanted:
                 continue
-            return href if href.startswith("http") else base + href
-        return None
+            url = href if href.startswith("http") else base + href
+            results.append((url, display))
+        return results
+
+    async def _discover_calendar_url(self, client: httpx.AsyncClient) -> str | None:
+        """Return first matching calendar URL (used for add/delete)."""
+        urls = await self._discover_calendar_urls(client)
+        return urls[0][0] if urls else None
 
     async def _fetch_events(self, cal_url: str, client: httpx.AsyncClient,
                             days: int = 14) -> list[dict]:
@@ -197,10 +209,10 @@ class CalDavPlugin(Plugin):
         try:
             async with httpx.AsyncClient(auth=self._auth(), timeout=12,
                                          follow_redirects=True) as c:
-                cal_url = await self._discover_calendar_url(c)
-            if cal_url:
-                name = cal_url.rstrip("/").split("/")[-1] or cal_url
-                return HealthStatus.ok(f"Kalender verbunden: {name}")
+                cal_urls = await self._discover_calendar_urls(c)
+            if cal_urls:
+                names = ", ".join(n or u.rstrip("/").split("/")[-1] for u, n in cal_urls)
+                return HealthStatus.ok(f"Kalender verbunden: {names}")
             return HealthStatus.error("Kein Kalender gefunden — URL / Zugangsdaten prüfen.")
         except Exception as e:  # noqa: BLE001
             return HealthStatus.error(str(e)[:200])
@@ -214,19 +226,25 @@ class CalDavPlugin(Plugin):
             try:
                 async with httpx.AsyncClient(auth=self._auth(), timeout=15,
                                              follow_redirects=True) as c:
-                    cal_url = await self._discover_calendar_url(c)
-                    if not cal_url:
+                    cal_urls = await self._discover_calendar_urls(c)
+                    if not cal_urls:
                         return "Kein Kalender gefunden."
-                    events = await self._fetch_events(cal_url, c, days)
+                    events: list[dict] = []
+                    for url, cal_name in cal_urls:
+                        for ev in await self._fetch_events(url, c, days):
+                            ev["_calendar"] = cal_name
+                            events.append(ev)
             except Exception as e:  # noqa: BLE001
                 return f"Fehler: {e}"
+            events.sort(key=lambda e: e.get("start_dt") or datetime.max.replace(tzinfo=timezone.utc))
             if not events:
                 return f"Keine Termine in den nächsten {days} Tagen."
             lines = [f"Termine (nächste {days} Tage):"]
-            for ev in events[:30]:
+            for ev in events[:40]:
                 start = (ev.get("start") or "?")[:16].replace("T", " ").replace("+00:00", "")
                 loc = f" · {ev['location']}" if ev.get("location") else ""
-                lines.append(f"• {start} — {ev.get('summary', '?')}{loc}")
+                cal = f" [{ev['_calendar']}]" if ev.get("_calendar") else ""
+                lines.append(f"• {start} — {ev.get('summary', '?')}{loc}{cal}")
             return "\n".join(lines)
 
         async def _add_event(args: dict, ctx: ToolContext) -> str:
@@ -261,7 +279,8 @@ class CalDavPlugin(Plugin):
                         headers={"Content-Type": "text/calendar; charset=utf-8"},
                     )
                 if r.status_code in (201, 204):
-                    return f"Termin angelegt: „{summary}“ am {start.strftime('%d.%m.%Y %H:%M')} UTC"
+                    dt_str = start.strftime("%d.%m.%Y %H:%M")
+                    return f"Termin angelegt: '{summary}' am {dt_str} UTC"
                 return f"Fehler: HTTP {r.status_code} — {r.text[:200]}"
             except Exception as e:  # noqa: BLE001
                 return f"Fehler: {e}"
@@ -274,10 +293,14 @@ class CalDavPlugin(Plugin):
             try:
                 async with httpx.AsyncClient(auth=self._auth(), timeout=15,
                                              follow_redirects=True) as c:
-                    cal_url = await self._discover_calendar_url(c)
-                    if not cal_url:
+                    cal_urls = await self._discover_calendar_urls(c)
+                    if not cal_urls:
                         return "Kein Kalender gefunden."
-                    events = await self._fetch_events(cal_url, c, days)
+                    events: list[dict] = []
+                    for url, cal_name in cal_urls:
+                        for ev in await self._fetch_events(url, c, days):
+                            ev["_calendar"] = cal_name
+                            events.append(ev)
             except Exception as e:  # noqa: BLE001
                 return f"Fehler: {e}"
             if query:
@@ -286,12 +309,13 @@ class CalDavPlugin(Plugin):
                           or query in (e.get("description") or "").lower()
                           or query in (e.get("location") or "").lower()]
             if not events:
-                return f"Keine Termine für „{query}“ in den nächsten {days} Tagen."
-            lines = [f"Treffer für „{query}“:"]
+                return f'Keine Termine fuer "{query}" in den naechsten {days} Tagen.'
+            lines = [f'Treffer fuer "{query}":']
             for ev in events[:20]:
                 start = (ev.get("start") or "?")[:16].replace("T", " ").replace("+00:00", "")
                 uid_short = (ev.get("uid") or "")[:20]
-                lines.append(f"• {start} — {ev.get('summary','?')} [UID: {uid_short}]")
+                cal = f" [{ev['_calendar']}]" if ev.get("_calendar") else ""
+                lines.append(f"• {start} — {ev.get('summary','?')}{cal} [UID: {uid_short}]")
             return "\n".join(lines)
 
         async def _delete_event(args: dict, ctx: ToolContext) -> str:
