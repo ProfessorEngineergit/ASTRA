@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
 from .. import __version__ as ASTRA_VERSION
-from .. import db, sysinfo
+from .. import db, knowledge, sysinfo
 from ..config import get_settings
 from ..config_store import SECRET_SENTINEL, get_config_store
 from ..google_oauth import authorization_url, exchange_code, token_patch, user_email
@@ -3907,3 +3907,97 @@ cd /opt/astra &amp;&amp; git fetch --tags origin main &amp;&amp; git branch serv
     </script>
     """
     return HTMLResponse(page("Updates", body, active="update"))
+
+
+# ─── Wissen / Brain files (live-editable markdown about me + each person) ───────
+_BRAIN_TAGS = ["über mich", "persona", "routinen", "personen", "person", "sonstiges"]
+
+
+@router.get("/admin/brain", response_class=HTMLResponse)
+async def brain_page(request: Request, _: bool = Depends(auth.require_admin), saved: str = ""):
+    files = knowledge.list_files()
+    token = await auth.issue_csrf()
+    flash = '<div class="flash ok">Gespeichert.</div>' if saved else ""
+    present = [t for t in _BRAIN_TAGS if any(f["tag"] == t for f in files)]
+    chips = '<span class="chip active" data-tag="all">Alle</span>' + "".join(
+        f'<span class="chip" data-tag="{esc(t)}">{esc(t)}</span>' for t in present)
+
+    cards = []
+    for f in files:
+        content = knowledge.read_file(f["rel"])
+        cards.append(f"""
+        <details class="card brain" data-name="{esc((f['title'] + ' ' + f['rel'] + ' ' + f['preview']).lower())}"
+                 data-tag="{esc(f['tag'])}">
+          <summary>
+            <div class="meta"><h3>{esc(f['title'])} <span class="tag-katalog">{esc(f['tag'])}</span></h3>
+              <div class="cat">{esc(f['rel'])} · {f['lines']} Zeilen · {esc(f['mtime'])}</div>
+              <p class="note" style="margin:6px 0 0">{esc(f['preview'])}</p></div>
+            <span class="chev">▾</span>
+          </summary>
+          <form method="post" action="/admin/brain/save" style="margin-top:12px">
+            <input type="hidden" name="csrf" value="{esc(token)}">
+            <input type="hidden" name="file" value="{esc(f['rel'])}">
+            <textarea name="content" class="brain-edit" spellcheck="false">{esc(content)}</textarea>
+            <div class="row" style="margin-top:10px"><button class="btn" type="submit">Speichern</button>
+              <span class="note">Markdown · ASTRA bearbeitet dieselben Dateien per Chat.</span></div>
+          </form>
+        </details>""")
+
+    body = f"""
+    <div class="hero"><h1>Wissen</h1>
+      <p>Live-editierbare Brain-Dateien — über dich und über jede Person. ASTRA liest und
+         pflegt genau diese Dateien (auch via Telegram).</p></div>
+    {flash}
+    <div class="toolbar">
+      <div class="searchwrap"><svg width="17" height="17" viewBox="0 0 24 24" fill="none"
+        stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/>
+        <path d="m21 21-4.3-4.3"/></svg>
+        <input class="search" id="bq" type="text" placeholder="Wissen durchsuchen…"></div>
+      <form method="post" action="/admin/brain/add-person" class="row" style="gap:8px">
+        <input type="hidden" name="csrf" value="{esc(token)}">
+        <input type="text" name="name" placeholder="Person hinzufügen…" style="width:200px">
+        <button class="btn secondary sm" type="submit">+ Person</button>
+      </form>
+    </div>
+    <div class="chips" id="btags">{chips}</div>
+    <div id="brainlist" style="display:flex;flex-direction:column;gap:12px">{''.join(cards)}</div>
+    <div class="empty" id="bempty" style="display:none">Nichts gefunden.</div>
+    <script>
+      const bq=document.getElementById('bq'); let btag='all';
+      function bapply(){{
+        const t=bq.value.toLowerCase(); let n=0;
+        document.querySelectorAll('.brain').forEach(c=>{{
+          const ok=(btag==='all'||c.dataset.tag===btag)&&c.dataset.name.includes(t);
+          c.style.display=ok?'':'none'; if(ok)n++;
+        }});
+        document.getElementById('bempty').style.display=n?'none':'';
+      }}
+      bq.oninput=bapply;
+      document.querySelectorAll('#btags .chip').forEach(ch=>ch.onclick=()=>{{
+        document.querySelectorAll('#btags .chip').forEach(x=>x.classList.remove('active'));
+        ch.classList.add('active'); btag=ch.dataset.tag; bapply();
+      }});
+    </script>"""
+    return _html_with_csrf(page("Wissen", body, active="brain"), token)
+
+
+@router.post("/admin/brain/save")
+async def brain_save(request: Request, _: bool = Depends(auth.require_admin)):
+    form = await request.form()
+    if not await _check_csrf(request, form):
+        return RedirectResponse("/admin/brain", status_code=303)
+    rel = form.get("file", "")
+    if knowledge.write_file(rel, form.get("content", "")):
+        await db.audit("brain_write", actor="owner", detail={"file": rel})
+    return RedirectResponse("/admin/brain?saved=1", status_code=303)
+
+
+@router.post("/admin/brain/add-person")
+async def brain_add_person(request: Request, _: bool = Depends(auth.require_admin)):
+    form = await request.form()
+    if not await _check_csrf(request, form):
+        return RedirectResponse("/admin/brain", status_code=303)
+    rel = knowledge.create_person(form.get("name", ""))
+    if rel:
+        await db.audit("brain_add_person", actor="owner", detail={"file": rel})
+    return RedirectResponse("/admin/brain?saved=1", status_code=303)

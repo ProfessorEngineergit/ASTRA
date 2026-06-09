@@ -341,6 +341,20 @@ hr { border: none; border-top: 1px solid var(--hair); margin: 20px 0; }
 .card.cat-entry { opacity: .82; }
 .card.cat-entry:hover { opacity: 1; }
 
+/* brain (knowledge) editor cards */
+details.card.brain { padding: 16px 18px; }
+details.card.brain > summary { cursor: pointer; list-style: none; display: flex;
+  align-items: flex-start; gap: 12px; }
+details.card.brain > summary::-webkit-details-marker { display: none; }
+details.card.brain > summary .meta { flex: 1; min-width: 0; }
+details.card.brain .chev { color: var(--text-faint); transition: transform .15s; flex-shrink: 0; }
+details.card.brain[open] .chev { transform: rotate(180deg); }
+.brain-edit { width: 100%; min-height: 260px; resize: vertical; padding: 12px 14px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--r-sm);
+  color: var(--text); font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 13px;
+  line-height: 1.55; }
+.brain-edit:focus { outline: none; border-color: #34343f; box-shadow: 0 0 0 3px rgba(170,180,214,.12); }
+
 /* system metrics */
 .metrics { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px,1fr)); gap: 14px; }
 .metric { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg); padding: 18px; }
@@ -682,6 +696,7 @@ def page(title: str, body: str, *, nav: bool = True, active: str = "") -> str:
             '<nav>'
             f'{navlink("/admin", "Plugins", "plugins")}'
             f'{navlink("/admin/chat", "Chat", "chat")}'
+            f'{navlink("/admin/brain", "Wissen", "brain")}'
             f'{navlink("/admin/secretary", "Secretary", "secretary")}'
             f'{navlink("/admin/system", "System", "system")}'
             f'{navlink("/admin/settings", "Einstellungen", "settings")}'
