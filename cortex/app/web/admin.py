@@ -2034,7 +2034,11 @@ def _channel_setup_fields(channel: str, inst: dict, connected: bool = False) -> 
                 'Signal-Account angemeldet und empfängt Nachrichten auf <code>/ingress/signal</code>.'
                 '</span></div>'
                 '<div class="pairing-actions">'
+                '<button class="btn sm" type="button" data-signal-test>Testen</button>'
                 '<button class="btn sm ghost" type="button" data-signal-recouple>Neu koppeln (QR)</button></div>'
+                '<details class="adv waha-test" data-signal-test-wrap hidden>'
+                '<summary>Live-Test (Selbst-Chat)</summary>'
+                '<div class="waha-test-box" data-signal-test-box></div></details>'
                 '<div class="qr-box" data-signal-qr-box></div></div>'
             )
         else:
@@ -2422,6 +2426,36 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
       if (signalRecouple) signalRecouple.onclick = () => {{
         if (!confirm('Signal wirklich neu koppeln? Die aktuelle Geräte-Verknüpfung bleibt bestehen, bis du den neuen QR-Code scannst.')) return;
         loadSignalQr();
+      }};
+      const signalTestBtn = document.querySelector('[data-signal-test]');
+      if (signalTestBtn) signalTestBtn.onclick = async () => {{
+        const wrap = document.querySelector('[data-signal-test-wrap]');
+        const box = document.querySelector('[data-signal-test-box]');
+        if (wrap) {{ wrap.hidden = false; wrap.open = true; }}
+        if (!box) return;
+        box.innerHTML = '<div class="mini">Sende Testnachrichten an deine eigene Nummer…</div>';
+        signalTestBtn.disabled = true;
+        try {{
+          const r = await fetch('/admin/secretary/signal/test', {{
+            method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(formContext('signal'))
+          }});
+          const d = await r.json();
+          if (!d.ok) {{ box.innerHTML = `<div class="mini">${{d.message || 'Test fehlgeschlagen.'}}</div>`; }}
+          else {{
+            const head = `<div class="mini">${{d.sent}} Nachrichten gesendet${{d.me ? ' · ' + d.me : ''}} · Spiegel des Selbst-Chats:</div>`;
+            const rows = (d.messages || []).map(m => {{
+              const div = document.createElement('div');
+              div.className = 'setup-msg ' + (m.fromMe ? 'user' : 'bot');
+              div.innerHTML = '<b>' + (m.fromMe ? 'Gesendet' : 'Empfangen') + '</b><span></span>';
+              div.querySelector('span').textContent = m.body;
+              return div.outerHTML;
+            }}).join('');
+            box.innerHTML = head + '<div class="setup-log">' + rows + '</div>';
+          }}
+        }} catch (e) {{
+          box.innerHTML = '<div class="mini">Test konnte nicht ausgeführt werden.</div>';
+        }}
+        signalTestBtn.disabled = false;
       }};
       let signalPoll = null;
       function pollSignalStatus() {{
@@ -2854,6 +2888,61 @@ async def secretary_signal_qr(request: Request, _: bool = Depends(auth.require_a
         "ok": False,
         "message": "Kein QR von signal-cli erhalten. Läuft der Container im json-rpc/native-Modus und stimmt die URL?",
     })
+
+
+@router.post("/admin/secretary/signal/test")
+async def secretary_signal_test(request: Request, _: bool = Depends(auth.require_admin)):
+    """Send a few messages from the owner's Signal number to itself, receive them
+    back and mirror the result. Each run is tagged so only its messages show."""
+    import asyncio
+    from urllib.parse import quote
+    data = await request.json()
+    s = get_settings()
+    base_url = str(data.get("signal_base_url") or data.get("base_url") or s.signal_base_url or "http://signal-cli:8080")
+    account = str(data.get("signal_account") or data.get("account") or s.signal_phone_number or "")
+    status = await _signal_status(base_url, account)
+    if not status.get("connected"):
+        return JSONResponse({"ok": False, "message": "Signal ist nicht verbunden."})
+    account = account or status.get("me") or ""
+    if not account:
+        return JSONResponse({"ok": False, "message": "Eigene Signal-Nummer konnte nicht ermittelt werden."})
+    token = datetime.now().strftime("%H%M%S")
+    texts = [
+        f"ASTRA Selbsttest 1/3 · #{token}",
+        f"ASTRA Selbsttest 2/3 · #{token} — Senden & Empfangen ok?",
+        f"ASTRA Selbsttest 3/3 · #{token} — fertig.",
+    ]
+    sent = 0
+    for text in texts:
+        res = await _waha_request(
+            base_url, "/v2/send", method="POST",
+            json_body={"message": text, "number": account, "recipients": [account]},
+        )
+        if res.get("ok"):
+            sent += 1
+        await asyncio.sleep(0.4)
+    if not sent:
+        return JSONResponse({"ok": False, "message": "Testnachrichten konnten nicht gesendet werden."})
+    await asyncio.sleep(2.0)
+    messages = []
+    read = await _waha_request(base_url, f"/v1/receive/{quote(account)}?timeout=3")
+    if read.get("ok"):
+        try:
+            arr = json.loads(read.get("text") or "[]")
+        except json.JSONDecodeError:
+            arr = []
+        for env in arr if isinstance(arr, list) else []:
+            envelope = env.get("envelope", env) if isinstance(env, dict) else {}
+            dm = (envelope.get("dataMessage") or envelope.get("syncMessage", {}).get("sentMessage") or {})
+            body = str(dm.get("message") or "")
+            if f"#{token}" not in body:
+                continue
+            messages.append({"fromMe": True, "body": body, "ts": int(envelope.get("timestamp") or 0)})
+        messages.sort(key=lambda x: x["ts"])
+    if not messages:
+        messages = [{"fromMe": True, "body": t, "ts": 0} for t in texts]
+    await db.audit("secretary_signal_test", actor="owner", detail={"sent": sent, "shown": len(messages)})
+    return JSONResponse({"ok": True, "sent": sent, "me": account, "messages": messages})
 
 
 @router.post("/admin/secretary/waha/test")
