@@ -2279,6 +2279,16 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
           <div><label>Nachfragen nach Minuten</label><input type="number" name="sec_confirm_after" min="1" max="240" value="{esc(settings.get("confirm_after_minutes"))}"></div>
           <div><label>Warten bis Eingriff</label><input type="number" name="sec_wait_after" min="1" max="480" value="{esc(settings.get("wait_after_minutes"))}"></div>
         </div>
+        <div style="margin-top:12px">
+          <label>Standard-Umgangston (Freitext, gilt wenn die Person kein eigenes Ton-Profil hat)</label>
+          <input type="text" name="sec_default_tone" style="width:100%"
+                 placeholder="z.B. freundlich-knapp, leicht trocken, nie anbiedernd"
+                 value="{esc(settings.get("default_tone", ""))}">
+          <p class="mini" style="margin:6px 0 0;color:var(--text-dim)">
+            Pro Person legst du den Ton in ihrer Profildatei fest (Feld <b>Ton:</b> unter
+            <a href="/admin/brain">Brain → Personen</a>). ASTRA zieht ihn beim Antworten heran.
+          </p>
+        </div>
         <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:13px">
           <label class="secretary-switch"><input type="checkbox" name="sec_enabled"{_checked(settings.get("enabled", True))}> Secretary aktiv</label>
           <label class="secretary-switch"><input type="checkbox" name="sec_school_direct"{_checked(settings.get("school_direct", True))}> In Schulzeit direkt antworten</label>
@@ -2743,6 +2753,7 @@ async def secretary_save(request: Request, _: bool = Depends(auth.require_admin)
     appset["secretary"] = {
         "enabled": form.get("sec_enabled") == "on",
         "tone": str(form.get("sec_tone") or "warm"),
+        "default_tone": str(form.get("sec_default_tone") or "").strip(),
         "jailbreak_tone": str(form.get("sec_jailbreak_tone") or "firm"),
         "school_direct": form.get("sec_school_direct") == "on",
         "school_start": str(form.get("sec_school_start") or "07:30"),
@@ -4866,7 +4877,26 @@ async def brain_page(request: Request, _: bool = Depends(auth.require_admin), sa
     body = f"""
     <div class="hero"><h1>Wissen</h1>
       <p>Live-editierbare Brain-Dateien — über dich und über jede Person. ASTRA liest und
-         pflegt genau diese Dateien (auch via Telegram).</p></div>
+         pflegt genau diese Dateien (auch via Telegram).</p>
+      <details class="panel" style="margin-top:12px">
+        <summary style="cursor:pointer;font-weight:600">So baust du Personen-Profile (Apple-Kontakte, Ton, Verläufe)</summary>
+        <div style="margin-top:10px;color:var(--text-dim);font-size:13.5px;line-height:1.6">
+          <p><b>Kontakte reindumpen:</b> Exportiere deine Apple-Kontakte (Kontakte-App →
+          Kontakte markieren → <i>Teilen</i> / <i>Exportieren</i> als vCard) und schick den
+          Text einfach ASTRA im Chat: „<i>Leg aus diesen Kontakten Profile an.</i>“ ASTRA legt
+          pro Person eine Datei an — mit Telefonnummer (damit direkt für WhatsApp/Signal
+          nutzbar), Beziehung und Trust-Tier.</p>
+          <p><b>Umgangston pro Person:</b> In jeder Profildatei gibt es ein Feld
+          „<b>Ton:</b>“. Trag ein, wie ASTRA mit der Person reden soll
+          („locker, viel Insider-Humor“ / „formell, knapp“). Beim Antworten zieht ASTRA genau
+          diesen Ton heran — sonst den <a href="/admin/secretary">Standard-Umgangston</a>.</p>
+          <p><b>Aus Verläufen lernen:</b> Schreib ASTRA „<i>Ergänze das Profil von [Name]</i>“
+          und kopier einen echten Nachrichtenverlauf rein. ASTRA erkennt euren Umgangston und
+          schreibt ihn samt Beispielen ins Profil — die Dateien werden so mit der Zeit immer
+          treffsicherer.</p>
+        </div>
+      </details>
+    </div>
     {flash}
     <div class="toolbar">
       <div class="searchwrap"><svg width="17" height="17" viewBox="0 0 24 24" fill="none"

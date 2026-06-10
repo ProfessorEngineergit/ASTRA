@@ -69,6 +69,7 @@ def secretary_settings(app_settings: dict | None) -> dict:
     return {
         "enabled": bool(raw.get("enabled", True)),
         "tone": raw.get("tone", "warm"),
+        "default_tone": (raw.get("default_tone") or "").strip(),
         "jailbreak_tone": raw.get("jailbreak_tone", "firm"),
         "school_direct": bool(raw.get("school_direct", True)),
         "workdays": raw.get("workdays", [0, 1, 2, 3, 4]),
@@ -132,9 +133,17 @@ def is_group_context(channel: str, handle: str, meta: dict | None = None) -> boo
 
 def tone_instruction(app_settings: dict | None, thread_meta: dict | None = None) -> str:
     settings = secretary_settings(app_settings)
-    tone = (thread_meta or {}).get("tone_override") or settings["tone"]
-    if (thread_meta or {}).get("security_watch"):
+    meta = thread_meta or {}
+    # Security watch and an explicit per-thread override beat the standard tone.
+    if meta.get("security_watch"):
         tone = settings.get("jailbreak_tone") or "firm"
+    elif meta.get("tone_override"):
+        tone = meta["tone_override"]
+    elif settings.get("default_tone"):
+        # Freeform standard tone set by Bahrian (used when no per-person tone applies).
+        return f"Tonfall (Standard): {settings['default_tone']}."
+    else:
+        tone = settings["tone"]
     return {
         "warm": "Tonfall: warm, ruhig, klar und menschlich.",
         "crisp": "Tonfall: knapp, praezise und ohne Smalltalk.",

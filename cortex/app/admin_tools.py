@@ -479,6 +479,40 @@ _SEND_CHANNELS = {"telegram", "waha", "signal"}
 _SEND_LABELS = {"telegram": "Telegram", "waha": "WhatsApp", "signal": "Signal"}
 
 
+async def _person_profiles_save(args: dict, ctx: ToolContext) -> str:
+    """Create/update one or many person profiles (people/<slug>.md).
+
+    Built for dumping Apple contacts: each entry becomes a profile with its
+    phone numbers (→ usable directly for WhatsApp/Signal), relationship, trust
+    tier and per-person tone. Existing notes are preserved (handles/tone merged).
+    """
+    profiles = args.get("profiles")
+    if isinstance(profiles, dict):
+        profiles = [profiles]
+    if not isinstance(profiles, list) or not profiles:
+        # Allow a single flat profile too.
+        if args.get("name"):
+            profiles = [args]
+        else:
+            return tool_result(ok=False, source="core",
+                               summary="Gib 'profiles' (Liste) oder 'name' an.")
+    saved, failed = [], []
+    for p in profiles:
+        if not isinstance(p, dict):
+            continue
+        name = str(p.get("name") or "").strip()
+        if not name:
+            failed.append("(ohne Name)")
+            continue
+        # A stored 'phone' already matches both WhatsApp and Signal inbound, so a
+        # bare mobile number is enough — no need to duplicate it per channel.
+        rel = knowledge.upsert_person_profile(name, p)
+        (saved if rel else failed).append(name)
+    summary = f"{len(saved)} Profil(e) gespeichert" + (f", {len(failed)} fehlgeschlagen" if failed else "")
+    return tool_result(ok=bool(saved), source="core", summary=summary,
+                       data={"saved": saved, "failed": failed})
+
+
 async def _is_owner_target(channel: str, to: str) -> bool:
     """True if `to` is Bahrian himself on this channel → no confirmation needed."""
     s = get_settings()
@@ -674,6 +708,24 @@ def register_admin_tools() -> None:
                      "poll_minutes": {"type": "string"},
                      "enabled": {"type": "boolean"}}}}},
           "required": ["accounts"]}, _secretary_email_set),
+        ("astra_person_profiles_save",
+         "Lege/aktualisiere Personen-Profile (people/<slug>.md) — ideal um Apple-Kontakte "
+         "reinzudumpen. Jeder Eintrag: name, relationship, trust_tier(0-3), tone(Umgangston), "
+         "phone/whatsapp/signal/telegram/email, notes. Telefonnummer wird auto. für WhatsApp+Signal "
+         "übernommen. Bestehende Notizen bleiben erhalten (Handles/Ton werden gemergt).",
+         {"type": "object", "properties": {
+             "profiles": {"type": "array", "items": {"type": "object", "properties": {
+                 "name": {"type": "string"},
+                 "relationship": {"type": "string"},
+                 "trust_tier": {"type": "string"},
+                 "tone": {"type": "string"},
+                 "phone": {"type": "string"},
+                 "whatsapp": {"type": "string"},
+                 "signal": {"type": "string"},
+                 "telegram": {"type": "string"},
+                 "email": {"type": "string"},
+                 "notes": {"type": "string"}}}}},
+          "required": ["profiles"]}, _person_profiles_save),
         ("astra_list_capabilities", "Liste verfügbare Agentenfähigkeiten mit Safety/Intent.",
          {"type": "object", "properties": {"query": {"type": "string"}}}, _list_capabilities),
         ("astra_explain_capability", "Erkläre eine Integration oder ein Tool aus dem Capability-Manifest.",
@@ -690,6 +742,7 @@ def register_admin_tools() -> None:
             "astra_configure_integration", "astra_update_settings", "astra_test_capability",
             "astra_create_plugin_module", "astra_brain_write", "astra_brain_append",
             "astra_brain_add_person", "astra_secretary_email_set", "astra_secretary_contacts_set",
+            "astra_person_profiles_save",
         } else "private_read"
         intents = ["status", "list"] if "list" in name or "status" in name else ["control"] if safety == "mutation" else ["status"]
         register(Tool(name=name, description=desc, parameters=params, handler=handler,

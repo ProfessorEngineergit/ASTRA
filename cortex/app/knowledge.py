@@ -206,9 +206,13 @@ def write_file(rel: str, content: str) -> bool:
         return False
 
 
+def _person_slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (name or "").lower()).strip("_")
+
+
 def create_person(name: str) -> str | None:
     """Create people/<slug>.md from a template; returns the relative path."""
-    slug = re.sub(r"[^a-z0-9]+", "_", (name or "").lower()).strip("_")
+    slug = _person_slug(name)
     if not slug:
         return None
     rel = f"{_PEOPLE_DIR}/{slug}.md"
@@ -220,7 +224,15 @@ def create_person(name: str) -> str | None:
 
 - **Beziehung:**
 - **Trust-Tier:** (0 = ich · 1 = eng · 2 = bekannt · 3 = fremd)
-- **Kanäle:** (Telegram / WhatsApp / Signal / E-Mail …)
+- **Ton:** (wie ASTRA mit dieser Person reden soll — z.B. „locker, viel Insider-Humor")
+
+<!-- astra:handles
+whatsapp:
+signal:
+telegram:
+email:
+phone:
+-->
 
 ## Darf wissen / teilen
 
@@ -228,8 +240,149 @@ def create_person(name: str) -> str | None:
 ## Nicht teilen
 
 
-## Notizen
+## Notizen & Umgangston-Beispiele
 """)
+    return rel
+
+
+# ─── Per-person matching, tone & structured profiles ───────────────────────────
+# A machine-readable handle block inside each person file lets ASTRA match an
+# inbound sender (phone/JID/e-mail) to the right profile and pull the number back
+# out when Bahrian says "schick X eine WhatsApp".
+_HANDLE_BLOCK = re.compile(r"<!--\s*astra:handles(.*?)-->", re.DOTALL | re.IGNORECASE)
+_TONE_LINE = re.compile(
+    r"^\s*[-*]?\s*\*{0,2}ton\*{0,2}\s*:\s*\*{0,2}\s*(.+?)\s*\*{0,2}\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_HANDLE_ALIASES = {
+    "whatsapp": "waha", "wa": "waha", "waha": "waha",
+    "signal": "signal", "telegram": "telegram", "tg": "telegram",
+    "email": "email", "mail": "email", "e-mail": "email",
+    "phone": "phone", "telefon": "phone", "tel": "phone", "handy": "phone", "nummer": "phone",
+}
+# Which stored handle kinds a given inbound channel may match against.
+_CHANNEL_KEYS = {
+    "waha": ("waha", "phone"),
+    "signal": ("signal", "phone"),
+    "telegram": ("telegram", "phone"),
+    "email": ("email",),
+    "slack": ("slack",),
+}
+
+
+def _norm_handle(kind: str, raw: str) -> str:
+    raw = (raw or "").strip().lower()
+    if not raw:
+        return ""
+    if kind == "email":
+        return raw
+    # phone-like: drop a JID suffix (…@c.us) and keep digits only.
+    raw = raw.split("@", 1)[0]
+    digits = re.sub(r"\D", "", raw)
+    return digits or raw
+
+
+def parse_person_handles(text: str) -> dict[str, list[str]]:
+    """Return {canonical_channel: [values]} from a file's astra:handles block."""
+    out: dict[str, list[str]] = {}
+    m = _HANDLE_BLOCK.search(text or "")
+    if not m:
+        return out
+    for line in m.group(1).splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        ch = _HANDLE_ALIASES.get(k.strip().lower())
+        v = v.strip()
+        if ch and v:
+            out.setdefault(ch, []).append(v)
+    return out
+
+
+def person_tone(text: str) -> str:
+    m = _TONE_LINE.search(text or "")
+    tone = m.group(1).strip() if m else ""
+    # Ignore the seed placeholder.
+    return "" if tone.startswith("(") else tone
+
+
+def person_file_for(channel: str, handle: str) -> dict | None:
+    """Find the person file whose handles match this inbound sender, or None."""
+    target = _norm_handle("phone" if channel in ("waha", "signal") else channel, handle)
+    if not target:
+        return None
+    keys = _CHANNEL_KEYS.get(channel, (channel,))
+    for e in list_files():
+        if e["tag"] != "person":
+            continue
+        txt = read_file(e["rel"])
+        handles = parse_person_handles(txt)
+        for k in keys:
+            for v in handles.get(k, []):
+                if _norm_handle("email" if k == "email" else "phone", v) == target:
+                    return {"rel": e["rel"], "title": e["title"], "content": txt,
+                            "tone": person_tone(txt)}
+    return None
+
+
+def _set_header_line(text: str, label: str, value: str) -> str:
+    """Insert/replace a `- **Label:** value` bullet near the top of a person file."""
+    pat = re.compile(rf"^(\s*[-*]\s*\*{{0,2}}{re.escape(label)}\*{{0,2}}\s*:).*$",
+                     re.IGNORECASE | re.MULTILINE)
+    line = f"- **{label}:** {value}"
+    if pat.search(text):
+        return pat.sub(line, text, count=1)
+    # Insert after the first heading, else prepend.
+    lines = text.splitlines()
+    for i, ln in enumerate(lines):
+        if ln.startswith("# "):
+            lines.insert(i + 1, line)
+            return "\n".join(lines)
+    return line + "\n" + text
+
+
+def _merge_handles_block(text: str, handles: dict[str, str]) -> str:
+    """Update/insert the astra:handles block, keeping any existing values."""
+    existing = parse_person_handles(text)
+    merged: dict[str, str] = {k: (v[0] if v else "") for k, v in existing.items()}
+    for ch, val in handles.items():
+        if val:
+            merged[_HANDLE_ALIASES.get(ch.lower(), ch.lower())] = val
+    order = ["whatsapp", "signal", "telegram", "email", "phone"]
+    canon = {"waha": "whatsapp"}
+    rows = {canon.get(k, k): v for k, v in merged.items()}
+    block = "<!-- astra:handles\n" + "".join(
+        f"{key}: {rows.get(key, '')}\n" for key in order
+    ) + "-->"
+    if _HANDLE_BLOCK.search(text):
+        return _HANDLE_BLOCK.sub(lambda _m: block, text, count=1)
+    # Append after the header bullets (after first blank line), else at end.
+    return text.rstrip() + "\n\n" + block + "\n"
+
+
+def upsert_person_profile(name: str, fields: dict) -> str | None:
+    """Create or update a person profile, preserving existing freeform notes.
+
+    `fields` may contain: relationship, trust_tier, tone, notes, can_share,
+    dont_share and handle keys (whatsapp/signal/telegram/email/phone)."""
+    rel = create_person(name)
+    if not rel:
+        return None
+    text = read_file(rel)
+    for label, key in (("Beziehung", "relationship"), ("Trust-Tier", "trust_tier"), ("Ton", "tone")):
+        val = str(fields.get(key) or "").strip()
+        if val:
+            text = _set_header_line(text, label, val)
+    handles = {k: str(fields.get(k) or "").strip()
+               for k in ("whatsapp", "signal", "telegram", "email", "phone")}
+    if any(handles.values()):
+        text = _merge_handles_block(text, handles)
+    notes = str(fields.get("notes") or "").strip()
+    if notes:
+        stamp = datetime.now().strftime("%Y-%m-%d")
+        text = text.rstrip() + f"\n\n## Notizen & Umgangston-Beispiele\n- ({stamp}) {notes}\n" \
+            if "## Notizen" not in text else text.rstrip() + f"\n- ({stamp}) {notes}\n"
+    write_file(rel, text)
     return rel
 
 

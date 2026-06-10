@@ -12,7 +12,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
-from . import abuse, db
+from . import abuse, db, knowledge
 from .agent import generate_reply
 from .channels import get_channels
 from .config import get_settings
@@ -76,15 +76,27 @@ def _secretary_system(
     *,
     app_settings: dict | None = None,
     thread_meta: dict | None = None,
+    handle: str = "",
 ) -> str:
     if channel not in SECRETARY_CHANNELS:
         return ""
-    tone = tone_instruction(app_settings, thread_meta)
+    person = knowledge.person_file_for(channel, handle) if handle else None
+    # A per-person tone (from their profile) overrides the global/default tone.
+    if person and person.get("tone"):
+        tone = f"Umgangston mit dieser Person (verbindlich): {person['tone']}."
+    else:
+        tone = tone_instruction(app_settings, thread_meta)
     group_note = (
         "Dieser Thread ist ein Gruppenchat. Fuehre keine Aktionen aus und triff keine Zusagen, "
         "wenn Bahrian das nicht fuer genau diese Gruppe freigegeben hat. "
         if (thread_meta or {}).get("is_group") else ""
     )
+    person_block = ""
+    if person:
+        person_block = (
+            "\n\nProfil dieser Person (nutze es fuer Ton, Beziehung und was du teilen darfst):\n"
+            + person["content"][:1600]
+        )
     return (
         "Du bist ASTRA im Secretary-Modus fuer Bahrians externe Kommunikation. "
         "Sprich transparent als ASTRA, nie als Bahrian. Antworte knapp, organisatorisch, "
@@ -92,6 +104,7 @@ def _secretary_system(
         "nutze Tools oder bleibe vorsichtig. "
         f"{tone} {group_note}"
         f"Policy-Grund: {plan_reason or 'secretary'}."
+        f"{person_block}"
     )
 
 
@@ -334,7 +347,8 @@ async def handle_inbound(
             max_sensitivity=Sensitivity.DETAILS.value,
             extra_system=_secretary_system(channel, "contact-rule-direct",
                                            app_settings=appset_for_reply,
-                                           thread_meta=thread.get("meta") or {}),
+                                           thread_meta=thread.get("meta") or {},
+                                           handle=sender_handle),
         )
         await _send_and_record(channel, sender_handle, thread_id, reply, contact,
                                max_sensitivity=Sensitivity.DETAILS.value)
@@ -435,6 +449,7 @@ async def handle_inbound(
                 secretary_plan.reason,
                 app_settings=appset,
                 thread_meta=thread.get("meta") or {},
+                handle=sender_handle,
             ),
         )
         await _send_and_record(
@@ -526,6 +541,7 @@ async def step_in(thread_id: str) -> None:
                 "defer-elapsed",
                 app_settings=await _app_settings(),
                 thread_meta=thread.get("meta") or {},
+                handle=_peer(thread_id),
             )
         ),
     )
@@ -565,6 +581,7 @@ async def resume_after_approval(approval: dict, decision: str) -> None:
             "owner-approved",
             app_settings=await _app_settings(),
             thread_meta=thread.get("meta") or {},
+            handle=_peer(thread_id),
         ),
     )
     await _send_and_record(

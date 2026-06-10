@@ -68,3 +68,16 @@ def test_secretary_security_watch_uses_thread_local_firm_tone():
     )
 
     assert "distanziert" in text
+
+
+def test_freeform_default_tone_is_used_when_set():
+    text = tone_instruction({"secretary": {"default_tone": "freundlich-knapp, trocken"}}, {})
+    assert text == "Tonfall (Standard): freundlich-knapp, trocken."
+
+
+def test_security_watch_beats_default_tone():
+    text = tone_instruction(
+        {"secretary": {"default_tone": "locker", "jailbreak_tone": "firm"}},
+        {"security_watch": True},
+    )
+    assert "distanziert" in text  # firm wins over the freeform default
