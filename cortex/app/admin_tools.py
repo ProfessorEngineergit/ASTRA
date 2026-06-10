@@ -522,16 +522,19 @@ async def _send_message(args: dict, ctx: ToolContext) -> str:
         )
 
     # Third party → require an explicit Telegram confirmation before anything leaves.
-    # contact_id is a UUID FK; in the owner chat ctx.contact["id"] is the pseudo
-    # value "owner", so only pass it through when it's a real UUID, else NULL.
+    # The approval rows have FKs: contact_id is a UUID → contacts, thread_id → threads.
+    # An owner-initiated send isn't tied to an inbound thread and the owner chat's
+    # pseudo ids ("owner" / "web-owner:…") aren't persisted, so pass them only when
+    # they actually exist, otherwise NULL.
     s = get_settings()
     raw_cid = ctx.contact.get("id")
     try:
         contact_id = str(_uuid.UUID(str(raw_cid))) if raw_cid else None
     except (ValueError, TypeError):
         contact_id = None
+    thread_id = ctx.thread_id if (ctx.thread_id and await db.get_thread(ctx.thread_id)) else None
     approval_id = await db.create_approval(
-        thread_id=ctx.thread_id, contact_id=contact_id,
+        thread_id=thread_id, contact_id=contact_id,
         kind="outbound_send", question=text,
         payload={"channel": channel, "to": to, "text": text},
     )
