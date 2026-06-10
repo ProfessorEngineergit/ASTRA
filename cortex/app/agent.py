@@ -10,7 +10,10 @@ from . import knowledge
 from .config import get_settings
 from .models import get_gateway
 from .persona import Register, system_prompt
-from .tools import ToolContext, capability_manifest, dispatch, needs_confirmation, openai_tools, result_summary
+from .tools import (
+    REGISTRY, ToolContext, capability_manifest, dispatch, needs_confirmation,
+    openai_tools, result_summary,
+)
 
 log = logging.getLogger("astra.agent")
 MAX_TOOL_ITERS = 4
@@ -173,14 +176,19 @@ async def generate_reply_meta(
                 args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
-            if (
-                permission_mode == "ask"
-                and register == Register.OWNER
-                and channel == "web"
-                and needs_confirmation(tc.function.name)
+            tool_obj = REGISTRY.get(tc.function.name)
+            web_owner = register == Register.OWNER and channel == "web"
+            # External sends are always eyeballed in the web chat (even in auto/
+            # bypass): the confirmed re-run goes through /admin/chat/action, not
+            # this loop, so it can't loop. Other risky tools pause only in ask mode.
+            is_external_send = tool_obj is not None and tool_obj.safety == "external_send"
+            if web_owner and (
+                is_external_send
+                or (permission_mode == "ask" and needs_confirmation(tc.function.name))
             ):
+                verb = "senden" if is_external_send else "ausführen"
                 return {
-                    "reply": "Ich brauche deine Freigabe, bevor ich diese Agentenaktion ausführe.",
+                    "reply": f"Ich brauche deine Freigabe, bevor ich diese Aktion {verb} kann.",
                     "pending_action": {
                         "tool": tc.function.name,
                         "args": args,

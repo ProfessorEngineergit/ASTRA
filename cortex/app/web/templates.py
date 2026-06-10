@@ -467,6 +467,7 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
 .icon-btn:hover { color: var(--text); background: var(--surface-2); border-color: #30303a; }
 .icon-btn:active { transform: translateY(1px); }
 .icon-btn.copied { color: var(--ok); border-color: rgba(54,211,153,.36); background: var(--ok-bg); }
+.icon-btn.copy-fail { color: var(--err); border-color: rgba(251,113,133,.34); background: var(--err-bg); }
 .icon-btn[data-delete]:hover { color: var(--err); border-color: rgba(251,113,133,.34); background: var(--err-bg); }
 .title-icon { width: 34px; height: 34px; }
 .title-icon svg { width: 17px; height: 17px; }
@@ -482,6 +483,9 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
 .action-mark svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 2;
   stroke-linecap: round; stroke-linejoin: round; }
 .action-card p { margin: -2px 0 0; color: var(--text-dim); font-size: 12.5px; }
+.action-msg { margin: 0; padding: 9px 12px; border-left: 2px solid rgba(245,196,81,.5);
+  background: rgba(255,255,255,.03); border-radius: 0 8px 8px 0; color: var(--text);
+  font-size: 13px; white-space: pre-wrap; }
 .action-details { border: 1px solid var(--border-soft); border-radius: 10px; padding: 8px 10px;
   background: rgba(255,255,255,.025); }
 .action-details summary { cursor: pointer; color: var(--text-dim); font-size: 12px; }

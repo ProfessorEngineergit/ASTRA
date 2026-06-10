@@ -68,14 +68,13 @@ def test_home_assistant_read_state_does_not_pause_in_ask_mode():
                 REGISTRY[name] = tool
 
 
-def test_send_message_self_gates_so_no_web_pause():
-    """astra_send_message confirms via Telegram itself; the allowlist must keep
-    it from ALSO pausing in the web ask-mode, even though it's external_send."""
+def test_send_message_is_external_send_and_confirms():
+    """astra_send_message is external_send → it always needs confirmation; the web
+    chat routes that to a pending-action card (see agent.generate_reply_meta)."""
     from app.admin_tools import register_admin_tools
     register_admin_tools()
     assert REGISTRY["astra_send_message"].safety == "external_send"
-    assert needs_confirmation("astra_send_message") is False
-    # A normal external_send/mutation tool still pauses.
+    assert needs_confirmation("astra_send_message") is True
     assert needs_confirmation("astra_configure_integration") is True
 
 

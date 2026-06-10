@@ -496,8 +496,14 @@ async def _is_owner_target(channel: str, to: str) -> bool:
 
 
 async def _send_message(args: dict, ctx: ToolContext) -> str:
-    """Send a message to the owner directly, or to a third party after the owner
-    confirms on Telegram (a typed 'ja' or the ✅ button both approve)."""
+    """Send a message, with the confirmation routed to where the request started.
+
+    • Web AstraChat origin → the pending-action card in the chat is the
+      confirmation (external_send always pauses there), so once we actually run
+      we just send.
+    • Telegram (or any other) origin → to Bahrian himself it goes straight
+      through; to a third party only after a Telegram "ja"/✅.
+    """
     channel = (args.get("channel") or "").strip().lower()
     to = (args.get("to") or "").strip()
     text = (args.get("text") or "").strip()
@@ -510,6 +516,16 @@ async def _send_message(args: dict, ctx: ToolContext) -> str:
                            summary="'to' (Telefonnummer/Handle) und 'text' sind erforderlich.")
 
     label = _SEND_LABELS.get(channel, channel)
+
+    # Web origin: already confirmed via the AstraChat card → send now.
+    if ctx.channel == "web":
+        ok = await get_channels().send(channel, to, text)
+        await db.audit("outbound_web", channel=channel, detail={"to": to, "ok": ok})
+        return tool_result(
+            ok=ok, source="core",
+            summary=(f"Gesendet an {to} ({label})." if ok
+                     else f"Senden an {to} ({label}) ist fehlgeschlagen."),
+        )
 
     # Send to Bahrian himself (incl. self-test) → straight through, no gate.
     if await _is_owner_target(channel, to):

@@ -3627,17 +3627,30 @@ def _render_messages(chat: dict) -> str:
         pending = ""
         if m.get("pending_action"):
             p = m["pending_action"]
+            pa = p.get("args", {}) or {}
+            is_send = p.get("tool") == "astra_send_message"
+            if is_send:
+                ch_label = {"waha": "WhatsApp", "signal": "Signal",
+                            "telegram": "Telegram"}.get(pa.get("channel"), pa.get("channel") or "")
+                head_small, head_b = "Nachricht senden", f"An {pa.get('to','?')} · {ch_label}"
+                body = f'<blockquote class="action-msg">{esc(pa.get("text",""))}</blockquote>'
+                run_label = "Senden"
+            else:
+                head_small, head_b = "Freigabe erforderlich", str(p.get("tool"))
+                body = (
+                    '<p>Diese Aktion wartet auf deine Entscheidung.</p>'
+                    '<details class="action-details"><summary>Argumente anzeigen</summary>'
+                    f'<pre>{esc(json.dumps(pa, ensure_ascii=False, indent=2))}</pre></details>'
+                )
+                run_label = "Ausführen"
             pending = (
                 '<div class="action-card">'
                 '<div class="action-head">'
-                f'<span class="action-mark">{_chat_icon("shield")}</span>'
-                '<div><small>Freigabe erforderlich</small>'
-                f'<b>{esc(p.get("tool"))}</b></div></div>'
-                '<p>Diese Aktion wartet auf deine Entscheidung.</p>'
-                '<details class="action-details"><summary>Argumente anzeigen</summary>'
-                f'<pre>{esc(json.dumps(p.get("args", {}), ensure_ascii=False, indent=2))}</pre></details>'
+                f'<span class="action-mark">{_chat_icon("send" if is_send else "shield")}</span>'
+                f'<div><small>{esc(head_small)}</small><b>{esc(head_b)}</b></div></div>'
+                f'{body}'
                 '<div class="action-row">'
-                f'<button class="btn sm" data-run-action="{esc(m["id"])}">Ausführen</button>'
+                f'<button class="btn sm" data-run-action="{esc(m["id"])}">{esc(run_label)}</button>'
                 f'<button class="btn ghost sm danger" data-deny-action="{esc(m["id"])}">Ablehnen</button>'
                 '</div></div>'
             )
@@ -3697,16 +3710,24 @@ async def chat_page(
     active_count = sum(1 for c in store["chats"] if not c.get("archived"))
     archived_count = sum(1 for c in store["chats"] if c.get("archived"))
     can_merge = bool(active and active.get("parent_id") and not archive_view)
+    delete_chat_btn = (
+        '<button class="icon-btn title-icon danger" id="deletechat" title="Chat löschen" '
+        f'aria-label="Chat löschen">{_chat_icon("delete")}</button>'
+        if active else ""
+    )
     title_actions = (
-        f'<button class="btn sm" id="restorechat">Wiederherstellen</button>'
-        if archive_view and active else
         (
-            '<button class="icon-btn title-icon" id="mergechat" title="In Ursprung mergen" '
-            f'aria-label="In Ursprung mergen">{_chat_icon("merge")}</button>'
-            if can_merge else ""
+            f'<button class="btn sm" id="restorechat">Wiederherstellen</button>'
+            if archive_view and active else
+            (
+                '<button class="icon-btn title-icon" id="mergechat" title="In Ursprung mergen" '
+                f'aria-label="In Ursprung mergen">{_chat_icon("merge")}</button>'
+                if can_merge else ""
+            )
+            + '<button class="icon-btn title-icon" id="branchchat" title="Branch erstellen" '
+            f'aria-label="Branch erstellen">{_chat_icon("branch")}</button>'
         )
-        + '<button class="icon-btn title-icon" id="branchchat" title="Branch erstellen" '
-        f'aria-label="Branch erstellen">{_chat_icon("branch")}</button>'
+        + delete_chat_btn
     )
     archive_button = "" if archive_view else '<button class="btn ghost sm" id="archivechat">Archivieren</button>'
     input_html = (
@@ -3796,11 +3817,26 @@ async def chat_page(
       async function postForm(url, fd){{const r=await fetch(url,{{method:'POST',body:fd}});return await r.json();}}
       async function restore(id){{const d=await post('/admin/chat/restore',{{chat_id:id||chatId}}); location.href='/admin/chat?chat='+encodeURIComponent(d.chat_id||id||chatId);}}
       async function copyText(text, btn){{
+        let ok=false;
         try {{
-          await navigator.clipboard.writeText(text);
-          btn.classList.add('copied'); setTimeout(()=>btn.classList.remove('copied'), 900);
-        }} catch(e) {{
-          prompt('Text kopieren:', text);
+          if(navigator.clipboard && window.isSecureContext){{
+            await navigator.clipboard.writeText(text); ok=true;
+          }}
+        }} catch(e) {{ ok=false; }}
+        if(!ok){{
+          // Plain-HTTP LAN has no async clipboard — use the legacy execCommand path.
+          try {{
+            const ta=document.createElement('textarea');
+            ta.value=text; ta.setAttribute('readonly','');
+            ta.style.position='fixed'; ta.style.top='-1000px'; ta.style.opacity='0';
+            document.body.appendChild(ta); ta.focus(); ta.select();
+            ta.setSelectionRange(0, text.length);
+            ok=document.execCommand('copy'); document.body.removeChild(ta);
+          }} catch(e) {{ ok=false; }}
+        }}
+        if(btn){{
+          btn.classList.add(ok?'copied':'copy-fail');
+          setTimeout(()=>btn.classList.remove('copied','copy-fail'), 1100);
         }}
       }}
       function confirmChoice(title, text, okLabel='Bestätigen', tone='default') {{
@@ -3847,6 +3883,10 @@ async def chat_page(
       if(archiveBtn) archiveBtn.onclick=async()=>{{if(!await confirmChoice('Chat archivieren', 'Der Thread bleibt erhalten und wandert ins Archiv.', 'Archivieren')) return;
         await post('/admin/chat/archive',{{chat_id:chatId}}); location.href='/admin/chat?view=archive&chat='+encodeURIComponent(chatId);}};
       if(branchBtn) branchBtn.onclick=async()=>{{const d=await post('/admin/chat/branch',{{chat_id:chatId}}); location.href='/admin/chat?chat='+d.chat_id;}};
+      const deleteChatBtn=document.getElementById('deletechat');
+      if(deleteChatBtn) deleteChatBtn.onclick=async()=>{{
+        if(!await confirmChoice('Chat löschen', 'Dieser Chat wird dauerhaft gelöscht — das lässt sich nicht rückgängig machen.', 'Löschen', 'danger')) return;
+        await post('/admin/chat/delete',{{chat_id:chatId}}); location.href='/admin/chat';}};
       if(mergeBtn) mergeBtn.onclick=async()=>{{
         if(!await confirmChoice('Branch mergen', 'Neue Nachrichten werden in den Ursprung übernommen.', 'Mergen')) return;
         const d=await post('/admin/chat/merge',{{chat_id:chatId}});
@@ -4139,6 +4179,22 @@ async def chat_clear(request: Request, _: bool = Depends(auth.require_admin)):
     chat["messages"] = []
     chat["pending_action"] = None
     chat["updated_at"] = _now_iso()
+    await _save_chat_store(store)
+    return JSONResponse({"ok": True})
+
+
+@router.post("/admin/chat/delete")
+async def chat_delete(request: Request, _: bool = Depends(auth.require_admin)):
+    """Permanently remove a whole chat (not just clear it)."""
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001
+        data = {}
+    cid = data.get("chat_id")
+    store = await _chat_store()
+    store["chats"] = [c for c in store["chats"] if c.get("id") != cid]
+    if store.get("active_id") == cid:
+        store["active_id"] = next((c["id"] for c in store["chats"] if not c.get("archived")), None)
     await _save_chat_store(store)
     return JSONResponse({"ok": True})
 
