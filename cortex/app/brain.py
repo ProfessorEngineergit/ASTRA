@@ -12,7 +12,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
-from . import db
+from . import abuse, db
 from .agent import generate_reply
 from .channels import get_channels
 from .config import get_settings
@@ -22,8 +22,8 @@ from .models import get_gateway
 from .persona import TRIAGE_INSTRUCTIONS, Register
 from .policy import Mode, Sensitivity, TrustTier, reconcile
 from .secretary import (
-    SECRETARY_CHANNELS, contact_rule_for, is_group_context, plan_for,
-    tone_instruction, unknown_sender_action, with_secretary_header,
+    CHANNEL_LABELS, SECRETARY_CHANNELS, contact_rule_for, is_group_context,
+    plan_for, tone_instruction, unknown_sender_action, with_secretary_header,
 )
 from .security import check_inbound, check_outbound
 from .state import Act, Signal, ThreadState, next_state
@@ -256,6 +256,35 @@ async def handle_inbound(
     # ── Third party → contact rules ────────────────────────────────────────────
     appset_pre = await _app_settings()
     contact_rule = contact_rule_for(appset_pre, channel, sender_handle)
+
+    # Explicit block rule → silent, cheapest possible path.
+    if contact_rule == "block":
+        log.info("Contact %s on %s blocked by rule.", sender_handle, channel)
+        await db.audit("contact_blocked", channel=channel, thread_id=thread_id,
+                       contact_id=contact["id"])
+        return
+
+    # Cheap abuse / rate guards BEFORE any LLM or triage cost. The owner has
+    # already been handled above, so this only ever clamps third parties.
+    sec_pre = (appset_pre.get("secretary") or {})
+    av = abuse.check(
+        channel, sender_handle, text,
+        short_max=int(sec_pre.get("rate_short_max") or 8),
+        long_max=int(sec_pre.get("rate_long_max") or 60),
+    )
+    if not av.ok:
+        await db.audit("abuse_blocked", channel=channel, thread_id=thread_id,
+                       contact_id=contact["id"], detail={"kind": av.kind})
+        log.info("Abuse guard (%s) clamped %s on %s.", av.kind, sender_handle, channel)
+        # Don't insult a trusted contact who simply texted fast — just stop spending.
+        # Code-farming / sexual content stays a hard block for everyone.
+        trusted = contact_rule in ("allow", "direct") or int(contact.get("trust_tier") or 3) <= 1
+        response = "" if (av.kind == "rate" and trusted) else av.response
+        if response:
+            await _send_and_record(channel, sender_handle, thread_id, response,
+                                   contact, max_sensitivity="none")
+        return
+
     if contact_rule is None:
         # Unknown sender — apply the configured default action
         action = unknown_sender_action(appset_pre)
@@ -290,11 +319,6 @@ async def handle_inbound(
                            contact_id=contact["id"], detail={"sender": sender_handle})
             return
         # action == "policy" → fall through to normal triage
-    elif contact_rule == "block":
-        log.info("Contact %s on %s blocked by rule.", sender_handle, channel)
-        await db.audit("contact_blocked", channel=channel, thread_id=thread_id,
-                       contact_id=contact["id"])
-        return
     elif contact_rule == "ask":
         await _ask_owner(channel, sender_handle, thread_id, contact, text,
                          type("_D", (), {"mode": Mode.ASK, "max_sensitivity": Sensitivity.FREEBUSY,
@@ -550,3 +574,35 @@ async def resume_after_approval(approval: dict, decision: str) -> None:
     await db.set_thread_state(thread_id, ThreadState.ANSWERED.value)
     await db.audit("resume", channel=thread["channel"], thread_id=thread_id,
                    contact_id=thread.get("contact_id"), detail={"decision": decision})
+
+
+# ─── outbound send confirmation (owner-initiated, gated on Telegram) ────────────
+async def resume_outbound_send(approval: dict, decision: str) -> None:
+    """ASTRA wanted to message a third party; the owner just decided on Telegram.
+
+    decision: 'yes'/'send' → actually send; anything else → cancel.
+    """
+    s = get_settings()
+    payload = approval.get("payload") or {}
+    channel = payload.get("channel") or ""
+    to = payload.get("to") or ""
+    text = payload.get("text") or ""
+
+    if decision == "no":
+        await db.audit("outbound_cancelled", channel=channel, detail={"to": to})
+        if s.telegram_enabled and s.telegram_owner_chat_id:
+            await get_channels().send_telegram(
+                s.telegram_owner_chat_id, f"Abgebrochen — an {to} wurde nichts gesendet."
+            )
+        return
+
+    ok = await get_channels().send(channel, to, text)
+    await db.audit("outbound_sent", channel=channel,
+                   detail={"to": to, "ok": ok, "preview": text[:160]})
+    if s.telegram_enabled and s.telegram_owner_chat_id:
+        label = CHANNEL_LABELS.get(channel, channel)
+        await get_channels().send_telegram(
+            s.telegram_owner_chat_id,
+            f"✅ Gesendet an {to} ({label})." if ok
+            else f"⚠️ Senden an {to} ({label}) ist fehlgeschlagen.",
+        )

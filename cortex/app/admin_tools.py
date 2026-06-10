@@ -14,12 +14,16 @@ import re
 from pathlib import Path
 
 from . import db, knowledge, sysinfo
+from .channels import get_channels
+from .config import get_settings
 from .config_store import SECRET_SENTINEL, get_config_store
 from .models import set_model_override
 from .plugins.base import CATEGORY_LABELS
 from .plugins.registry import get_manager
 from .plugins import extended_catalog
-from .tools import REGISTRY, Tool, ToolContext, capability_manifest, dispatch, register
+from .tools import (
+    REGISTRY, Tool, ToolContext, capability_manifest, dispatch, register, tool_result,
+)
 
 log = logging.getLogger("astra.admin_tools")
 
@@ -468,6 +472,84 @@ async def _secretary_email_get(args: dict, ctx: ToolContext) -> str:
     return "\n".join(rows)
 
 
+# Channels the transport layer sends natively (self-send + the confirm gate live here).
+# Mail/Slack keep their dedicated send_email / slack_send tools.
+_SEND_CHANNELS = {"telegram", "waha", "signal"}
+_SEND_LABELS = {"telegram": "Telegram", "waha": "WhatsApp", "signal": "Signal"}
+
+
+async def _is_owner_target(channel: str, to: str) -> bool:
+    """True if `to` is Bahrian himself on this channel → no confirmation needed."""
+    s = get_settings()
+    norm = to.replace(" ", "").lower()
+    if channel == "telegram" and str(to) == str(s.telegram_owner_chat_id):
+        return True
+    if channel == "signal" and norm == (s.signal_phone_number or "").replace(" ", "").lower():
+        return True
+    try:
+        if await db.is_owner_handle(channel, to):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+async def _send_message(args: dict, ctx: ToolContext) -> str:
+    """Send a message to the owner directly, or to a third party after the owner
+    confirms on Telegram (a typed 'ja' or the ✅ button both approve)."""
+    channel = (args.get("channel") or "").strip().lower()
+    to = (args.get("to") or "").strip()
+    text = (args.get("text") or "").strip()
+    if channel not in _SEND_CHANNELS:
+        return tool_result(ok=False, source="core",
+                           summary="channel muss telegram|waha|signal sein. Für Mail nutze "
+                                   "send_email, für Slack slack_send.")
+    if not to or not text:
+        return tool_result(ok=False, source="core",
+                           summary="'to' (Telefonnummer/Handle) und 'text' sind erforderlich.")
+
+    label = _SEND_LABELS.get(channel, channel)
+
+    # Send to Bahrian himself (incl. self-test) → straight through, no gate.
+    if await _is_owner_target(channel, to):
+        ok = await get_channels().send(channel, to, text)
+        await db.audit("outbound_self", channel=channel, detail={"to": to, "ok": ok})
+        return tool_result(
+            ok=ok, source="core",
+            summary=(f"An dich selbst auf {label} gesendet." if ok
+                     else f"Senden an dich auf {label} ist fehlgeschlagen."),
+        )
+
+    # Third party → require an explicit Telegram confirmation before anything leaves.
+    s = get_settings()
+    approval_id = await db.create_approval(
+        thread_id=ctx.thread_id, contact_id=ctx.contact.get("id"),
+        kind="outbound_send", question=text,
+        payload={"channel": channel, "to": to, "text": text},
+    )
+    if s.telegram_enabled and s.telegram_owner_chat_id:
+        buttons = [
+            {"text": "✅ Senden", "callback_data": f"apv:{approval_id}:yes"},
+            {"text": "❌ Abbrechen", "callback_data": f"apv:{approval_id}:no"},
+        ]
+        await get_channels().send_telegram(
+            s.telegram_owner_chat_id,
+            f"✉️ ASTRA möchte an {to} ({label}) senden:\n„{text[:800]}“\n\n"
+            "Senden? Tippe ✅ oder antworte einfach „ja“.",
+            buttons=buttons,
+        )
+        return tool_result(
+            ok=True, source="core",
+            summary=f"Bestätigung an dich per Telegram geschickt. Nach deinem „ja“ geht "
+                    f"die Nachricht an {to} ({label}) raus.",
+        )
+    return tool_result(
+        ok=False, source="core",
+        summary="Telegram ist nicht konfiguriert — ohne Bestätigungskanal sende ich "
+                "nichts an Dritte.",
+    )
+
+
 def register_admin_tools() -> None:
     """Register all self-admin tools as owner-only core tools (idempotent)."""
     defs = [
@@ -585,4 +667,21 @@ def register_admin_tools() -> None:
         intents = ["status", "list"] if "list" in name or "status" in name else ["control"] if safety == "mutation" else ["status"]
         register(Tool(name=name, description=desc, parameters=params, handler=handler,
                       owner_only=True, source="core", safety=safety, intents=intents))
-    log.info("Registered %d self-admin tools.", len(defs))
+
+    register(Tool(
+        name="astra_send_message",
+        description=(
+            "Sende eine WhatsApp-/Signal-/Telegram-Nachricht. An dich selbst (Bahrian) geht "
+            "sie sofort raus; an jede andere Person erst nach deiner Telegram-Bestätigung "
+            "(„ja“ oder ✅). channel=telegram|waha(WhatsApp)|signal, to=Telefonnummer/Handle "
+            "(WhatsApp: Nummer), text=Inhalt. Für Mail nutze send_email, für Slack slack_send."
+        ),
+        parameters={"type": "object", "properties": {
+            "channel": {"type": "string", "enum": sorted(_SEND_CHANNELS)},
+            "to": {"type": "string", "description": "Telefonnummer, Handle oder Mailadresse"},
+            "text": {"type": "string"}},
+            "required": ["channel", "to", "text"]},
+        handler=_send_message, owner_only=True, source="core",
+        safety="external_send", intents=["control"],
+    ))
+    log.info("Registered %d self-admin tools.", len(defs) + 1)

@@ -132,7 +132,10 @@ async def _handle_tg_update(
                 if not decided:
                     log.info("Approval %s already decided, ignoring duplicate callback.", approval_id)
                     return
-                await brain.resume_after_approval(approval, decision)
+                if approval.get("kind") == "outbound_send":
+                    await brain.resume_outbound_send(approval, decision)
+                else:
+                    await brain.resume_after_approval(approval, decision)
                 log.info("Approval %s decided: %s", approval_id, decision)
             else:
                 log.warning("Malformed apv callback_data: %r", data)
@@ -177,6 +180,12 @@ async def _handle_tg_update(
         chat = msg.get("chat") or {}
         chat_type = chat.get("type", "private")
         is_group = chat_type in {"group", "supergroup"}
+
+        # Owner typing a bare "ja"/"nein" decides a pending approval directly.
+        if not is_group and sender_id == str(s.telegram_owner_chat_id):
+            if await _maybe_resolve_pending_approval(text):
+                return
+
         await brain.handle_inbound(
             channel="telegram",
             sender_handle=str(chat.get("id") or sender_id) if is_group else sender_id,
@@ -223,6 +232,50 @@ def _tg_display(user: dict) -> str:
     parts = [user.get("first_name", ""), user.get("last_name", "")]
     full = " ".join(p for p in parts if p).strip()
     return full or user.get("username") or str(user.get("id", "unknown"))
+
+
+_AFFIRM = {"ja", "jo", "jep", "jepp", "jup", "yes", "yep", "ok", "okay", "okey",
+           "passt", "sende", "senden", "send", "schick", "schicken", "los", "mach",
+           "👍", "✅", "🆗", "ja!", "jo!"}
+_NEGATE = {"nein", "ne", "nö", "noe", "no", "nope", "stop", "stopp", "abbrechen",
+           "cancel", "lass", "lassen", "abbruch", "❌", "🚫", "nein!"}
+
+
+def _decision_from_text(text: str) -> str | None:
+    """Map a bare 'ja'/'nein'-style owner reply to an approval decision, else None.
+
+    Strict: only a short, standalone affirmation/negation counts — a real chat
+    message like 'ja ich brauche noch...' must never silently approve anything.
+    """
+    norm = (text or "").strip().lower().rstrip(".!? ")
+    if len(norm) > 12:
+        return None
+    if norm in _AFFIRM:
+        return "yes"
+    if norm in _NEGATE:
+        return "no"
+    return None
+
+
+async def _maybe_resolve_pending_approval(text: str) -> bool:
+    """If the owner typed a bare yes/no and an approval is pending, decide it.
+
+    Returns True when the message was consumed as a decision."""
+    decision = _decision_from_text(text)
+    if decision is None:
+        return False
+    approval = await db.latest_pending_approval()
+    if not approval:
+        return False
+    decided = await db.decide_approval(approval["id"], decision)
+    if not decided:
+        return False
+    if approval.get("kind") == "outbound_send":
+        await brain.resume_outbound_send(approval, decision)
+    else:
+        await brain.resume_after_approval(approval, decision)
+    log.info("Approval %s decided via typed reply: %s", approval["id"], decision)
+    return True
 
 
 # ─── App lifespan ──────────────────────────────────────────────────────────────

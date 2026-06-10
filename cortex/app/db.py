@@ -253,6 +253,14 @@ async def pending_approvals() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+async def latest_pending_approval() -> dict | None:
+    """Most recently created still-pending approval (full row), or None."""
+    row = await pool().fetchrow(
+        "SELECT * FROM approvals WHERE status='pending' ORDER BY created_at DESC LIMIT 1"
+    )
+    return dict(row) if row else None
+
+
 async def recent_audit(limit: int = 30) -> list[dict]:
     rows = await pool().fetch(
         "SELECT ts, event_type, channel, thread_id, detail FROM audit_log "

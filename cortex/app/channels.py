@@ -60,11 +60,21 @@ class Channels:
         return True
 
     # ── Direct backends ──────────────────────────────────────────────────────────
+    @staticmethod
+    def _waha_chat_id(to: str) -> str:
+        """Accept a bare phone number and turn it into WAHA's <number>@c.us chatId.
+        Existing JIDs (…@c.us / …@g.us) and group ids pass through untouched."""
+        to = (to or "").strip()
+        if "@" in to:
+            return to
+        digits = "".join(ch for ch in to if ch.isdigit())
+        return f"{digits}@c.us" if digits else to
+
     async def _waha(self, chat_id: str, text: str) -> bool:
         r = await self._http.post(
             f"{self.s.waha_base_url}/api/sendText",
             headers={"X-Api-Key": self.s.waha_api_key},
-            json={"session": self.s.waha_session, "chatId": chat_id, "text": text},
+            json={"session": self.s.waha_session, "chatId": self._waha_chat_id(chat_id), "text": text},
         )
         r.raise_for_status()
         return True
