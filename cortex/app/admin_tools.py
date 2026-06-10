@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid as _uuid
 from pathlib import Path
 
 from . import db, knowledge, sysinfo
@@ -521,9 +522,16 @@ async def _send_message(args: dict, ctx: ToolContext) -> str:
         )
 
     # Third party → require an explicit Telegram confirmation before anything leaves.
+    # contact_id is a UUID FK; in the owner chat ctx.contact["id"] is the pseudo
+    # value "owner", so only pass it through when it's a real UUID, else NULL.
     s = get_settings()
+    raw_cid = ctx.contact.get("id")
+    try:
+        contact_id = str(_uuid.UUID(str(raw_cid))) if raw_cid else None
+    except (ValueError, TypeError):
+        contact_id = None
     approval_id = await db.create_approval(
-        thread_id=ctx.thread_id, contact_id=ctx.contact.get("id"),
+        thread_id=ctx.thread_id, contact_id=contact_id,
         kind="outbound_send", question=text,
         payload={"channel": channel, "to": to, "text": text},
     )

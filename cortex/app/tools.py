@@ -157,6 +157,9 @@ _SAFE_TOOL_NAMES = {
     "astra_get_settings",
     "astra_system_status",
     "home_assistant_state",
+    # Self-gates via Telegram (third-party sends need a "ja"); a web-UI pause on
+    # top would be a redundant second confirmation, so skip it here.
+    "astra_send_message",
 }
 _SAFE_PREFIXES = (
     "get_",
@@ -198,13 +201,13 @@ def needs_confirmation(name: str) -> bool:
         return False
     if tool.requires_approval:
         return True
+    lname = name.lower()
+    if lname in _SAFE_TOOL_NAMES:  # explicit allowlist wins over the safety heuristic
+        return False
     if tool.safety in ("read", "private_read"):
         return False
     if tool.safety in ("mutation", "external_send", "destructive"):
         return True
-    lname = name.lower()
-    if lname in _SAFE_TOOL_NAMES:
-        return False
     if lname.startswith(_SAFE_PREFIXES):
         return False
     return any(hint in lname for hint in _MUTATING_HINTS) or tool.owner_only
