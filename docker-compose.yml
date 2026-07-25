@@ -11,6 +11,12 @@ x-restart: &restart
 networks:
   astra:
     driver: bridge
+  # Recherche-Netz: der Browser hängt NUR hier und am Tor-Proxy — er hat damit
+  # keine Route ins Heim-LAN. Das ist die operative Sicherheitsgrenze: selbst wenn
+  # eine besuchte Seite den Browser übernimmt, kommt sie nicht an 192.168.178.0/24.
+  research:
+    driver: bridge
+    internal: true
 
 volumes:
   postgres_data:
@@ -86,6 +92,9 @@ services:
       SIGNAL_BASE_URL: http://signal-cli:8080
       BRAIN_DATA_DIR: /srv/data          # durable, editable knowledge (volume below)
       ASTRA_UPDATE_REPO_ROOT: /opt/astra # host checkout mounted below for web updates
+      # Recherche-Pfeiler (nur aktiv mit --profile research)
+      TOR_PROXY_URL: socks5://tor:9050
+      BROWSER_WS_URL: ws://browser:3000
     volumes:
       - brain_data:/srv/data             # persona/facts/routines markdown — survives updates
       - .:/opt/astra
@@ -100,7 +109,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
-    networks: [astra]
+    networks: [astra, research]   # research nur, um Tor/Browser zu erreichen
 
   # ─── n8n (stateless tool workflows ONLY — no business logic) ────────────────
   n8n:
@@ -163,6 +172,34 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     networks: [astra]
+
+  # ─── Tor (SOCKS5) — einziger Ausgang für die Recherche ─────────────────────
+  # Kein Port nach außen: nur cortex und der Browser dürfen ihn im Netz erreichen.
+  # OSINT-Verkehr geht ausschließlich hierüber. "Untrackable" bleibt best effort:
+  # Tor verschleiert die Herkunft, garantiert aber keine Anonymität.
+  tor:
+    image: dperson/torproxy:latest
+    <<: *restart
+    environment:
+      TOR_NewCircuitPeriod: "60"
+    networks: [astra, research]
+    profiles: ["research"]        # startet nur mit: docker compose --profile research up -d
+
+  # ─── Headless-Browser für Recherche (netz-isoliert!) ───────────────────────
+  # Hängt bewusst NICHT am astra-Netz-Internetpfad, sondern nur am internen
+  # research-Netz + Tor. Kein Zugriff auf Postgres, WAHA, HA oder das LAN.
+  browser:
+    image: browserless/chrome:latest
+    <<: *restart
+    environment:
+      CONNECTION_TIMEOUT: "60000"
+      MAX_CONCURRENT_SESSIONS: "2"
+      DEFAULT_BLOCK_ADS: "true"
+      # Aller Browser-Verkehr durch Tor.
+      DEFAULT_LAUNCH_ARGS: '["--proxy-server=socks5://tor:9050","--no-sandbox"]'
+    networks: [research]
+    depends_on: [tor]
+    profiles: ["research"]
 
   # ─── Langfuse (LLM tracing). v2 needs only Postgres. ────────────────────────
   langfuse:

@@ -23,6 +23,26 @@ class Settings(BaseSettings):
     openai_model_small: str = "gpt-4o-mini"
     openai_embed_model: str = "text-embedding-3-small"
 
+    # ── Second brain: Claude for heavy reasoning / HomeLab jobs (optional) ──────
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-sonnet-5"
+    # OpenRouter — one key, many models (used by the OSINT pillar when local is off)
+    openrouter_api_key: str = ""
+    openrouter_model: str = ""
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    # Local, OpenAI-compatible endpoint (Ollama ≥0.2 serves /v1)
+    ollama_base_url: str = "http://192.168.178.189:11434/v1"
+    # Deliberately less restrictive model for the OSINT/research role
+    osint_model: str = "dolphin-mistral"
+
+    @property
+    def anthropic_enabled(self) -> bool:
+        return bool(self.anthropic_api_key)
+
+    @property
+    def openrouter_enabled(self) -> bool:
+        return bool(self.openrouter_api_key)
+
     # ── Telegram (owner control + approval channel) ────────────────────────────
     telegram_bot_token: str = ""
     telegram_owner_chat_id: str = ""

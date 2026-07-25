@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -23,7 +24,11 @@ from .config import get_settings
 
 log = logging.getLogger("astra.knowledge")
 
-# Owner-private files (injected only when ASTRA talks to the owner himself).
+# Always-on core injected into every owner prompt — small and genuinely always
+# relevant. facts.md / people.md are NO LONGER dumped here; their bullets are
+# retrieved on demand by relevant_facts() so the prompt stays cheap.
+_CORE_FILES = ("persona.md", "routines.md")
+# Historical set (kept for reference / any external caller).
 _PRIVATE = ("persona.md", "facts.md", "routines.md", "people.md")
 
 _SEED: dict[str, str] = {
@@ -67,11 +72,40 @@ Pro Person: Beziehung, Trust-Tier-Hinweis, was geteilt werden darf / nicht.
 - _Beispiel:_ **Mutter** — Tier 1. Darf wissen, wann ich nach Hause komme.
 - _Beispiel:_ **Klavierlehrerin (WhatsApp)** — Terminänderungen in Kalender übernehmen.
 """,
+    "world_aliases.md": """\
+# Aliasse für Räume & Geräte (editierbar)
+
+Wie DU deine Räume und Geräte nennst. ASTRA schlägt hier nach, bevor es einen
+Raum sucht — damit „mein Zimmer" oder „unten" trifft, auch wenn Home Assistant
+den Raum anders nennt. Links steht der echte Name, rechts deine Wörter dafür.
+
+Umlaute, Tippfehler und verschluckte Endungen muss du hier NICHT eintragen —
+die verzeiht der Resolver von sich aus („Wohnzimma" findet das Wohnzimmer).
+
+<!-- astra:aliases
+wohnzimmer: wohnstube, unten, couch
+schlafzimmer: mein zimmer, oben, bett
+kueche: kochen, essen
+-->
+
+Trag deine eigenen Zeilen in den Block oben ein (oder sag ASTRA einfach
+„mein Zimmer ist das Schlafzimmer" — dann schreibt es das selbst hier rein).
+""",
 }
 
 
 def _dir() -> Path:
     return Path(get_settings().brain_data_dir)
+
+
+def principal_dir(principal: str = "") -> Path:
+    """Brain-data root for a principal. The default owner keeps the historical
+    /srv/data (nothing moves); additional principals live under /srv/data/principals/<key>."""
+    base = _dir()
+    if not principal:
+        return base
+    safe = re.sub(r"[^a-z0-9_-]+", "_", principal.lower()).strip("_") or "unknown"
+    return base / "principals" / safe
 
 
 def ensure_seeded() -> None:
@@ -98,8 +132,10 @@ def _read(name: str) -> str:
 
 
 def owner_context() -> str:
-    """Concatenated private knowledge for the OWNER register (system prompt block)."""
-    parts = [c for name in _PRIVATE if (c := _read(name))]
+    """Always-on core for the OWNER register: persona + routines + a one-line people
+    index. The long tail (facts.md bullets, per-person notes) is pulled per turn by
+    relevant_facts() instead of dumped here — that is the efficiency win."""
+    parts = [c for name in _CORE_FILES if (c := _read(name))]
     idx = people_index()
     if idx:
         parts.append(idx + "\n(Mit astra_brain_read/-write kannst du sie lesen & pflegen.)")
@@ -130,6 +166,7 @@ _TITLES: dict[str, tuple[str, str]] = {
     "persona.md": ("Persona & Ton", "persona"),
     "routines.md": ("Routinen", "routinen"),
     "people.md": ("Personen – Übersicht", "personen"),
+    "world_aliases.md": ("Räume & Geräte – Aliasse", "zuhause"),
 }
 _PEOPLE_DIR = "people"
 
@@ -392,3 +429,215 @@ def people_index() -> str:
     if not people:
         return ""
     return "Personen-Dateien: " + ", ".join(f"{e['title']} ({e['rel']})" for e in people)
+
+
+# ─── Room/device aliases for the world model ───────────────────────────────────
+# Same machine-readable-block idea as astra:handles above, one file for the whole
+# home: `real name: my word, my other word`. The world resolver reads this so
+# "mein Zimmer" resolves even though Home Assistant calls it "Schlafzimmer".
+WORLD_ALIAS_FILE = "world_aliases.md"
+_ALIAS_BLOCK = re.compile(r"<!--\s*astra:aliases(.*?)-->", re.DOTALL | re.IGNORECASE)
+
+
+def world_aliases() -> dict[str, list[str]]:
+    """Return {real_name: [alias, ...]} from world_aliases.md (empty on any problem)."""
+    out: dict[str, list[str]] = {}
+    m = _ALIAS_BLOCK.search(read_file(WORLD_ALIAS_FILE))
+    if not m:
+        return out
+    for line in m.group(1).splitlines():
+        if ":" not in line:
+            continue
+        target, raw = line.split(":", 1)
+        target = target.strip()
+        values = [v.strip() for v in raw.split(",") if v.strip()]
+        if target and values:
+            out.setdefault(target, []).extend(values)
+    return out
+
+
+# ─── Compact fact retrieval (efficient owner memory) ───────────────────────────
+# Instead of dumping every markdown file into the prompt, we keep candidate facts
+# — DB rows, facts.md/people bullets, aliases — as short lines and inject only the
+# ones relevant to the current message. The scorer is pure so it is unit-testable
+# without a database.
+
+@dataclass(frozen=True)
+class Fact:
+    kind: str
+    subject: str
+    value: str
+    tags: tuple[str, ...] = ()
+    always_on: bool = False
+    weight: float = 1.0
+    id: int | None = None
+
+    def line(self) -> str:
+        """One compact line for the prompt (caveman style — no prose)."""
+        head = f"{self.subject}: {self.value}" if self.subject and self.value else \
+               (self.value or self.subject)
+        return f"[{self.kind}] {head}".strip()
+
+    def _haystack(self) -> str:
+        return " ".join([self.subject, self.value, self.kind, *self.tags])
+
+
+_STOPWORDS = frozenset({
+    "der", "die", "das", "und", "oder", "im", "in", "ist", "war", "mit", "auf",
+    "den", "dem", "ein", "eine", "wie", "was", "wo", "mir", "mich", "mal", "bitte",
+    "the", "a", "of", "is", "my", "me", "to", "for",
+})
+
+
+def _tokens(text: str) -> set[str]:
+    """Lowercase word tokens (umlaut-folded via the world normalizer if present)."""
+    try:
+        from . import world
+        folded = world.fold(text)
+    except Exception:  # noqa: BLE001 — knowledge must not hard-depend on world
+        folded = (text or "").lower()
+    return {t for t in re.split(r"[^a-z0-9]+", folded) if len(t) > 2 and t not in _STOPWORDS}
+
+
+def score_facts(candidates: list[Fact], query: str, *, limit: int = 12) -> list[Fact]:
+    """Rank facts by token overlap with the query. always_on facts always make it
+    in; the rest compete for the remaining slots. Pure — no I/O."""
+    q = _tokens(query)
+    pinned = [f for f in candidates if f.always_on]
+    rest = [f for f in candidates if not f.always_on]
+    scored: list[tuple[float, Fact]] = []
+    for f in rest:
+        toks = _tokens(f._haystack())
+        if not toks:
+            continue
+        overlap = 0.0
+        for qt in q:
+            if qt in toks:
+                overlap += 1.0
+            # Compound-word tolerance: "kaffee" inside "filterkaffee" still counts,
+            # at reduced weight so it never beats an exact hit.
+            elif any(len(qt) >= 4 and (qt in ft or ft in qt) for ft in toks):
+                overlap += 0.6
+        if overlap:
+            # Longer facts shouldn't win just by having more words to match.
+            score = (overlap / (len(toks) ** 0.5)) * max(0.1, f.weight)
+            scored.append((score, f))
+    scored.sort(key=lambda row: (-row[0], row[1].subject))
+    room = max(0, limit - len(pinned))
+    return pinned + [f for _s, f in scored[:room]]
+
+
+def _bullets_as_facts(rel: str, kind: str) -> list[Fact]:
+    """Parse '- foo' / '- **Label:** value' bullets from a markdown brain file."""
+    out: list[Fact] = []
+    for line in read_file(rel).splitlines():
+        s = line.strip()
+        if not s.startswith(("-", "*")):
+            continue
+        s = s.lstrip("-* ").strip()
+        # Drop the leading date stamp remember_fact writes: "(2026-07-25) …"
+        s = re.sub(r"^\(\d{4}-\d{2}-\d{2}\)\s*", "", s)
+        if not s or s.startswith("_"):   # skip template "_Beispiel:_" lines
+            continue
+        m = re.match(r"\*{0,2}([^:*]{1,40})\*{0,2}\s*:\s*(.+)", s)
+        if m:
+            subject = m.group(1).strip().strip("*").strip()
+            value = m.group(2).strip().strip("*").strip()
+            out.append(Fact(kind=kind, subject=subject, value=value))
+        else:
+            out.append(Fact(kind=kind, subject="", value=s.strip("*").strip()))
+    return out
+
+
+def markdown_facts() -> list[Fact]:
+    """Existing facts.md + per-person notes as retrievable candidates (not dumped)."""
+    facts = _bullets_as_facts("facts.md", "bio")
+    for e in list_files():
+        if e["tag"] == "person":
+            facts.extend(_bullets_as_facts(e["rel"], "relation"))
+    return facts
+
+
+async def relevant_facts(query: str, *, limit: int = 12, principal_key: str = "") -> str:
+    """Compact block of the facts most relevant to `query`, for the owner prompt.
+
+    Merges structured DB facts, facts.md/people bullets and room aliases, ranks by
+    relevance, returns a short bullet list. Fault-tolerant: a missing DB just means
+    the markdown candidates are used."""
+    candidates: list[Fact] = list(markdown_facts())
+    try:
+        from . import db
+        for r in await db.all_facts(principal_key=principal_key):
+            candidates.append(Fact(
+                kind=r["kind"], subject=r["subject"], value=r["value"],
+                tags=tuple(r.get("tags") or ()), always_on=bool(r["always_on"]),
+                weight=float(r.get("weight") or 1.0), id=r.get("id"),
+            ))
+    except Exception:  # noqa: BLE001 — no pool in tests / DB down → markdown only
+        log.debug("relevant_facts: DB facts unavailable.", exc_info=True)
+    for target, aliases in world_aliases().items():
+        for spoken in aliases:
+            candidates.append(Fact(kind="alias", subject=spoken, value=target))
+
+    chosen = score_facts(candidates, query, limit=limit)
+    if not chosen:
+        return ""
+    try:
+        from . import db
+        await db.touch_facts([f.id for f in chosen if f.id])
+    except Exception:  # noqa: BLE001
+        pass
+    return "Relevantes über Bahrian (kompakt):\n" + "\n".join(f"- {f.line()}" for f in chosen)
+
+
+async def world_aliases_db(*, principal_key: str = "") -> dict[str, list[str]]:
+    """Room/device aliases stored as kind=alias facts (subject=spoken, value=target),
+    reshaped to {real_target: [spoken, …]} for the world resolver."""
+    out: dict[str, list[str]] = {}
+    try:
+        from . import db
+        for r in await db.all_facts(principal_key=principal_key):
+            if r["kind"] == "alias" and r["subject"] and r["value"]:
+                out.setdefault(r["value"], []).append(r["subject"])
+    except Exception:  # noqa: BLE001 — no DB → markdown aliases still apply
+        log.debug("world_aliases_db unavailable.", exc_info=True)
+    return out
+
+
+def _render_alias_block(aliases: dict[str, list[str]]) -> str:
+    rows = "".join(
+        f"{target}: {', '.join(dict.fromkeys(values))}\n"
+        for target, values in sorted(aliases.items()) if values
+    )
+    return "<!-- astra:aliases\n" + rows + "-->"
+
+
+def set_world_alias(target: str, alias: str, *, remove: bool = False) -> bool:
+    """Add or remove one alias for a room/device. Keeps the rest of the file intact."""
+    target, alias = (target or "").strip(), (alias or "").strip()
+    if not target or not alias:
+        return False
+    ensure_seeded()
+    aliases = world_aliases()
+    current = aliases.get(target, [])
+    if remove:
+        lowered = alias.casefold()
+        kept = [a for a in current if a.casefold() != lowered]
+        if len(kept) == len(current):
+            return False
+        if kept:
+            aliases[target] = kept
+        else:
+            aliases.pop(target, None)
+    else:
+        if any(a.casefold() == alias.casefold() for a in current):
+            return True   # already known — nothing to write, still a success
+        aliases[target] = current + [alias]
+
+    text = read_file(WORLD_ALIAS_FILE) or _SEED[WORLD_ALIAS_FILE]
+    block = _render_alias_block(aliases)
+    if _ALIAS_BLOCK.search(text):
+        text = _ALIAS_BLOCK.sub(lambda _m: block, text, count=1)
+    else:
+        text = text.rstrip() + "\n\n" + block + "\n"
+    return write_file(WORLD_ALIAS_FILE, text)

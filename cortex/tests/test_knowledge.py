@@ -28,12 +28,19 @@ def test_seed_does_not_overwrite_existing(tmp_path, monkeypatch):
     assert (tmp_path / "facts.md").read_text(encoding="utf-8") == "MEINE EIGENEN FAKTEN"
 
 
-def test_append_fact_and_owner_context(tmp_path, monkeypatch):
+def test_owner_context_is_core_only_facts_are_retrieved(tmp_path, monkeypatch):
+    """W1.5: owner_context is the always-on core (persona+routines); facts.md is no
+    longer dumped wholesale — it is surfaced on demand by relevant_facts()."""
     knowledge = _fresh_knowledge(tmp_path, monkeypatch)
     knowledge.ensure_seeded()
     assert knowledge.append_fact("Ich mag Filterkaffee", file="facts.md")
-    ctx = knowledge.owner_context()
-    assert "Filterkaffee" in ctx
+    # No longer in the always-on block …
+    assert "Filterkaffee" not in knowledge.owner_context()
+    # … but a bullet parsed into a retrievable candidate.
+    candidates = knowledge.markdown_facts()
+    assert any("Filterkaffee" in f.value for f in candidates)
+    chosen = knowledge.score_facts(candidates, "was trinkt er, kaffee?", limit=8)
+    assert any("Filterkaffee" in f.value for f in chosen)
 
 
 def test_append_fact_rejects_unknown_file_falls_back(tmp_path, monkeypatch):

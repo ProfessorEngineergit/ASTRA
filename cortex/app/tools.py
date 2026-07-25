@@ -32,6 +32,7 @@ class ToolContext:
     max_sensitivity: str = "none"
     is_owner: bool = False     # True only when ASTRA is talking to the owner himself
     permission_mode: str = "auto"  # web owner chat: ask | auto | bypass
+    principal: str = ""        # served-person key ('' = default owner); multi-tenant seam
 
 
 @dataclass
@@ -146,11 +147,43 @@ async def _remember_fact(args: dict, ctx: ToolContext) -> str:
     return f"Gespeichert in {target}." if ok else "Konnte den Fakt nicht speichern."
 
 
+async def _remember(args: dict, ctx: ToolContext) -> str:
+    """Store one compact, structured fact about the owner (efficient memory).
+
+    subject+value is a terse pair ('Quantum Room' → 'Schlafzimmer'), not prose.
+    Only relevant facts are pulled back into later prompts, so this stays cheap."""
+    kind = (args.get("kind") or "bio").strip().lower()
+    subject = (args.get("subject") or "").strip()
+    value = (args.get("value") or "").strip()
+    if not value and not subject:
+        return "Nichts zu merken — gib subject und/oder value an."
+    tags = args.get("tags") or []
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+    principal = getattr(ctx, "principal", "") or ""
+    try:
+        await db.add_fact(kind, subject, value, tags=tags,
+                          always_on=bool(args.get("always_on")), principal_key=principal)
+    except Exception as e:  # noqa: BLE001
+        log.warning("remember failed: %s", e)
+        return f"Konnte das nicht merken: {e}"
+    if kind == "alias":
+        try:
+            from . import world
+            world.invalidate()
+        except Exception:  # noqa: BLE001
+            pass
+    shown = f"{subject}: {value}" if subject and value else (value or subject)
+    return f"Gemerkt [{kind}]: {shown}"
+
+
 # ─── Registry ─────────────────────────────────────────────────────────────────
 REGISTRY: dict[str, Tool] = {}
 
 _SAFE_TOOL_NAMES = {
     "recall_memory",
+    "home_state",
+    "list_areas",
     "astra_list_integrations",
     "astra_integration_details",
     "astra_test_integration",
@@ -276,6 +309,34 @@ register(Tool(
     },
     handler=_remember_fact,
     owner_only=True,
+))
+
+register(Tool(
+    name="remember",
+    description=(
+        "Merke dir EINEN kompakten, strukturierten Fakt über Bahrian — knapp, kein "
+        "Fließtext. subject+value als Paar (z. B. subject='Quantum Room', value='Schlafzimmer', "
+        "oder subject='Wecker', value='6:40 werktags'). kind ordnet ein: alias (Raum/Gerät-"
+        "Spitzname), pref (Vorliebe), bio (über ihn), relation (Person), place (Ort), note. "
+        "Nur relevante Fakten kommen später in den Kontext, darum ist das billig. always_on=true "
+        "nur für Dinge, die IMMER gelten müssen."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string",
+                     "enum": ["alias", "pref", "bio", "relation", "place", "note"]},
+            "subject": {"type": "string", "description": "Kurzes Stichwort / linke Seite"},
+            "value": {"type": "string", "description": "Der Wert / rechte Seite"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "always_on": {"type": "boolean"},
+        },
+        "required": ["value"],
+    },
+    handler=_remember,
+    owner_only=True,
+    safety="mutation",
+    intents=["control"],
 ))
 
 

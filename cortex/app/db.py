@@ -55,6 +55,98 @@ async def _migrate() -> None:
         )
         """
     )
+    # Compact, structured owner knowledge — one terse triple per row instead of
+    # dumping whole markdown files into every prompt. principal_key '' = default
+    # owner (W2 fills this in later); no migration needed then.
+    await _pool.execute(
+        """
+        CREATE TABLE IF NOT EXISTS facts (
+            id            BIGSERIAL PRIMARY KEY,
+            principal_key TEXT NOT NULL DEFAULT '',
+            kind          TEXT NOT NULL DEFAULT 'bio',   -- alias|pref|bio|relation|place|note|…
+            subject       TEXT NOT NULL DEFAULT '',
+            value         TEXT NOT NULL DEFAULT '',
+            tags          TEXT[] NOT NULL DEFAULT '{}',
+            always_on     BOOLEAN NOT NULL DEFAULT FALSE, -- pinned into every prompt
+            weight        REAL NOT NULL DEFAULT 1.0,
+            created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+            last_used_at  TIMESTAMPTZ
+        )
+        """
+    )
+    await _pool.execute(
+        "CREATE INDEX IF NOT EXISTS idx_facts_principal ON facts (principal_key, kind)"
+    )
+    # Multi-tenant seam: one principal per served person. Only the default (Bahrian)
+    # exists today; a second user is later a row here, not a refactor. Threads and
+    # approvals gain a principal_key ('' = default) so nothing existing needs migrating.
+    await _pool.execute(
+        """
+        CREATE TABLE IF NOT EXISTS principals (
+            key              TEXT PRIMARY KEY,
+            display_name     TEXT NOT NULL DEFAULT '',
+            is_default       BOOLEAN NOT NULL DEFAULT FALSE,
+            telegram_chat_id TEXT NOT NULL DEFAULT '',
+            ha_person_entity TEXT NOT NULL DEFAULT '',
+            created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    # Cross-integration rules (W4): "when trigger + condition → actions". JSON so
+    # they are inspectable and editable. ASTRA-authored rules stay unconfirmed
+    # (confirmed_at NULL) until Bahrian approves.
+    await _pool.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rules (
+            id            BIGSERIAL PRIMARY KEY,
+            principal_key TEXT NOT NULL DEFAULT '',
+            plugin_slug   TEXT NOT NULL DEFAULT '',
+            name          TEXT NOT NULL DEFAULT '',
+            enabled       BOOLEAN NOT NULL DEFAULT TRUE,
+            trigger       JSONB NOT NULL DEFAULT '{}'::jsonb,
+            condition     JSONB NOT NULL DEFAULT '{}'::jsonb,
+            actions       JSONB NOT NULL DEFAULT '[]'::jsonb,
+            created_by    TEXT NOT NULL DEFAULT 'owner',  -- owner | astra
+            confirmed_at  TIMESTAMPTZ,
+            last_run_at   TIMESTAMPTZ,
+            last_result   TEXT NOT NULL DEFAULT '',
+            created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    # Delegated jobs (W7): the small model hands a task to the big brain, with an
+    # explicit permission envelope. Steps outside the envelope create approvals.
+    await _pool.execute(
+        """
+        CREATE TABLE IF NOT EXISTS jobs (
+            id            BIGSERIAL PRIMARY KEY,
+            principal_key TEXT NOT NULL DEFAULT '',
+            goal          TEXT NOT NULL,
+            kind          TEXT NOT NULL DEFAULT 'analyze',   -- analyze | ops | research
+            envelope      JSONB NOT NULL DEFAULT '{}'::jsonb, -- hosts, write?, budget
+            status        TEXT NOT NULL DEFAULT 'pending',    -- pending|running|done|failed|cancelled
+            plan          TEXT NOT NULL DEFAULT '',
+            result        TEXT NOT NULL DEFAULT '',
+            created_by    TEXT NOT NULL DEFAULT 'astra',
+            created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+            finished_at   TIMESTAMPTZ
+        )
+        """
+    )
+    await _pool.execute("ALTER TABLE threads ADD COLUMN IF NOT EXISTS principal_key TEXT NOT NULL DEFAULT ''")
+    await _pool.execute("ALTER TABLE approvals ADD COLUMN IF NOT EXISTS principal_key TEXT NOT NULL DEFAULT ''")
+    # Seed exactly one default principal from the configured owner name.
+    s = get_settings()
+    await _pool.execute(
+        """
+        INSERT INTO principals (key, display_name, is_default, telegram_chat_id)
+        VALUES ('', $1, TRUE, $2)
+        ON CONFLICT (key) DO UPDATE
+            SET display_name = EXCLUDED.display_name,
+                telegram_chat_id = EXCLUDED.telegram_chat_id
+        """,
+        s.astra_owner_name, str(s.telegram_owner_chat_id or ""),
+    )
 
 
 async def close_pool() -> None:
@@ -288,6 +380,75 @@ async def set_setting(key: str, value) -> None:
     )
 
 
+# ─── Principals (multi-tenant seam; only the default is active today) ─────────
+DEFAULT_PRINCIPAL = ""
+
+
+async def default_principal() -> dict:
+    row = await pool().fetchrow(
+        "SELECT * FROM principals WHERE is_default ORDER BY created_at LIMIT 1"
+    )
+    if row:
+        return dict(row)
+    row = await pool().fetchrow("SELECT * FROM principals WHERE key=''")
+    return dict(row) if row else {"key": DEFAULT_PRINCIPAL, "display_name": "", "is_default": True}
+
+
+async def get_principal(key: str) -> dict | None:
+    row = await pool().fetchrow("SELECT * FROM principals WHERE key=$1", key)
+    return dict(row) if row else None
+
+
+async def list_principals() -> list[dict]:
+    rows = await pool().fetch("SELECT * FROM principals ORDER BY is_default DESC, key")
+    return [dict(r) for r in rows]
+
+
+async def upsert_principal(
+    key: str,
+    *,
+    display_name: str = "",
+    telegram_chat_id: str = "",
+    ha_person_entity: str = "",
+) -> dict:
+    row = await pool().fetchrow(
+        """
+        INSERT INTO principals (key, display_name, telegram_chat_id, ha_person_entity)
+        VALUES ($1,$2,$3,$4)
+        ON CONFLICT (key) DO UPDATE SET
+            display_name = COALESCE(NULLIF(EXCLUDED.display_name, ''), principals.display_name),
+            telegram_chat_id = COALESCE(NULLIF(EXCLUDED.telegram_chat_id, ''), principals.telegram_chat_id),
+            ha_person_entity = COALESCE(NULLIF(EXCLUDED.ha_person_entity, ''), principals.ha_person_entity)
+        RETURNING *
+        """,
+        key, display_name, telegram_chat_id, ha_person_entity,
+    )
+    return dict(row)
+
+
+async def principal_for_telegram(chat_id: str) -> str:
+    """Map a Telegram chat id to a principal key ('' default if unknown)."""
+    key = await pool().fetchval(
+        "SELECT key FROM principals WHERE telegram_chat_id = $1 AND telegram_chat_id <> ''",
+        str(chat_id),
+    )
+    return key if key is not None else DEFAULT_PRINCIPAL
+
+
+def _principal_setting_key(key: str, principal: str) -> str:
+    return key if not principal else f"principal:{principal}:{key}"
+
+
+async def get_principal_setting(key: str, principal: str = DEFAULT_PRINCIPAL, default=None):
+    """Per-principal setting. The default principal keeps the historical flat keys
+    (e.g. app_settings), so nothing existing has to move."""
+    return await get_setting(_principal_setting_key(key, principal), default)
+
+
+async def set_principal_setting(key: str, value, principal: str = DEFAULT_PRINCIPAL) -> None:
+    await set_setting(_principal_setting_key(key, principal), value)
+
+
 # ─── Plugin config (per-plugin key/value, secrets stored as ciphertext) ───────
 async def plugin_config_all(slug: str) -> dict[str, dict]:
     """All stored config for one plugin → {key: {"value": ..., "is_secret": bool}}."""
@@ -319,6 +480,175 @@ async def plugin_config_set(slug: str, key: str, value, is_secret: bool = False)
 async def plugin_config_delete(slug: str, key: str) -> None:
     await pool().execute(
         "DELETE FROM plugin_config WHERE plugin_slug=$1 AND key=$2", slug, key
+    )
+
+
+# ─── Facts (compact structured owner knowledge) ───────────────────────────────
+async def add_fact(
+    kind: str,
+    subject: str,
+    value: str,
+    *,
+    tags: list[str] | None = None,
+    always_on: bool = False,
+    weight: float = 1.0,
+    principal_key: str = "",
+) -> int:
+    """Insert a fact. A non-empty subject replaces any prior fact with the same
+    (principal, kind, subject) — so re-teaching an alias updates, never duplicates."""
+    tags = [t for t in (tags or []) if t]
+    async with pool().acquire() as conn:
+        async with conn.transaction():
+            if subject.strip():
+                await conn.execute(
+                    "DELETE FROM facts WHERE principal_key=$1 AND kind=$2 "
+                    "AND lower(subject)=lower($3)",
+                    principal_key, kind, subject,
+                )
+            return int(await conn.fetchval(
+                """
+                INSERT INTO facts (principal_key, kind, subject, value, tags, always_on, weight)
+                VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id
+                """,
+                principal_key, kind, subject, value, tags, always_on, weight,
+            ))
+
+
+async def delete_fact(kind: str, subject: str, *, principal_key: str = "") -> int:
+    row = await pool().fetchval(
+        "WITH d AS (DELETE FROM facts WHERE principal_key=$1 AND kind=$2 "
+        "AND lower(subject)=lower($3) RETURNING 1) SELECT count(*) FROM d",
+        principal_key, kind, subject,
+    )
+    return int(row or 0)
+
+
+async def all_facts(*, principal_key: str = "") -> list[dict]:
+    rows = await pool().fetch(
+        "SELECT id, kind, subject, value, tags, always_on, weight "
+        "FROM facts WHERE principal_key=$1 ORDER BY kind, subject",
+        principal_key,
+    )
+    return [dict(r) for r in rows]
+
+
+async def touch_facts(ids: list[int]) -> None:
+    if not ids:
+        return
+    await pool().execute("UPDATE facts SET last_used_at=now() WHERE id = ANY($1)", ids)
+
+
+# ─── Rules (cross-integration automation) ─────────────────────────────────────
+async def add_rule(
+    *,
+    name: str,
+    trigger: dict,
+    condition: dict,
+    actions: list,
+    plugin_slug: str = "",
+    principal_key: str = "",
+    created_by: str = "owner",
+    confirmed: bool = False,
+) -> int:
+    return int(await pool().fetchval(
+        """
+        INSERT INTO rules (principal_key, plugin_slug, name, trigger, condition, actions,
+                           created_by, confirmed_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7, CASE WHEN $8 THEN now() ELSE NULL END)
+        RETURNING id
+        """,
+        principal_key, plugin_slug, name, trigger, condition, actions, created_by, confirmed,
+    ))
+
+
+async def list_rules(*, principal_key: str | None = None, include_unconfirmed: bool = True) -> list[dict]:
+    q = "SELECT * FROM rules"
+    conds, args = [], []
+    if principal_key is not None:
+        args.append(principal_key)
+        conds.append(f"principal_key = ${len(args)}")
+    if not include_unconfirmed:
+        conds.append("confirmed_at IS NOT NULL")
+    if conds:
+        q += " WHERE " + " AND ".join(conds)
+    q += " ORDER BY created_at DESC"
+    return [dict(r) for r in await pool().fetch(q, *args)]
+
+
+async def get_rule(rule_id: int) -> dict | None:
+    row = await pool().fetchrow("SELECT * FROM rules WHERE id=$1", rule_id)
+    return dict(row) if row else None
+
+
+async def active_schedule_rules() -> list[dict]:
+    """Enabled, confirmed rules whose trigger is a schedule (the scheduler polls these)."""
+    rows = await pool().fetch(
+        "SELECT * FROM rules WHERE enabled AND confirmed_at IS NOT NULL "
+        "AND trigger->>'type' = 'schedule'"
+    )
+    return [dict(r) for r in rows]
+
+
+async def confirm_rule(rule_id: int) -> bool:
+    return bool(await pool().fetchval(
+        "UPDATE rules SET confirmed_at = now() WHERE id=$1 AND confirmed_at IS NULL RETURNING id",
+        rule_id,
+    ))
+
+
+async def mark_rule_run(rule_id: int, result: str) -> None:
+    await pool().execute(
+        "UPDATE rules SET last_run_at = now(), last_result = $2 WHERE id=$1", rule_id, result[:400]
+    )
+
+
+async def set_rule_enabled(rule_id: int, enabled: bool) -> None:
+    await pool().execute("UPDATE rules SET enabled=$2 WHERE id=$1", rule_id, enabled)
+
+
+async def delete_rule(rule_id: int) -> int:
+    return int(await pool().fetchval(
+        "WITH d AS (DELETE FROM rules WHERE id=$1 RETURNING 1) SELECT count(*) FROM d", rule_id
+    ) or 0)
+
+
+# ─── Jobs (delegated to the big brain) ────────────────────────────────────────
+async def add_job(*, goal: str, kind: str = "analyze", envelope: dict | None = None,
+                  principal_key: str = "", created_by: str = "astra") -> int:
+    return int(await pool().fetchval(
+        "INSERT INTO jobs (principal_key, goal, kind, envelope, created_by) "
+        "VALUES ($1,$2,$3,$4,$5) RETURNING id",
+        principal_key, goal, kind, envelope or {}, created_by,
+    ))
+
+
+async def get_job(job_id: int) -> dict | None:
+    row = await pool().fetchrow("SELECT * FROM jobs WHERE id=$1", job_id)
+    return dict(row) if row else None
+
+
+async def list_jobs(*, principal_key: str | None = None, limit: int = 20) -> list[dict]:
+    if principal_key is None:
+        rows = await pool().fetch("SELECT * FROM jobs ORDER BY created_at DESC LIMIT $1", limit)
+    else:
+        rows = await pool().fetch(
+            "SELECT * FROM jobs WHERE principal_key=$1 ORDER BY created_at DESC LIMIT $2",
+            principal_key, limit)
+    return [dict(r) for r in rows]
+
+
+async def update_job(job_id: int, *, status: str | None = None, plan: str | None = None,
+                     result: str | None = None) -> None:
+    await pool().execute(
+        """
+        UPDATE jobs SET
+            status = COALESCE($2, status),
+            plan   = COALESCE($3, plan),
+            result = COALESCE($4, result),
+            finished_at = CASE WHEN $2 IN ('done','failed','cancelled') THEN now() ELSE finished_at END
+        WHERE id=$1
+        """,
+        job_id, status, plan, result,
     )
 
 

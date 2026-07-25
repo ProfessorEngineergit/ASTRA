@@ -66,6 +66,21 @@ async def _deferral_sweeper() -> None:
         await asyncio.sleep(5)
 
 
+async def _rules_scheduler() -> None:
+    """Wakes every 30 s and fires any schedule-triggered rule that is due."""
+    from . import rules
+    while True:
+        try:
+            n = await rules.tick()
+            if n:
+                log.info("Rules scheduler fired %d rule(s).", n)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("Rules scheduler error (retry in 30 s)")
+        await asyncio.sleep(30)
+
+
 async def _telegram_poller() -> None:
     """Long-poll Telegram getUpdates and dispatch to brain."""
     s = get_settings()
@@ -132,10 +147,7 @@ async def _handle_tg_update(
                 if not decided:
                     log.info("Approval %s already decided, ignoring duplicate callback.", approval_id)
                     return
-                if approval.get("kind") == "outbound_send":
-                    await brain.resume_outbound_send(approval, decision)
-                else:
-                    await brain.resume_after_approval(approval, decision)
+                await _resume_approval(approval, decision)
                 log.info("Approval %s decided: %s", approval_id, decision)
             else:
                 log.warning("Malformed apv callback_data: %r", data)
@@ -257,6 +269,17 @@ def _decision_from_text(text: str) -> str | None:
     return None
 
 
+async def _resume_approval(approval: dict, decision: str) -> None:
+    """Route a decided approval to the flow that created it."""
+    kind = approval.get("kind")
+    if kind == "outbound_send":
+        await brain.resume_outbound_send(approval, decision)
+    elif kind == "ops_exec":
+        await brain.resume_ops_exec(approval, decision)
+    else:
+        await brain.resume_after_approval(approval, decision)
+
+
 async def _maybe_resolve_pending_approval(text: str) -> bool:
     """If the owner typed a bare yes/no and an approval is pending, decide it.
 
@@ -270,10 +293,7 @@ async def _maybe_resolve_pending_approval(text: str) -> bool:
     decided = await db.decide_approval(approval["id"], decision)
     if not decided:
         return False
-    if approval.get("kind") == "outbound_send":
-        await brain.resume_outbound_send(approval, decision)
-    else:
-        await brain.resume_after_approval(approval, decision)
+    await _resume_approval(approval, decision)
     log.info("Approval %s decided via typed reply: %s", approval["id"], decision)
     return True
 
@@ -307,9 +327,11 @@ async def lifespan(app: FastAPI):
     try:
         appset = await db.get_setting("app_settings", {}) or {}
         from .brain import set_autonomy
-        from .models import set_model_override
+        from .models import set_economy, set_model_config, set_model_override
         from .web.templates import set_font
         set_model_override(appset.get("ai_model"))
+        set_economy(bool(appset.get("economy_mode")))
+        set_model_config(appset.get("models"))   # provider registry + role assignment
         set_font(appset.get("font"))
         set_autonomy(appset.get("autonomy", "ask"))
     except Exception:  # noqa: BLE001
@@ -320,6 +342,10 @@ async def lifespan(app: FastAPI):
     sweeper_task = asyncio.create_task(_deferral_sweeper(), name="deferral_sweeper")
     tasks.append(sweeper_task)
     log.info("Deferral sweeper started.")
+
+    rules_task = asyncio.create_task(_rules_scheduler(), name="rules_scheduler")
+    tasks.append(rules_task)
+    log.info("Rules scheduler started.")
 
     if s.astra_telegram_mode == "poll":
         poller_task = asyncio.create_task(_telegram_poller(), name="telegram_poller")
@@ -546,6 +572,43 @@ async def ingress_signal(
         },
     )
     return {"ok": True}
+
+
+# ─── Voice ingress (HA Assist satellite → spoken reply) ────────────────────────
+
+@app.post("/ingress/voice", tags=["ingress"])
+async def ingress_voice(
+    request: Request,
+    x_astra_secret: str | None = Header(default=None),
+):
+    """HA Assist pipeline posts the recognized text here; ASTRA replies in one or
+    two spoken sentences that HA reads back. The satellite may send its `area`,
+    which becomes the default room for 'wie warm ist es hier'.
+
+    Body: {"text": "...", "area": "Wohnzimmer", "principal": "" }
+    """
+    _verify_secret(x_astra_secret)
+    from .agent import generate_reply
+    from .persona import Register
+
+    body = await request.json()
+    text = (body.get("text") or "").strip()
+    if not text:
+        return {"reply": ""}
+    area = (body.get("area") or "").strip()
+    principal = (body.get("principal") or "").strip()
+
+    extra = (f"Der Lautsprecher steht im Raum „{area}“. Wenn {get_settings().astra_owner_name} "
+             f"„hier“ meint, ist dieser Raum gemeint." if area else "")
+    thread_id = f"voice:{principal or 'default'}"
+    reply = await generate_reply(
+        register=Register.VOICE, contact={}, thread_id=thread_id, channel="voice",
+        history=[{"role": "owner", "content": text}], max_sensitivity="details",
+        extra_system=extra, principal=principal,
+    )
+    await db.audit("voice_turn", channel="voice", thread_id=thread_id,
+                   detail={"area": area, "text": text[:200]})
+    return {"reply": reply}
 
 
 # ─── E-Mail ingress ───────────────────────────────────────────────────────────

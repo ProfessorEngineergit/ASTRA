@@ -14,7 +14,7 @@ import logging
 import pkgutil
 import re
 
-from .. import tools
+from .. import tools, world
 from ..config_store import get_config_store
 from . import base, builtin
 from .base import Plugin
@@ -128,6 +128,8 @@ class PluginManager:
         await self.load_all()
         self._register_tools()
         self._sync_background_tasks()
+        world.invalidate()   # enabling/reconfiguring a plugin changes what exists
+
         log.info("Plugins rebuilt — enabled: %s",
                  ", ".join(p.runtime_slug for p in self.enabled()) or "(none)")
 
@@ -142,6 +144,18 @@ class PluginManager:
                 s = None
             if s:
                 out.append(s)
+        return out
+
+    async def world_nodes(self) -> list:
+        """Collect world-model nodes from every enabled plugin."""
+        out: list = []
+        for p in self.enabled():
+            try:
+                nodes = await p.world_nodes()
+            except Exception as e:  # noqa: BLE001 — one provider must not break the world
+                log.warning("world_nodes failed for %s: %s", p.runtime_slug, e)
+                continue
+            out.extend(nodes or [])
         return out
 
     async def shutdown(self) -> None:

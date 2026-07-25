@@ -178,6 +178,25 @@ class Plugin(ABC):
         """Optional line(s) for the morning briefing."""
         return None
 
+    async def world_nodes(self) -> list[Any]:
+        """Addressable things this plugin contributes to the world model.
+
+        Return `world.Node` objects (topology only — rooms, devices, hosts; no
+        live values). They feed the resolver that maps free text like „im
+        Wohnzimma" onto real ids, so anything a user might name out loud belongs
+        here. Called at most once per world TTL, never in a hot path.
+        """
+        return []
+
     def background_tasks(self) -> list[Coroutine[Any, Any, Any] | Awaitable[Any]]:
         """Long-running coroutines (e.g. a poller) started while enabled."""
+        return []
+
+    def rule_templates(self) -> list[dict]:
+        """Ready-made automation rules this plugin suggests (W4).
+
+        Each is a dict {name, trigger, condition, actions} the owner can accept as a
+        starting point on the plugin's config page — e.g. Duolingo offers "remind me
+        at HH:MM if today's lesson isn't done yet". Empty by default.
+        """
         return []

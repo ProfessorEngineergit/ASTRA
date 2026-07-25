@@ -18,7 +18,9 @@ COPY pyproject.toml ./
 COPY app ./app
 RUN uv pip install --system . \
  && (uv pip install --system mem0ai || echo "mem0ai optional — skipped, memory layer will no-op") \
- && (uv pip install --system edupage-api || echo "edupage-api optional — skipped, timetable will no-op")
+ && (uv pip install --system edupage-api || echo "edupage-api optional — skipped, timetable will no-op") \
+ && (uv pip install --system asyncssh || echo "asyncssh optional — skipped, ops_exec will no-op") \
+ && (uv pip install --system 'httpx[socks]' || echo "socks optional — skipped, OSINT via Tor will no-op")
 
 # Durable, editable knowledge lives here (mounted as a volume in compose).
 RUN mkdir -p /srv/data

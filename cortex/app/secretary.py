@@ -46,6 +46,7 @@ class SecretaryPlan:
     reason: str
     in_service_window: bool
     should_notify_owner: bool = False
+    silent: bool = False   # a 'silent' window (e.g. night): don't respond at all
 
 
 def secretary_settings(app_settings: dict | None) -> dict:
@@ -176,9 +177,22 @@ def plan_for(
     if is_group and settings.get("group_actions") != "auto":
         return SecretaryPlan(Mode.ASK, "group-action-requires-owner-grant", in_window, True)
 
+    # Named time-window behavior takes priority over channel modes (except the
+    # email safety guard below): night → silent, focus → hold, etc.
+    behavior = window_behavior(app_settings, local_now)
+    if behavior == "silent":
+        return SecretaryPlan(mode, "window-silent", in_window, silent=True)
+
     channel_mode = channel_cfg.get("mode", "policy")
     if channel == "email" or channel_mode == "always_ask":
         return SecretaryPlan(Mode.ASK, "email-requires-owner-confirmation", in_window, True)
+
+    if behavior == "auto":
+        return SecretaryPlan(Mode.AUTO, "window-auto", in_window)
+    if behavior == "hold":
+        return SecretaryPlan(Mode.DEFER, "window-hold", in_window, True)
+    if behavior == "notify":
+        return SecretaryPlan(Mode.DEFER, "window-notify", in_window, True)
     if channel_mode == "direct":
         return SecretaryPlan(Mode.AUTO, f"{channel}-direct", in_window)
     if channel_mode == "wait":
@@ -188,6 +202,67 @@ def plan_for(
     if mode == Mode.DEFER:
         return SecretaryPlan(mode, "owner-likely-personal-reply", in_window, True)
     return SecretaryPlan(mode, "policy-kept", in_window, mode == Mode.ASK)
+
+
+# ─── Named time-window engine (generalizes the single school window) ──────────
+# A window is {name, start, end, days, behavior}. `behavior` says what the
+# secretary does for third parties while the window is active:
+#   auto   → answer autonomously   hold → wait for Bahrian (DEFER)
+#   notify → only ping Bahrian      silent → stay quiet (e.g. night)
+# Night windows may wrap past midnight (start > end). Falls back to the legacy
+# school window so existing configs keep working unchanged.
+_BEHAVIORS = ("auto", "hold", "notify", "silent")
+
+
+def secretary_windows(app_settings: dict | None) -> list[dict]:
+    raw = (app_settings or {}).get("secretary", {}) or {}
+    windows = raw.get("windows")
+    if isinstance(windows, list) and windows:
+        return [w for w in windows if isinstance(w, dict)]
+    # Back-compat: synthesize windows from the historical school settings.
+    s = secretary_settings(app_settings)
+    return [{
+        "name": "schule", "start": s["school_start"], "end": s["school_end"],
+        "days": s["workdays"], "behavior": "auto" if s["school_direct"] else "hold",
+    }]
+
+
+def _in_window(now: datetime, win: dict) -> bool:
+    try:
+        days = {int(d) for d in (win.get("days") or [0, 1, 2, 3, 4, 5, 6])}
+    except (TypeError, ValueError):
+        days = {0, 1, 2, 3, 4, 5, 6}
+    start = _parse_hhmm(win.get("start", "00:00"), time(0, 0))
+    end = _parse_hhmm(win.get("end", "23:59"), time(23, 59))
+    t = now.time()
+    if start <= end:
+        return now.weekday() in days and start <= t <= end
+    # Wrap past midnight: active from `start` tonight until `end` tomorrow morning.
+    return (now.weekday() in days and t >= start) or t <= end
+
+
+def active_window(app_settings: dict | None, now: datetime) -> dict | None:
+    """First matching window (order = priority), or None."""
+    for win in secretary_windows(app_settings):
+        if _in_window(now, win):
+            return win
+    return None
+
+
+def window_behavior(app_settings: dict | None, now: datetime) -> str:
+    win = active_window(app_settings, now)
+    beh = (win or {}).get("behavior", "")
+    return beh if beh in _BEHAVIORS else ""
+
+
+def shadow_enabled(app_settings: dict | None, channel: str) -> bool:
+    """Shadow mode: draft the reply and send it to Bahrian for approval instead of
+    to the contact. The only honest way to test the secretary on real WhatsApp."""
+    raw = (app_settings or {}).get("secretary", {}) or {}
+    if raw.get("shadow_all"):
+        return True
+    per = raw.get("shadow") or {}
+    return bool(per.get(channel))
 
 
 def with_secretary_header(text: str, *, first_interaction: bool, app_settings: dict | None) -> str:

@@ -6,7 +6,7 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from . import knowledge
+from . import knowledge, world
 from .config import get_settings
 from .models import get_gateway
 from .persona import Register, system_prompt
@@ -98,24 +98,37 @@ async def generate_reply_meta(
     max_sensitivity: str = "none",
     extra_system: str = "",
     permission_mode: str = "auto",
+    principal: str = "",
 ) -> dict:
     s = get_settings()
     gw = get_gateway()
     if not gw.enabled:
         return {"reply": "(ASTRA: kein OpenAI-Key konfiguriert — Antwort übersprungen.)"}
 
-    is_owner = register == Register.OWNER
+    is_owner = register in (Register.OWNER, Register.VOICE)
     tools = openai_tools(is_owner=is_owner)
     sys = system_prompt(
         register, owner=s.astra_owner_name, now=_now_str(s.astra_timezone), tz=s.astra_timezone
     )
     messages: list[dict] = [{"role": "system", "content": sys}]
-    if register == Register.OWNER:
+    if is_owner:
         kb = knowledge.owner_context()
         if kb:
             messages.append(
                 {"role": "system", "content": f"Dauerhaftes Wissen über {s.astra_owner_name}:\n{kb}"}
             )
+        # Only the facts relevant to THIS message — not the whole brain dump. Keyed
+        # on the latest turn's text. Fault-tolerant (DB may be down).
+        query = history[-1]["content"] if history else ""
+        try:
+            if facts := await knowledge.relevant_facts(query, principal_key=principal):
+                messages.append({"role": "system", "content": facts})
+        except Exception:  # noqa: BLE001
+            log.debug("relevant_facts failed", exc_info=True)
+        # Live room/device digest — OWNER only: a third party must never learn the
+        # floor plan. prompt_digest() swallows its own errors (it touches the network).
+        if world_view := await world.prompt_digest():
+            messages.append({"role": "system", "content": world_view})
         tool_hint = _tool_context_hint()
         if tool_hint:
             messages.append({"role": "system", "content": tool_hint})
@@ -148,7 +161,7 @@ async def generate_reply_meta(
 
     ctx = ToolContext(
         thread_id=thread_id, channel=channel, contact=contact, max_sensitivity=max_sensitivity,
-        is_owner=is_owner, permission_mode=permission_mode,
+        is_owner=is_owner, permission_mode=permission_mode, principal=principal,
     )
 
     tool_trace = []

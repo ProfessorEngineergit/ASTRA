@@ -22,6 +22,8 @@ dependencies = [
 [project.optional-dependencies]
 memory = ["mem0ai>=0.1.0"]
 edupage = ["edupage-api>=0.10"]
+ops = ["asyncssh>=2.14"]          # HomeLab-Ausführung (ops_exec)
+research = ["httpx[socks]>=0.27"]  # OSINT über den Tor-SOCKS5-Proxy
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.5"]
 
 [build-system]

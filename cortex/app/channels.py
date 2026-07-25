@@ -17,6 +17,24 @@ from .config import get_settings
 log = logging.getLogger("astra.channels")
 
 
+def _split_message(text: str, limit: int = 4096) -> list[str]:
+    """Split a long message into <=limit chunks, preferring paragraph then line breaks."""
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        cut = window.rfind("\n\n")
+        if cut < limit // 2:
+            cut = window.rfind("\n")
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 class Channels:
     def __init__(self) -> None:
         self.s = get_settings()
@@ -46,16 +64,39 @@ class Channels:
             return False
 
     # ── Telegram (control + approvals) ───────────────────────────────────────────
-    async def send_telegram(self, chat_id: str, text: str, buttons: list[dict] | None = None) -> bool:
+    async def send_telegram(
+        self, chat_id: str, text: str, buttons: list[dict] | None = None,
+        *, parse_mode: str | None = None,
+    ) -> bool:
+        if self.s.astra_dry_run:
+            log.info("[DRY_RUN] → telegram/%s: %s", chat_id, text)
+            return True
         if not self.s.telegram_bot_token:
             log.warning("Telegram not configured.")
             return False
-        payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
-        if buttons:
-            payload["reply_markup"] = {"inline_keyboard": [buttons]}
-        r = await self._http.post(
-            f"https://api.telegram.org/bot{self.s.telegram_bot_token}/sendMessage", json=payload
-        )
+        # Telegram caps a message at 4096 chars. Split on paragraph/line/hard
+        # boundaries so a long briefing still gets through in order.
+        chunks = _split_message(text) if len(text) > 4096 else [text]
+        ok = True
+        for i, chunk in enumerate(chunks):
+            payload: dict[str, Any] = {"chat_id": chat_id, "text": chunk}
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+            if buttons and i == len(chunks) - 1:   # buttons only on the last chunk
+                payload["reply_markup"] = {"inline_keyboard": [buttons]}
+            ok = await self._post_telegram(payload) and ok
+        return ok
+
+    async def _post_telegram(self, payload: dict[str, Any]) -> bool:
+        url = f"https://api.telegram.org/bot{self.s.telegram_bot_token}/sendMessage"
+        r = await self._http.post(url, json=payload)
+        # A stray '_' or '*' in dynamic text can 400 under Markdown — never drop the
+        # message for cosmetics: retry once as plain text so it always arrives.
+        if r.status_code == 400 and payload.get("parse_mode"):
+            log.warning("Telegram %s under %s — retrying as plain text.",
+                        r.status_code, payload["parse_mode"])
+            payload = {k: v for k, v in payload.items() if k != "parse_mode"}
+            r = await self._http.post(url, json=payload)
         r.raise_for_status()
         return True
 

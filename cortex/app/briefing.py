@@ -67,7 +67,9 @@ async def _intro(sections: list[str]) -> str:
             {"role": "user", "content": "Kontext:\n" + "\n".join(sections)[:1500] +
                 (f"\n\nRoutinen:\n{kb[:800]}" if kb else "")},
         ]
-        out = await gw.chat(msg, temperature=0.7)
+        # One throwaway greeting sentence does not need the expensive model.
+        from .models import SMALL
+        out = await gw.chat(msg, temperature=0.7, role=SMALL)
         return "☀️ " + (out.content or "Guten Morgen!").strip()
     except Exception as e:  # noqa: BLE001
         log.warning("briefing intro failed: %s", e)
@@ -97,7 +99,9 @@ async def send(chat_id: str | None = None) -> bool:
         log.warning("Briefing: no chat id configured.")
         return False
     text = await compose()
-    ok = await get_channels().send_telegram(chat, text)
+    # parse_mode renders the *bold* / _italic_ section headers instead of showing
+    # literal asterisks; send_telegram falls back to plain text if a name breaks it.
+    ok = await get_channels().send_telegram(chat, text, parse_mode="Markdown")
     await db.audit("briefing_sent", channel="telegram", detail={"ok": ok})
     return ok
 
@@ -120,11 +124,14 @@ def _parse_time(hhmm: str) -> time:
 
 
 async def scheduler() -> None:
-    """Sleep until the configured local time, send, repeat daily."""
-    target = _parse_time(get_settings().astra_briefing_time)
-    log.info("Briefing scheduler armed for %02d:%02d local.", target.hour, target.minute)
+    """Sleep until the configured local time, send, repeat daily.
+
+    The time is re-read each loop, so changing ASTRA_BRIEFING_TIME (or a future
+    web setting) takes effect the next day without a restart."""
+    log.info("Briefing scheduler armed (%s local).", get_settings().astra_briefing_time)
     while True:
         try:
+            target = _parse_time(get_settings().astra_briefing_time)
             await asyncio.sleep(_seconds_until(target))
             log.info("Briefing scheduler: composing & sending.")
             await send()

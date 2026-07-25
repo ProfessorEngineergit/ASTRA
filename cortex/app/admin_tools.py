@@ -14,7 +14,7 @@ import re
 import uuid as _uuid
 from pathlib import Path
 
-from . import db, knowledge, sysinfo
+from . import db, knowledge, sysinfo, world
 from .channels import get_channels
 from .config import get_settings
 from .config_store import SECRET_SENTINEL, get_config_store
@@ -355,6 +355,272 @@ async def _brain_add_person(args: dict, ctx: ToolContext) -> str:
     return f"Personen-Datei angelegt: {rel} — jetzt mit astra_brain_write füllen."
 
 
+async def _world_alias(args: dict, ctx: ToolContext) -> str:
+    """List/add/remove a nickname for a room or device (feeds the world resolver).
+
+    Learned aliases live in the compact facts table (kind=alias, subject=spoken word,
+    value=real target); the markdown world_aliases.md stays readable as a manual override."""
+    action = str(args.get("action") or "list").strip().lower()
+    if action == "list":
+        by_target: dict[str, list[str]] = {t: list(v) for t, v in knowledge.world_aliases().items()}
+        for target, spoken in (await knowledge.world_aliases_db()).items():
+            by_target.setdefault(target, []).extend(spoken)
+        if not by_target:
+            return "Keine Aliasse gesetzt."
+        return "Aliasse (echter Name ← deine Wörter):\n" + "\n".join(
+            f"• {target}: {', '.join(dict.fromkeys(vals))}" for target, vals in sorted(by_target.items())
+        )
+    if not await _writes_allowed(ctx):
+        return "Schreiben ist deaktiviert (allow_self_config)."
+    target = str(args.get("target") or "").strip()
+    alias = str(args.get("alias") or "").strip()
+    if not alias:
+        return "Bitte 'alias' (Bahrians Wort) angeben."
+    principal = getattr(ctx, "principal", "") or ""
+    if action == "remove":
+        n = await db.delete_fact("alias", alias, principal_key=principal)
+        world.invalidate()
+        return (f"Alias '{alias}' entfernt." if n else
+                f"'{alias}' war nicht als Alias eingetragen.")
+    if not target:
+        return "Bitte 'target' (echter Raum-/Geräte-Name) angeben."
+    await db.add_fact("alias", alias, target, principal_key=principal)
+    world.invalidate()
+    await db.audit("world_alias", actor="astra",
+                   detail={"action": "add", "target": target, "alias": alias})
+    return f"Gemerkt: '{alias}' bedeutet '{target}'."
+
+
+async def _models_show(args: dict, ctx: ToolContext) -> str:
+    from . import models as m
+    lines = ["Modell-Rollen (Anbieter/Modell):", m.describe_roles(), "", "Anbieter:"]
+    for name, p in sorted(m.providers().items()):
+        state = "konfiguriert" if p.configured else "kein Key/URL"
+        tools = "Tool-Calling" if p.tools else "nur Text (kein Tool-Calling)"
+        lines.append(f"• {name} [{p.kind}] {state} · {tools}"
+                     + (f" · {p.base_url}" if p.base_url else ""))
+    lines.append(f"\nSparmodus: {'an' if m.get_economy() else 'aus'}")
+    return "\n".join(lines)
+
+
+async def _models_set(args: dict, ctx: ToolContext) -> str:
+    """Assign a provider+model to one role (small|medium|heavy|code|osint)."""
+    if not await _writes_allowed(ctx):
+        return "Änderungen sind deaktiviert (allow_self_config)."
+    from . import models as m
+    role = str(args.get("role") or "").strip().lower()
+    if role not in m.ROLES:
+        return f"Unbekannte Rolle. Erlaubt: {', '.join(m.ROLES)}."
+    provider = str(args.get("provider") or "").strip().lower()
+    model = str(args.get("model") or "").strip()
+    if not provider or not model:
+        return "Bitte 'provider' und 'model' angeben (astra_models_show zeigt die Anbieter)."
+    known = m.providers()
+    if provider not in known:
+        return f"Unbekannter Anbieter '{provider}'. Bekannt: {', '.join(sorted(known))}."
+    if role == "medium" and not known[provider].tools:
+        return (f"'{provider}' kann in diesem Loop kein Tool-Calling — für die Rolle 'medium' "
+                "braucht es einen OpenAI-kompatiblen Anbieter (openai, openrouter, ollama).")
+    appset = await _settings()
+    cfg = appset.get("models") or {}
+    roles = dict(cfg.get("roles") or {})
+    roles[role] = {"provider": provider, "model": model}
+    cfg["roles"] = roles
+    appset["models"] = cfg
+    await db.set_setting("app_settings", appset)
+    m.set_model_config(cfg)
+    await db.audit("model_role_set", actor="astra",
+                   detail={"role": role, "provider": provider, "model": model})
+    return f"Rolle '{role}' läuft jetzt auf {provider}/{model}."
+
+
+async def _models_add_provider(args: dict, ctx: ToolContext) -> str:
+    """Register any OpenAI-compatible endpoint (OpenRouter, Groq, vLLM, LM Studio …)."""
+    if not await _writes_allowed(ctx):
+        return "Änderungen sind deaktiviert (allow_self_config)."
+    from . import models as m
+    name = str(args.get("name") or "").strip().lower()
+    if not name:
+        return "Bitte 'name' angeben."
+    appset = await _settings()
+    cfg = appset.get("models") or {}
+    provs = dict(cfg.get("providers") or {})
+    entry = dict(provs.get(name) or {})
+    entry["kind"] = str(args.get("kind") or entry.get("kind") or "openai_compat")
+    if args.get("base_url"):
+        entry["base_url"] = str(args["base_url"]).strip()
+    if args.get("api_key"):
+        entry["api_key"] = str(args["api_key"]).strip()
+    entry["tools"] = bool(args.get("tools", entry.get("tools", entry["kind"] == "openai_compat")))
+    provs[name] = entry
+    cfg["providers"] = provs
+    appset["models"] = cfg
+    await db.set_setting("app_settings", appset)
+    m.set_model_config(cfg)
+    await db.audit("model_provider_set", actor="astra", detail={"provider": name})
+    return f"Anbieter '{name}' gespeichert ({entry['kind']})."
+
+
+async def _delegate_job(args: dict, ctx: ToolContext) -> str:
+    """Hand a task to the big brain with an explicit permission envelope."""
+    if not await _writes_allowed(ctx):
+        return "Delegation ist deaktiviert (allow_self_config)."
+    from . import jobs as jobs_mod
+    goal = str(args.get("goal") or "").strip()
+    if not goal:
+        return "Bitte 'goal' angeben — was soll erreicht werden?"
+    hosts = args.get("hosts") or []
+    if isinstance(hosts, str):
+        hosts = [h.strip() for h in hosts.split(",") if h.strip()]
+    envelope = {"hosts": hosts, "write": bool(args.get("write")),
+                "budget_steps": int(args.get("budget_steps") or 10)}
+    job_id = await db.add_job(goal=goal, kind=str(args.get("kind") or "ops"),
+                              envelope=envelope, principal_key=getattr(ctx, "principal", "") or "",
+                              created_by="owner" if ctx.is_owner else "astra")
+    plan = await jobs_mod.run_job(job_id)
+    return (f"Job #{job_id} geplant (Umschlag: Hosts={hosts or '—'}, "
+            f"Schreiben={'ja' if envelope['write'] else 'nein'}).\n\n{plan}")
+
+
+async def _jobs_list(args: dict, ctx: ToolContext) -> str:
+    rows = await db.list_jobs(principal_key=getattr(ctx, "principal", "") or "")
+    if not rows:
+        return "Keine Jobs."
+    return "Jobs:\n" + "\n".join(
+        f"#{j['id']} [{j['status']}] {j['goal'][:70]} — {j['result'][:60]}" for j in rows)
+
+
+async def _job_show(args: dict, ctx: ToolContext) -> str:
+    job = await db.get_job(int(args.get("id") or 0))
+    if not job:
+        return "Job nicht gefunden."
+    return (f"Job #{job['id']} [{job['status']}]\nZiel: {job['goal']}\n"
+            f"Umschlag: {job['envelope']}\n\n{job['plan'] or '(kein Plan)'}")
+
+
+async def _secretary_simulate(args: dict, ctx: ToolContext) -> str:
+    """Dry-run the secretary decision for a fake inbound — shows the full chain
+    (window → plan → shadow) and sends NOTHING. The safe way to test time windows."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from .policy import Mode, Sensitivity
+    from . import secretary
+    channel = str(args.get("channel") or "waha")
+    triage = str(args.get("triage") or "defer")
+    tz = get_settings().astra_timezone
+    when = str(args.get("time") or "").strip()
+    try:
+        now = datetime.now(ZoneInfo(tz))
+        if when:
+            hh, mm = when.split(":", 1)
+            day = int(args.get("weekday", now.weekday()))
+            # nearest date with that weekday, at HH:MM
+            now = now.replace(hour=int(hh), minute=int(mm[:2]), second=0, microsecond=0)
+            now += __import__("datetime").timedelta(days=(day - now.weekday()) % 7)
+    except Exception:  # noqa: BLE001
+        now = datetime.now(ZoneInfo(tz))
+    appset = await _settings()
+    try:
+        mode = Mode(triage)
+    except ValueError:
+        mode = Mode.DEFER
+    win = secretary.active_window(appset, now)
+    plan = secretary.plan_for(
+        channel=channel, mode=mode, max_sensitivity=Sensitivity.FREEBUSY,
+        app_settings=appset, timezone=tz, now=now,
+        is_group=bool(args.get("is_group")),
+    )
+    shadow = secretary.shadow_enabled(appset, channel)
+    outcome = ("STILL (keine Antwort)" if plan.silent else
+               "SCHATTEN → an dich statt Kontakt" if (shadow and plan.mode == Mode.AUTO) else
+               {"auto": "AUTO (antwortet selbst)", "defer": "DEFER (wartet auf dich)",
+                "ask": "ASK (fragt dich)"}.get(plan.mode.value, plan.mode.value))
+    return (f"Simulation {channel} · {now:%a %H:%M} · Triage={mode.value}\n"
+            f"Fenster: {win.get('name') if win else '—'} ({win.get('behavior') if win else '—'})\n"
+            f"Plan: {plan.mode.value} · Grund: {plan.reason}\n"
+            f"Schattenmodus: {'an' if shadow else 'aus'}\n"
+            f"→ Ergebnis: {outcome}")
+
+
+async def _rules_list(args: dict, ctx: ToolContext) -> str:
+    principal = getattr(ctx, "principal", "") or ""
+    rules = await db.list_rules(principal_key=principal)
+    if not rules:
+        return "Keine Regeln angelegt."
+    rows = []
+    for r in rules:
+        state = "aktiv" if (r["enabled"] and r["confirmed_at"]) else \
+                ("wartet auf Freigabe" if not r["confirmed_at"] else "aus")
+        trig = r["trigger"] or {}
+        when = f"{trig.get('at','?')}" + (f" -{trig.get('offset_min')}min" if trig.get("offset_min") else "") \
+               if trig.get("type") == "schedule" else trig.get("type", "?")
+        last = f" · zuletzt: {r['last_result']}" if r["last_result"] else ""
+        rows.append(f"#{r['id']} „{r['name']}“ [{state}] ({when}){last}")
+    return "Regeln:\n" + "\n".join(rows)
+
+
+async def _rules_create(args: dict, ctx: ToolContext) -> str:
+    if not await _writes_allowed(ctx):
+        return "Regeln anlegen ist deaktiviert (allow_self_config)."
+    name = str(args.get("name") or "").strip()
+    trigger = args.get("trigger") or {}
+    actions = args.get("actions") or []
+    if isinstance(trigger, str):
+        try:
+            trigger = json.loads(trigger)
+        except json.JSONDecodeError:
+            return "trigger ist kein gültiges JSON-Objekt."
+    if isinstance(actions, str):
+        try:
+            actions = json.loads(actions)
+        except json.JSONDecodeError:
+            return "actions ist kein gültiges JSON-Array."
+    if not name or not isinstance(trigger, dict) or not isinstance(actions, list) or not actions:
+        return "Bitte name, trigger (Objekt) und actions (nicht-leere Liste) angeben."
+    condition = args.get("condition") or {"type": "always"}
+    principal = getattr(ctx, "principal", "") or ""
+    # Bahrian asking in his own chat IS the confirmation → active immediately.
+    # Anything else (a proposal outside the owner's chat) stays pending.
+    owner_here = bool(ctx.is_owner)
+    rule_id = await db.add_rule(
+        name=name, trigger=trigger, condition=condition, actions=actions,
+        plugin_slug=str(args.get("plugin_slug") or ""), principal_key=principal,
+        created_by=("owner" if owner_here else "astra"), confirmed=owner_here,
+    )
+    await db.audit("rule_created", actor="astra",
+                   detail={"id": rule_id, "name": name, "confirmed": owner_here})
+    if owner_here:
+        return f"Regel #{rule_id} „{name}“ angelegt und aktiv."
+    return f"Regel #{rule_id} „{name}“ angelegt — wartet auf deine Freigabe (astra_rule_confirm)."
+
+
+async def _rules_confirm(args: dict, ctx: ToolContext) -> str:
+    if not await _writes_allowed(ctx):
+        return "Deaktiviert (allow_self_config)."
+    rid = int(args.get("id") or 0)
+    ok = await db.confirm_rule(rid)
+    return f"Regel #{rid} freigegeben und aktiv." if ok else f"Regel #{rid} war nicht offen."
+
+
+async def _rules_delete(args: dict, ctx: ToolContext) -> str:
+    if not await _writes_allowed(ctx):
+        return "Deaktiviert (allow_self_config)."
+    rid = int(args.get("id") or 0)
+    n = await db.delete_rule(rid)
+    return f"Regel #{rid} gelöscht." if n else f"Regel #{rid} nicht gefunden."
+
+
+async def _rules_run_now(args: dict, ctx: ToolContext) -> str:
+    """Fire a rule immediately (test it), regardless of its schedule."""
+    if not await _writes_allowed(ctx):
+        return "Deaktiviert (allow_self_config)."
+    from . import rules as rules_engine
+    rule = await db.get_rule(int(args.get("id") or 0))
+    if not rule:
+        return "Regel nicht gefunden."
+    return f"Regel #{rule['id']} ausgeführt: {await rules_engine.fire_rule(rule)}"
+
+
 async def _secretary_email_set(args: dict, ctx: ToolContext) -> str:
     """Set/overwrite the Secretary email_accounts list in app_settings."""
     if not await _writes_allowed(ctx):
@@ -671,6 +937,16 @@ def register_admin_tools() -> None:
         ("astra_brain_add_person", "Lege eine neue Personen-Brain-Datei an (people/<slug>.md).",
          {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
          _brain_add_person),
+        ("astra_world_alias",
+         "Merke dir, wie Bahrian einen Raum oder ein Gerät nennt — z. B. 'mein Zimmer' für "
+         "'Schlafzimmer' oder 'unten' für 'Wohnzimmer'. Danach findet home_state/home_control "
+         "das Ziel auch unter diesem Wort. action=list|add|remove, target=echter Name, "
+         "alias=Bahrians Wort. Tippfehler und Umlaute musst du NICHT als Alias anlegen — "
+         "die verzeiht der Resolver von sich aus.",
+         {"type": "object", "properties": {
+             "action": {"type": "string", "enum": ["list", "add", "remove"]},
+             "target": {"type": "string"},
+             "alias": {"type": "string"}}}, _world_alias),
         ("astra_secretary_contacts_get",
          "Zeige alle Secretary-Kontaktregeln und die Standardaktion für unbekannte Sender.",
          {"type": "object", "properties": {}}, _secretary_contact_rules_get),
@@ -726,6 +1002,85 @@ def register_admin_tools() -> None:
                  "email": {"type": "string"},
                  "notes": {"type": "string"}}}}},
           "required": ["profiles"]}, _person_profiles_save),
+        ("astra_models_show",
+         "Zeige, welches Modell welcher Stufe zugeordnet ist (small/medium/heavy/code/osint) "
+         "und welche Anbieter konfiguriert sind.",
+         {"type": "object", "properties": {}}, _models_show),
+        ("astra_models_set",
+         "Ordne einer Stufe einen Anbieter + ein Modell zu. role=small(einfach)|medium(normal, "
+         "mit Tools)|heavy(schwer)|code(Programmieren, z. B. OpenAI Codex)|osint(Recherche). "
+         "provider=openai|anthropic|openrouter|ollama oder ein selbst angelegter. "
+         "Achtung: 'medium' braucht einen OpenAI-kompatiblen Anbieter, weil dort Tools laufen.",
+         {"type": "object", "properties": {
+             "role": {"type": "string", "enum": ["small", "medium", "heavy", "code", "osint"]},
+             "provider": {"type": "string"},
+             "model": {"type": "string"}},
+          "required": ["role", "provider", "model"]}, _models_set),
+        ("astra_models_add_provider",
+         "Registriere einen weiteren Anbieter. Jeder OpenAI-kompatible Endpoint funktioniert "
+         "(OpenRouter, Groq, DeepSeek, Together, LM Studio, vLLM, lokales Ollama): "
+         "kind=openai_compat + base_url + api_key. Für Claude: kind=anthropic.",
+         {"type": "object", "properties": {
+             "name": {"type": "string"},
+             "kind": {"type": "string", "enum": ["openai_compat", "anthropic"]},
+             "base_url": {"type": "string"},
+             "api_key": {"type": "string"},
+             "tools": {"type": "boolean"}},
+          "required": ["name"]}, _models_add_provider),
+        ("astra_delegate_job",
+         "Gib eine schwere HomeLab-/Analyse-Aufgabe an das große Modell (Claude) ab, statt sie "
+         "selbst zu lösen. goal=Ziel im Klartext, hosts=Liste erlaubter Hosts (Rechte-Umschlag!), "
+         "write=true nur wenn verändert werden darf, kind=ops|analyze|research. Das große Modell "
+         "plant; jeder Schritt wird gegen die Command-Policy geprüft — Allow-List läuft autonom, "
+         "alles andere braucht Bahrians Freigabe, Destruktives wird blockiert.",
+         {"type": "object", "properties": {
+             "goal": {"type": "string"},
+             "hosts": {"type": "array", "items": {"type": "string"}},
+             "write": {"type": "boolean"},
+             "kind": {"type": "string", "enum": ["ops", "analyze", "research"]},
+             "budget_steps": {"type": "integer"}},
+          "required": ["goal"]}, _delegate_job),
+        ("astra_jobs_list", "Liste die letzten delegierten Jobs mit Status.",
+         {"type": "object", "properties": {}}, _jobs_list),
+        ("astra_job_show", "Zeige Plan und Rechte-Umschlag eines Jobs. id = Jobnummer.",
+         {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]},
+         _job_show),
+        ("astra_secretary_simulate",
+         "Simuliere die Sekretär-Entscheidung für eine erfundene Nachricht — zeigt Fenster, "
+         "Plan (AUTO/DEFER/ASK/STILL) und Schattenmodus, SENDET NICHTS. Felder: channel"
+         "(waha|signal|slack|email), time('HH:MM', optional), weekday(0=Mo..6=So, optional), "
+         "triage(auto|defer|ask), is_group(bool).",
+         {"type": "object", "properties": {
+             "channel": {"type": "string"}, "time": {"type": "string"},
+             "weekday": {"type": "integer"}, "triage": {"type": "string"},
+             "is_group": {"type": "boolean"}}}, _secretary_simulate),
+        ("astra_rules_list", "Zeige alle Automatik-Regeln (Trigger → Aktionen) mit Status.",
+         {"type": "object", "properties": {}}, _rules_list),
+        ("astra_rule_create",
+         "Lege eine Automatik-Regel an: 'wenn Trigger (+ Bedingung), dann Aktionen'. "
+         "trigger z. B. {\"type\":\"schedule\",\"at\":\"21:50\",\"days\":[0,1,2,3,4]}. "
+         "condition optional, z. B. {\"type\":\"tool\",\"tool\":\"duolingo_status\","
+         "\"expect\":{\"path\":\"data.done\",\"equals\":false}}. actions ist eine Liste, z. B. "
+         "[{\"type\":\"speak\",\"text\":\"Duolingo nicht vergessen\",\"where\":\"Schlafzimmer\"},"
+         "{\"type\":\"notify\",\"text\":\"Duolingo offen\"},{\"type\":\"tool\","
+         "\"tool\":\"add_google_task\",\"args\":{\"title\":\"Duolingo\"}}]. Wenn Bahrian dich im "
+         "Chat darum bittet, ist die Regel sofort aktiv.",
+         {"type": "object", "properties": {
+             "name": {"type": "string"},
+             "trigger": {"type": "object"},
+             "condition": {"type": "object"},
+             "actions": {"type": "array", "items": {"type": "object"}},
+             "plugin_slug": {"type": "string"}},
+          "required": ["name", "trigger", "actions"]}, _rules_create),
+        ("astra_rule_confirm", "Gib eine wartende Regel frei (macht sie aktiv). id = Regelnummer.",
+         {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]},
+         _rules_confirm),
+        ("astra_rule_delete", "Lösche eine Regel. id = Regelnummer.",
+         {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]},
+         _rules_delete),
+        ("astra_rule_run_now", "Führe eine Regel sofort testweise aus (ignoriert den Zeitplan).",
+         {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]},
+         _rules_run_now),
         ("astra_list_capabilities", "Liste verfügbare Agentenfähigkeiten mit Safety/Intent.",
          {"type": "object", "properties": {"query": {"type": "string"}}}, _list_capabilities),
         ("astra_explain_capability", "Erkläre eine Integration oder ein Tool aus dem Capability-Manifest.",
@@ -742,7 +1097,9 @@ def register_admin_tools() -> None:
             "astra_configure_integration", "astra_update_settings", "astra_test_capability",
             "astra_create_plugin_module", "astra_brain_write", "astra_brain_append",
             "astra_brain_add_person", "astra_secretary_email_set", "astra_secretary_contacts_set",
-            "astra_person_profiles_save",
+            "astra_person_profiles_save", "astra_world_alias",
+            "astra_rule_create", "astra_rule_confirm", "astra_rule_delete", "astra_rule_run_now",
+            "astra_delegate_job", "astra_models_set", "astra_models_add_provider",
         } else "private_read"
         intents = ["status", "list"] if "list" in name or "status" in name else ["control"] if safety == "mutation" else ["status"]
         register(Tool(name=name, description=desc, parameters=params, handler=handler,

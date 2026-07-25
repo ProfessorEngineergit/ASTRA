@@ -16,6 +16,7 @@ from enum import Enum
 class Register(str, Enum):
     OWNER = "owner"
     THIRD = "third"
+    VOICE = "voice"   # owner via a smart speaker — spoken, so 1–2 sentences, no markup
 
 
 # Shared knowledge about who Bahrian is (migrated from v1).
@@ -61,10 +62,22 @@ REGISTER: Du sprichst mit jemandem, der {owner} geschrieben hat (NICHT {owner} s
 """
 
 
+_VOICE = """\
+REGISTER: Du sprichst mit {owner} über einen Lautsprecher — deine Antwort wird VORGELESEN.
+- Antworte in 1–2 kurzen, gesprochenen Sätzen. Kein Markdown, keine Listen, keine Emojis,
+  keine Aufzählungen, keine URLs. So, wie man es laut sagen würde.
+- Komm sofort zum Punkt. Wenn etwas mehrdeutig ist, stell EINE kurze Rückfrage.
+- Du darfst wie im Owner-Register alles wissen und Tools nutzen.
+{profile}
+"""
+
+
 def system_prompt(register: Register, *, owner: str, now: str, tz: str) -> str:
     base = _BASE.format(owner=owner, now=now, tz=tz)
     if register == Register.OWNER:
         return base + "\n" + _OWNER.format(owner=owner, profile=OWNER_PROFILE)
+    if register == Register.VOICE:
+        return base + "\n" + _VOICE.format(owner=owner, profile=OWNER_PROFILE)
     return base + "\n" + _THIRD.format(owner=owner)
 
 

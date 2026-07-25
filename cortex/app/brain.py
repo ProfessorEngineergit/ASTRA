@@ -23,7 +23,7 @@ from .persona import TRIAGE_INSTRUCTIONS, Register
 from .policy import Mode, Sensitivity, TrustTier, reconcile
 from .secretary import (
     CHANNEL_LABELS, SECRETARY_CHANNELS, contact_rule_for, is_group_context,
-    plan_for, tone_instruction, unknown_sender_action, with_secretary_header,
+    plan_for, shadow_enabled, tone_instruction, unknown_sender_action, with_secretary_header,
 )
 from .security import check_inbound, check_outbound
 from .state import Act, Signal, ThreadState, next_state
@@ -431,6 +431,13 @@ async def handle_inbound(
         timezone=s.astra_timezone,
         is_group=bool((thread.get("meta") or {}).get("is_group")),
     )
+    # A 'silent' window (e.g. night quiet) → don't respond at all, just log.
+    if secretary_plan.silent:
+        await db.audit("secretary_silent", channel=channel, thread_id=thread_id,
+                       contact_id=contact["id"], detail={"reason": secretary_plan.reason})
+        log.info("Secretary silent window on %s — not responding.", thread_id)
+        return
+
     mode = secretary_plan.mode
     auto = get_autonomy()
     if auto == "full" and mode in (Mode.DEFER, Mode.ASK):
@@ -452,6 +459,11 @@ async def handle_inbound(
                 handle=sender_handle,
             ),
         )
+        # Shadow mode: send the draft to Bahrian for review instead of the contact.
+        if shadow_enabled(appset, channel):
+            await _shadow_to_owner(channel, thread_id, contact, text, reply)
+            await db.set_thread_state(thread_id, ThreadState.ANSWERED.value)
+            return
         await _send_and_record(
             channel, sender_handle, thread_id, reply, contact,
             max_sensitivity=decision.max_sensitivity.value,
@@ -507,6 +519,23 @@ async def _ask_owner(channel: str, peer: str, thread_id: str, contact: dict, tex
             "Einen Moment — ich halte kurz Rücksprache mit Bahrian und melde mich gleich.",
             contact,
             max_sensitivity="none",
+        )
+
+
+async def _shadow_to_owner(channel: str, thread_id: str, contact: dict, incoming: str, draft: str) -> None:
+    """Shadow mode: show Bahrian the reply ASTRA WOULD send, without sending it."""
+    s = get_settings()
+    await db.add_message(thread_id, "assistant", f"[SCHATTEN, nicht gesendet] {draft}")
+    await db.audit("secretary_shadow", channel=channel, thread_id=thread_id,
+                   contact_id=contact.get("id"), detail={"preview": draft[:200]})
+    if s.telegram_enabled and s.telegram_owner_chat_id:
+        name = contact.get("display_name") or contact.get("handle") or "Unbekannt"
+        label = CHANNEL_LABELS.get(channel, channel)
+        await get_channels().send_telegram(
+            s.telegram_owner_chat_id,
+            f"🕶️ Schattenmodus ({label}) — {name} schrieb:\n„{incoming[:400]}“\n\n"
+            f"ASTRA würde antworten:\n„{draft}“\n\n(Nicht gesendet. Zum Scharfschalten "
+            f"Schattenmodus im Secretary aus.)",
         )
 
 
@@ -591,6 +620,34 @@ async def resume_after_approval(approval: dict, decision: str) -> None:
     await db.set_thread_state(thread_id, ThreadState.ANSWERED.value)
     await db.audit("resume", channel=thread["channel"], thread_id=thread_id,
                    contact_id=thread.get("contact_id"), detail={"decision": decision})
+
+
+# ─── ops command confirmation (HomeLab execution, gated on Telegram) ───────────
+async def resume_ops_exec(approval: dict, decision: str) -> None:
+    """Owner decided on a command that needed approval. 'yes' → run it now."""
+    s = get_settings()
+    payload = approval.get("payload") or {}
+    host, command = payload.get("host", ""), payload.get("command", "")
+
+    async def tell(text: str) -> None:
+        if s.telegram_enabled and s.telegram_owner_chat_id:
+            await get_channels().send_telegram(s.telegram_owner_chat_id, text)
+
+    if decision != "yes":
+        await db.audit("ops_cancelled", detail={"host": host, "command": command})
+        await tell(f"Abgebrochen — auf {host} wurde nichts ausgeführt.")
+        return
+
+    from .plugins.registry import get_manager
+    plugin = get_manager().get(payload.get("plugin") or "ops_exec")
+    if not plugin or not plugin.enabled:
+        await tell("Die HomeLab-Ausführung ist nicht mehr aktiv — nichts ausgeführt.")
+        return
+    result = await plugin.run(host, command)
+    await db.audit("ops_exec", detail={"host": host, "command": command,
+                                       "ok": result["ok"], "via": "approval"})
+    head = "✅" if result["ok"] else "⚠️"
+    await tell(f"{head} {host}$ {command}\n\n{result['output'][:1500]}")
 
 
 # ─── outbound send confirmation (owner-initiated, gated on Telegram) ────────────
