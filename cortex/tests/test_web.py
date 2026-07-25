@@ -506,3 +506,25 @@ def test_secretary_saves_multiple_email_accounts(memdb, monkeypatch):
     assert "imap.example.org" in r.text
     # second saved account + one fresh blank block => index 2 fields rendered
     assert "sec_email_2_imap_host" in r.text
+
+
+def test_osint_tab_renders_and_run_endpoint_gates_tool(memdb):
+    _prime_manager()
+    c = TestClient(_app())
+    c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+
+    r = c.get("/admin/osint")
+    assert r.status_code == 200
+    assert "Recon" in r.text and "Netz-Audit" in r.text
+    # Plugin ist im Test aus → Hinweis-Banner statt Scan-Funktion
+    assert "noch nicht aktiv" in r.text
+
+    # Der Run-Endpoint lässt nur registrierte osint_-Tools zu. Ein Nicht-OSINT-Tool
+    # wird abgelehnt; ein osint_-Tool bei ausgeschaltetem Plugin ebenfalls (nicht
+    # registriert) — genau das ist die Absicht, kein Tool leckt durch.
+    assert c.post("/admin/osint/run", data={"tool": "home_assistant_call"}).status_code == 400
+    assert c.post("/admin/osint/run", data={"tool": "ops_exec"}).status_code == 400
+    assert c.post("/admin/osint/run", data={"tool": "osint_exit_ip"}).status_code == 400

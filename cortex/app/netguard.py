@@ -79,3 +79,46 @@ def assert_public(url: str, *, resolve: bool = True) -> str:
     if not ok:
         raise ValueError(f"Ziel abgelehnt: {reason}")
     return url
+
+
+# ─── Aktives Scannen: nur auf ausdrücklich autorisierten Netzen ───────────────
+# Passives Lesen öffentlicher Daten (oben) und AKTIVES Scannen sind zwei Paar
+# Schuhe. Ein Portscan berührt ein Gerät. Deshalb darf er ausschließlich auf
+# Netze zeigen, die Bahrian selbst als seine eigenen/freigegebenen einträgt —
+# nie auf öffentliche Adressen und nie auf etwas außerhalb der Liste. Das ist
+# die Grenze, die verhindert, dass „Recon" je einen Fremden trifft.
+def _networks(allowed_cidrs: list[str]) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    nets = []
+    for cidr in allowed_cidrs or []:
+        try:
+            nets.append(ipaddress.ip_network(cidr.strip(), strict=False))
+        except ValueError:
+            continue
+    return nets
+
+
+def scan_target_ok(target: str, allowed_cidrs: list[str]) -> tuple[bool, str]:
+    """(erlaubt, Grund) für ein Scan-Ziel (Host oder CIDR).
+
+    Erlaubt NUR, wenn das Ziel vollständig in einem der freigegebenen Netze liegt.
+    Öffentliche Adressen sind selbst dann tabu, wenn jemand sie einträgt — Scannen
+    im offenen Internet ist keine autorisierte Demo."""
+    raw = (target or "").strip()
+    if not raw:
+        return False, "leeres Ziel"
+    allowed = _networks(allowed_cidrs)
+    if not allowed:
+        return False, "keine Netze freigegeben (Feld 'scan_networks' leer)"
+    try:
+        target_net = ipaddress.ip_network(raw, strict=False)
+    except ValueError:
+        return False, f"'{raw}' ist keine IP/kein CIDR"
+    # Öffentliche Ziele grundsätzlich ablehnen, egal was in der Liste steht.
+    hosts_public = any(_is_public_ip(ip) for ip in
+                       (target_net.network_address, target_net.broadcast_address))
+    if hosts_public:
+        return False, f"'{raw}' ist öffentlich — aktives Scannen nur im eigenen Netz"
+    for net in allowed:
+        if target_net.version == net.version and target_net.subnet_of(net):
+            return True, f"innerhalb des freigegebenen Netzes {net}"
+    return False, f"'{raw}' liegt außerhalb der freigegebenen Netze"

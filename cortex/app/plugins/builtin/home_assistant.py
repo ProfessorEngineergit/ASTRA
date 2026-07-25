@@ -298,6 +298,29 @@ class HomeAssistantPlugin(Plugin):
         state = str((st or {}).get("state") or "unknown")
         return {"state": state, "at_home": state == "home", "entity_id": entity_id}
 
+    async def location(self, entity_id: str = "") -> dict[str, Any]:
+        """Live phone coordinates from a person/device_tracker (Companion App).
+
+        This is the 'wo bin ich' source for 'in der Nähe' over Telegram — Bahrian's
+        own phone reporting to his own HA, no browser prompt needed."""
+        entity_id = entity_id or str(self.get("person_entity") or "")
+        if not entity_id:
+            return {"ok": False, "reason": "keine person_entity konfiguriert"}
+        st = await self.get_state(entity_id)
+        attrs = (st or {}).get("attributes") or {}
+        lat, lon = attrs.get("latitude"), attrs.get("longitude")
+        # A person entity often points at its active device_tracker for coordinates.
+        if lat is None and (src := attrs.get("source")):
+            st2 = await self.get_state(src)
+            attrs = (st2 or {}).get("attributes") or {}
+            lat, lon = attrs.get("latitude"), attrs.get("longitude")
+        if lat is None or lon is None:
+            return {"ok": False, "reason": "keine Koordinaten im Tracker",
+                    "state": (st or {}).get("state")}
+        return {"ok": True, "lat": float(lat), "lon": float(lon),
+                "accuracy": attrs.get("gps_accuracy"),
+                "zone": (st or {}).get("state")}
+
     async def health_check(self) -> HealthStatus:
         base = await super().health_check()
         if base.state.value != "ok":

@@ -55,8 +55,38 @@ class OsintPlugin(Plugin):
                     help="Kostenlos auf windy.com — für öffentliche Webcams"),
         ConfigField("browser_url", "Browser-Container", required=False,
                     default="http://browser:3000", env_fallback="browser_ws_url"),
+        # Recon (Selbst-Audit / autorisierte Netze). Aktives Scannen NUR auf den
+        # hier eingetragenen eigenen/freigegebenen Netzen — die Prüfung erzwingt es.
+        ConfigField("scan_networks", "Freigegebene Scan-Netze (CIDR)", required=False,
+                    help="Kommagetrennt, NUR eigene/autorisierte, z. B. 192.168.178.0/24"),
+        ConfigField("shodan_key", "Shodan API-Key", FieldType.PASSWORD, required=False,
+                    secret=True, help="Für Selbst-Exposition (öffentliche Daten über deine IP)"),
+        ConfigField("hibp_key", "HaveIBeenPwned API-Key", FieldType.PASSWORD, required=False,
+                    secret=True, help="Für Breach-Check deiner eigenen Mailadressen"),
         ConfigField("timeout", "Timeout (Sekunden)", FieldType.NUMBER, default=45),
     ]
+
+    # Häufige „interessante" Ports für den Netz-Audit (Drucker, Kamera, Web, SSH …).
+    _AUDIT_PORTS: dict[int, str] = {
+        21: "FTP", 22: "SSH", 23: "Telnet", 80: "HTTP", 443: "HTTPS",
+        445: "SMB", 554: "RTSP/Kamera", 631: "IPP/Drucker", 1883: "MQTT",
+        3389: "RDP", 5000: "UPnP", 8080: "HTTP-alt", 8123: "Home Assistant",
+        9000: "div.", 9100: "JetDirect/Drucker", 32400: "Plex",
+    }
+
+    def scan_networks(self) -> list[str]:
+        return [c.strip() for c in str(self.get("scan_networks") or "").split(",") if c.strip()]
+
+    async def _here(self) -> dict:
+        """Aktueller Standort für 'in der Nähe' — vom Handy über die HA-Companion-App."""
+        try:
+            from ..registry import get_manager
+            ha = get_manager().get("home_assistant")
+            if ha and ha.enabled:
+                return await ha.location()
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": False, "reason": "kein Home-Assistant-Standort verfügbar"}
 
     def _proxy(self) -> str | None:
         return str(self.get("tor_proxy") or "").strip() or None
@@ -107,7 +137,206 @@ class OsintPlugin(Plugin):
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "text": "", "reason": str(e)}
 
+    # ── Autorisierter Netz-Audit (nur eigene/freigegebene Netze) ─────────────
+    async def _probe(self, host: str, port: int, timeout: float) -> bool:
+        """Ein einzelner TCP-Connect. Kein Payload, kein Exploit — nur 'offen?'."""
+        try:
+            fut = asyncio.open_connection(host, port)
+            reader, writer = await asyncio.wait_for(fut, timeout=timeout)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def scan(self, target: str, *, ports: list[int] | None = None,
+                   max_hosts: int = 64) -> dict:
+        """TCP-Connect-Audit eines freigegebenen Netzes. Prüft die Autorisierung."""
+        import ipaddress
+        ok, reason = netguard.scan_target_ok(target, self.scan_networks())
+        if not ok:
+            return {"ok": False, "reason": reason}
+        ports = ports or list(self._AUDIT_PORTS)
+        try:
+            net = ipaddress.ip_network(target.strip(), strict=False)
+            hosts = [str(net.network_address)] if net.num_addresses == 1 \
+                else [str(h) for h in net.hosts()]
+        except ValueError:
+            return {"ok": False, "reason": "ungültiges Ziel"}
+        if len(hosts) > max_hosts:
+            return {"ok": False, "reason": f"Netz zu groß ({len(hosts)} Hosts > {max_hosts}). "
+                                           "Nimm ein kleineres CIDR."}
+        timeout = min(2.0, float(self.get("timeout") or 45) / 10)
+        sem = asyncio.Semaphore(200)
+
+        async def probe_one(host: str, port: int):
+            async with sem:
+                return host, port, await self._probe(host, port, timeout)
+
+        results = await asyncio.gather(*(probe_one(h, p) for h in hosts for p in ports))
+        found: dict[str, list[dict]] = {}
+        for host, port, is_open in results:
+            if is_open:
+                found.setdefault(host, []).append(
+                    {"port": port, "service": self._AUDIT_PORTS.get(port, "?")})
+        return {"ok": True, "hosts_scanned": len(hosts), "ports": len(ports),
+                "found": found}
+
     def tools(self) -> list[Tool]:
+        async def _net_scan(args: dict, ctx: ToolContext) -> str:
+            if not self.enabled:
+                return tool_result(ok=False, source=self.slug, summary="OSINT ist deaktiviert.")
+            target = str(args.get("target") or "").strip()
+            nets = self.scan_networks()
+            if not nets:
+                return tool_result(
+                    ok=False, source=self.slug,
+                    summary="Kein Netz freigegeben. Trage im Feld 'scan_networks' NUR deine "
+                            "eigenen/autorisierten Netze ein (z. B. 192.168.178.0/24). Aktives "
+                            "Scannen fremder Netze mache ich nicht.")
+            if not target:
+                target = nets[0]
+            res = await self.scan(target)
+            if not res["ok"]:
+                return tool_result(ok=False, source=self.slug,
+                                   summary=f"Nicht gescannt: {res['reason']}")
+            found = res["found"]
+            if not found:
+                return tool_result(ok=True, source=self.slug,
+                                   summary=f"{res['hosts_scanned']} Hosts geprüft — keine "
+                                           "offenen Ports aus der Audit-Liste.")
+            lines = []
+            for host, ports in sorted(found.items()):
+                pl = ", ".join(f"{p['port']}({p['service']})" for p in ports)
+                lines.append(f"• {host}: {pl}")
+            return tool_result(
+                ok=True, source=self.slug,
+                summary=f"Netz-Audit {target} — offene Ports auf {len(found)} Gerät(en):\n"
+                        + "\n".join(lines),
+                data={"target": target, "found": found})
+
+        async def _self_exposure(args: dict, ctx: ToolContext) -> str:
+            """Shodan-Blick auf die EIGENE (oder eine angegebene) öffentliche IP — liest
+            nur bereits veröffentlichte Daten, scannt nichts."""
+            if not self.enabled:
+                return tool_result(ok=False, source=self.slug, summary="OSINT ist deaktiviert.")
+            key = str(self.get("shodan_key") or "").strip()
+            if not key:
+                return tool_result(ok=False, source=self.slug,
+                                   summary="Kein Shodan-Key hinterlegt.")
+            ip = str(args.get("ip") or "").strip()
+            try:
+                async with self._client() as c:
+                    if not ip:
+                        rr = await c.get("https://api.ipify.org", params={"format": "json"})
+                        ip = rr.json().get("ip", "")
+                    r = await c.get(f"https://api.shodan.io/shodan/host/{ip}",
+                                    params={"key": key})
+                    if r.status_code == 404:
+                        return tool_result(ok=True, source=self.slug,
+                                           summary=f"{ip}: Shodan kennt keine offenen Dienste "
+                                                   "(gut — nichts öffentlich indexiert).")
+                    r.raise_for_status()
+                    data = r.json()
+            except Exception as e:  # noqa: BLE001
+                return tool_result(ok=False, source=self.slug,
+                                   summary=f"Shodan-Abfrage fehlgeschlagen: {e}")
+            ports = data.get("ports") or []
+            return tool_result(
+                ok=True, source=self.slug,
+                summary=f"Exposition {ip}: {len(ports)} Port(s) öffentlich sichtbar: "
+                        f"{', '.join(str(p) for p in ports) or '—'}. "
+                        f"Org: {data.get('org', '?')}",
+                data={"ip": ip, "ports": ports, "hostnames": data.get("hostnames")})
+
+        async def _breach_check(args: dict, ctx: ToolContext) -> str:
+            if not self.enabled:
+                return tool_result(ok=False, source=self.slug, summary="OSINT ist deaktiviert.")
+            key = str(self.get("hibp_key") or "").strip()
+            account = str(args.get("email") or "").strip()
+            if not key:
+                return tool_result(ok=False, source=self.slug, summary="Kein HIBP-Key hinterlegt.")
+            if not account:
+                return tool_result(ok=False, source=self.slug, summary="Keine Mailadresse angegeben.")
+            try:
+                async with self._client() as c:
+                    r = await c.get(
+                        f"https://haveibeenpwned.com/api/v3/breachedaccount/{account}",
+                        headers={"hibp-api-key": key, "user-agent": "ASTRA"})
+                    if r.status_code == 404:
+                        return tool_result(ok=True, source=self.slug,
+                                           summary=f"{account}: in keinem bekannten Leak. 👍")
+                    r.raise_for_status()
+                    breaches = [b.get("Name") for b in r.json()]
+            except Exception as e:  # noqa: BLE001
+                return tool_result(ok=False, source=self.slug, summary=f"HIBP fehlgeschlagen: {e}")
+            return tool_result(ok=True, source=self.slug,
+                               summary=f"{account} in {len(breaches)} Leak(s): {', '.join(breaches)}",
+                               data={"breaches": breaches})
+
+        async def _dns_intel(args: dict, ctx: ToolContext) -> str:
+            """DNS + Cert-Transparency (crt.sh) zu einer Domain — öffentliche Register."""
+            if not self.enabled:
+                return tool_result(ok=False, source=self.slug, summary="OSINT ist deaktiviert.")
+            domain = str(args.get("domain") or "").strip().lower()
+            if not domain or "." not in domain:
+                return tool_result(ok=False, source=self.slug, summary="Gültige Domain angeben.")
+            import socket as _socket
+            out: dict[str, Any] = {"domain": domain}
+            try:
+                out["a"] = sorted({info[4][0]
+                                   for info in _socket.getaddrinfo(domain, None)})
+            except OSError as e:
+                out["a"] = []
+                out["dns_error"] = str(e)
+            try:
+                async with self._client() as c:
+                    r = await c.get("https://crt.sh/", params={"q": domain, "output": "json"})
+                    if r.status_code == 200:
+                        subs = sorted({row.get("common_name", "") for row in r.json()})
+                        out["subdomains"] = [s for s in subs if s][:40]
+            except Exception:  # noqa: BLE001
+                out["subdomains"] = []
+            return tool_result(
+                ok=True, source=self.slug,
+                summary=f"{domain}: {', '.join(out.get('a') or []) or 'keine A-Records'} · "
+                        f"{len(out.get('subdomains') or [])} Subdomains (crt.sh)",
+                data=out)
+
+        async def _image_exif(args: dict, ctx: ToolContext) -> str:
+            """EXIF/Geodaten aus einem lokal hochgeladenen Bild (Uploads-Ordner)."""
+            if not self.enabled:
+                return tool_result(ok=False, source=self.slug, summary="OSINT ist deaktiviert.")
+            try:
+                from PIL import Image, ExifTags  # type: ignore
+            except Exception:  # noqa: BLE001
+                return tool_result(ok=False, source=self.slug,
+                                   summary="Bild-Forensik braucht Pillow (Extra 'research').")
+            from pathlib import Path
+            name = str(args.get("file") or "").strip()
+            path = Path(get_settings().brain_data_dir) / "uploads" / Path(name).name
+            if not name or not path.exists():
+                return tool_result(ok=False, source=self.slug,
+                                   summary="Bild nicht gefunden (erst im Chat hochladen).")
+            try:
+                img = Image.open(path)
+                raw = img._getexif() or {}
+                exif = {ExifTags.TAGS.get(k, k): v for k, v in raw.items()}
+            except Exception as e:  # noqa: BLE001
+                return tool_result(ok=False, source=self.slug, summary=f"EXIF-Fehler: {e}")
+            gps = exif.get("GPSInfo")
+            interesting = {k: str(exif.get(k)) for k in
+                           ("Make", "Model", "DateTimeOriginal", "Software") if exif.get(k)}
+            return tool_result(
+                ok=True, source=self.slug,
+                summary=(f"{name}: {interesting.get('Make', '')} {interesting.get('Model', '')} · "
+                         f"{interesting.get('DateTimeOriginal', 'kein Datum')}"
+                         + (" · GPS enthalten!" if gps else " · kein GPS")),
+                data={"exif": interesting, "has_gps": bool(gps)})
+
         async def _search(args: dict, ctx: ToolContext) -> str:
             if not self.enabled:
                 return tool_result(ok=False, source=self.slug, summary="OSINT ist deaktiviert.")
@@ -168,9 +397,15 @@ class OsintPlugin(Plugin):
                     summary="Kein Windy-API-Key hinterlegt — ohne den kann ich keine "
                             "öffentlichen Webcams abfragen.")
             where = str(args.get("where") or "").strip()
+            lat, lon = args.get("lat"), args.get("lon")
+            # "in der Nähe" ohne Koordinaten → Standort vom Handy über HA holen.
+            if lat is None and not where:
+                loc = await self._here()
+                if loc.get("ok"):
+                    lat, lon = loc["lat"], loc["lon"]
             params: dict[str, Any] = {"limit": 8, "include": "location,urls,player"}
-            if lat := args.get("lat"):
-                params["nearby"] = f"{lat},{args.get('lon')},{args.get('radius', 50)}"
+            if lat is not None:
+                params["nearby"] = f"{lat},{lon},{args.get('radius', 50)}"
             try:
                 async with self._client() as c:
                     r = await c.get(_WINDY_WEBCAMS, params=params,
@@ -229,4 +464,43 @@ class OsintPlugin(Plugin):
                  parameters={"type": "object", "properties": {}},
                  handler=_exit_ip, owner_only=True, source=self.slug,
                  safety="private_read", intents=["status"]),
+            Tool(name="osint_net_scan",
+                 description=(
+                     "Netz-Audit: findet offene Ports (Drucker 9100/631, Kamera 554, SSH, "
+                     "Web …) — NUR auf deinen eigenen/freigegebenen Netzen aus 'scan_networks'. "
+                     "Fremde Netze lehnt die Prüfung ab. target=CIDR oder Host, leer=erstes "
+                     "freigegebenes Netz."
+                 ),
+                 parameters={"type": "object", "properties": {"target": {"type": "string"}}},
+                 handler=_net_scan, owner_only=True, source=self.slug,
+                 safety="external_send", intents=["research"],
+                 examples=["welche geräte in meinem netz haben offene ports"]),
+            Tool(name="osint_self_exposure",
+                 description="Zeigt, was von DIR im Internet sichtbar ist (Shodan über deine "
+                             "öffentliche IP) — liest nur veröffentlichte Daten, scannt nichts.",
+                 parameters={"type": "object", "properties": {
+                     "ip": {"type": "string", "description": "optional, sonst eigene IP"}}},
+                 handler=_self_exposure, owner_only=True, source=self.slug,
+                 safety="external_send", intents=["research", "status"]),
+            Tool(name="osint_breach_check",
+                 description="Prüft, ob eine (deiner) Mailadresse in bekannten Daten-Leaks "
+                             "auftaucht (HaveIBeenPwned).",
+                 parameters={"type": "object", "properties": {"email": {"type": "string"}},
+                             "required": ["email"]},
+                 handler=_breach_check, owner_only=True, source=self.slug,
+                 safety="external_send", intents=["research"]),
+            Tool(name="osint_dns",
+                 description="DNS-Records + Subdomains (Cert-Transparency/crt.sh) zu einer "
+                             "Domain — öffentliche Register.",
+                 parameters={"type": "object", "properties": {"domain": {"type": "string"}},
+                             "required": ["domain"]},
+                 handler=_dns_intel, owner_only=True, source=self.slug,
+                 safety="external_send", intents=["research"]),
+            Tool(name="osint_image_exif",
+                 description="EXIF-/Geodaten aus einem hochgeladenen Bild lesen (Kamera, "
+                             "Zeitstempel, ggf. GPS).",
+                 parameters={"type": "object", "properties": {"file": {"type": "string"}},
+                             "required": ["file"]},
+                 handler=_image_exif, owner_only=True, source=self.slug,
+                 safety="private_read", intents=["research"]),
         ]

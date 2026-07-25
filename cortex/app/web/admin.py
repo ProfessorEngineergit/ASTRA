@@ -4951,3 +4951,127 @@ async def brain_add_person(request: Request, _: bool = Depends(auth.require_admi
     if rel:
         await db.audit("brain_add_person", actor="owner", detail={"file": rel})
     return RedirectResponse("/admin/brain?saved=1", status_code=303)
+
+
+# ─── OSINT / Recon tab ─────────────────────────────────────────────────────────
+# The frontend for the (owner-only, off-by-default) osint plugin. Actively scans
+# ONLY the networks Bahrian authorizes in the plugin config; every card runs a
+# gated tool. Location for "in der Nähe" comes from HA (phone) or the browser.
+_OSINT_CARDS = [
+    ("osint_net_scan", "Netz-Audit", "Offene Ports auf deinem freigegebenen Netz "
+     "(Drucker, Kamera, SSH …). Nur autorisierte Netze.", "target", "CIDR/Host, leer = 1. Netz"),
+    ("osint_self_exposure", "Meine Exposition", "Was von dir im Internet sichtbar ist "
+     "(Shodan über deine IP).", "ip", "IP (leer = eigene)"),
+    ("osint_breach_check", "Breach-Check", "Taucht eine Mailadresse in Daten-Leaks auf?",
+     "email", "deine@mail.de"),
+    ("osint_dns", "DNS & Subdomains", "A-Records + Cert-Transparency (crt.sh) einer Domain.",
+     "domain", "example.com"),
+    ("osint_webcams", "Öffentliche Webcams", "Frei zugängliche Kameras in der Nähe "
+     "(Windy). Standort via HA/Browser.", "where", "Ort (leer = hier)"),
+    ("osint_search", "Recherche (Tor)", "Offene Quellen über Tor durchsuchen.",
+     "query", "Suchbegriff"),
+    ("osint_image_exif", "Bild-EXIF", "Kamera/Zeit/GPS aus einem hochgeladenen Bild.",
+     "file", "Dateiname aus dem Chat-Upload"),
+    ("osint_exit_ip", "Tor-Status", "Läuft die Recherche wirklich über Tor?", "", ""),
+]
+
+
+def _osint_card(tool: str, title: str, desc: str, field: str, placeholder: str) -> str:
+    from ..web.templates import esc
+    input_html = (f'<input name="value" placeholder="{esc(placeholder)}" '
+                  f'style="flex:1;min-width:0">' if field else "")
+    latlon = ('<input type="hidden" name="lat" class="osint-lat">'
+              '<input type="hidden" name="lon" class="osint-lon">'
+              if tool == "osint_webcams" else "")
+    return f"""
+<div class="card osint-card" data-tool="{tool}">
+  <div style="font-weight:600">{esc(title)}</div>
+  <div class="note" style="font-size:12px;margin:4px 0 8px">{esc(desc)}</div>
+  <form class="osint-form" data-tool="{tool}" style="display:flex;gap:6px">
+    {input_html}{latlon}
+    <button class="btn sm" type="submit">Los</button>
+  </form>
+  <pre class="osint-out" style="white-space:pre-wrap;font-size:12px;margin-top:8px;
+       max-height:220px;overflow:auto;opacity:.85"></pre>
+</div>"""
+
+
+@router.get("/admin/osint", response_class=HTMLResponse)
+async def osint_page(request: Request, _: bool = Depends(auth.require_admin)):
+    from ..plugins.registry import get_manager
+    plugin = get_manager().get("osint")
+    enabled = bool(plugin and plugin.enabled)
+    banner = ("" if enabled else
+              '<div class="card" style="border-color:#c94">Das OSINT-Plugin ist noch nicht '
+              'aktiv. Richte es unter <a href="/admin/plugin/osint">Plugins → OSINT</a> ein '
+              '(Tor-Proxy, und für den Netz-Audit deine eigenen Netze unter „scan_networks“).</div>')
+    nets = ", ".join(plugin.scan_networks()) if enabled else ""
+    cards = "".join(_osint_card(*c) for c in _OSINT_CARDS)
+    body = f"""
+<section class="hero"><h1>Recon &amp; OSINT</h1>
+<p class="note">Nur offene Quellen und <b>deine eigenen/autorisierten</b> Netze. Aktives
+Scannen ist auf die in den Plugin-Einstellungen freigegebenen Netze begrenzt
+({esc(nets) or 'noch keine'}). Ausgang über Tor.</p>
+<div id="osint-loc" class="note" style="font-size:12px">Standort: unbekannt
+ · <a href="#" id="osint-locate">Browser-Standort freigeben</a></div>
+</section>
+{banner}
+<div class="grid" style="display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(280px,1fr))">
+{cards}
+</div>
+<script>
+const locBadge = document.getElementById('osint-loc');
+let here = {{lat:null, lon:null}};
+document.getElementById('osint-locate').onclick = (e) => {{
+  e.preventDefault();
+  navigator.geolocation.getCurrentPosition(p => {{
+    here = {{lat:p.coords.latitude, lon:p.coords.longitude}};
+    locBadge.innerHTML = 'Standort (Browser): ' + here.lat.toFixed(4) + ', ' + here.lon.toFixed(4);
+    document.querySelectorAll('.osint-lat').forEach(i => i.value = here.lat);
+    document.querySelectorAll('.osint-lon').forEach(i => i.value = here.lon);
+  }}, () => locBadge.textContent = 'Standort: Freigabe verweigert (HA-Standort wird genutzt)');
+}};
+document.querySelectorAll('.osint-form').forEach(f => {{
+  f.addEventListener('submit', async (e) => {{
+    e.preventDefault();
+    const out = f.parentElement.querySelector('.osint-out');
+    out.textContent = '… läuft (über Tor, kann dauern) …';
+    const fd = new FormData(f); fd.append('tool', f.dataset.tool);
+    try {{
+      const r = await fetch('/admin/osint/run', {{method:'POST', body:fd}});
+      const j = await r.json();
+      out.textContent = j.summary || j.error || '(keine Ausgabe)';
+    }} catch (err) {{ out.textContent = 'Fehler: ' + err; }}
+  }});
+}});
+</script>"""
+    return HTMLResponse(page("Recon", body, active="osint"))
+
+
+@router.post("/admin/osint/run")
+async def osint_run(request: Request, _: bool = Depends(auth.require_admin)):
+    from ..tools import ToolContext, dispatch, REGISTRY, result_summary
+    form = await request.form()
+    tool = str(form.get("tool") or "")
+    if not tool.startswith("osint_") or tool not in REGISTRY:
+        return JSONResponse({"error": "Unbekanntes Tool."}, status_code=400)
+    # Map the single visible field back to the tool's real argument name.
+    field_map = {"osint_net_scan": "target", "osint_self_exposure": "ip",
+                 "osint_breach_check": "email", "osint_dns": "domain",
+                 "osint_webcams": "where", "osint_search": "query",
+                 "osint_image_exif": "file"}
+    args: dict = {}
+    value = str(form.get("value") or "").strip()
+    if tool in field_map and value:
+        args[field_map[tool]] = value
+    if tool == "osint_webcams":
+        for k in ("lat", "lon"):
+            if form.get(k):
+                try:
+                    args[k] = float(form.get(k))
+                except (TypeError, ValueError):
+                    pass
+    raw = await dispatch(tool, args, ToolContext(
+        thread_id="web-osint", channel="web", contact={"id": "owner"}, is_owner=True))
+    _ok, summary, _p = result_summary(raw)
+    return JSONResponse({"summary": summary})

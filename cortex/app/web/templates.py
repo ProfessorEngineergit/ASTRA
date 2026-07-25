@@ -730,6 +730,7 @@ def page(title: str, body: str, *, nav: bool = True, active: str = "") -> str:
             f'{navlink("/admin/chat", "Chat", "chat")}'
             f'{navlink("/admin/brain", "Wissen", "brain")}'
             f'{navlink("/admin/secretary", "Secretary", "secretary")}'
+            f'{navlink("/admin/osint", "Recon", "osint")}'
             f'{navlink("/admin/system", "System", "system")}'
             f'{navlink("/admin/settings", "Einstellungen", "settings")}'
             f'{navlink("/admin/update", "Update", "update")}'
