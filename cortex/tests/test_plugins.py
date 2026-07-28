@@ -15,6 +15,7 @@ from app.plugins.builtin.google_calendar import GoogleCalendarPlugin
 from app.plugins.builtin.google_tasks import GoogleTasksPlugin
 from app.plugins.builtin.home_assistant import HomeAssistantPlugin
 from app.plugins.builtin.native_catalog_pack import _slug as native_slug
+from app.plugins.builtin.osint import OsintPlugin
 from app.plugins.registry import _discover_classes, get_manager
 from app.tools import ToolContext
 
@@ -68,6 +69,65 @@ def test_all_plugin_tools_are_owner_only():
         for t in inst.tools():
             assert t.owner_only is True, f"{cls.slug}:{t.name} not owner_only"
             assert t.source == cls.slug
+
+
+def test_osint_nearby_is_passive_shodan_metadata(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "total": 1,
+                "matches": [{
+                    "ip_str": "203.0.113.10",
+                    "port": 443,
+                    "transport": "tcp",
+                    "product": "Example Camera",
+                    "org": "Example ISP",
+                    "location": {
+                        "city": "Frankfurt",
+                        "country_name": "Germany",
+                        "latitude": 50.12,
+                        "longitude": 8.69,
+                    },
+                }],
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return FakeResponse()
+
+    plugin = OsintPlugin({
+        "__enabled": True,
+        "tor_proxy": "socks5://tor:9050",
+        "shodan_key": "secret",
+    })
+    monkeypatch.setattr(plugin, "_client", lambda: FakeClient())
+    tool = next(t for t in plugin.tools() if t.name == "osint_nearby_exposure")
+    ctx = ToolContext(thread_id="web-owner:test", channel="web",
+                      contact={"id": "owner"}, is_owner=True)
+
+    result = asyncio.run(tool.handler({
+        "category": "cameras", "lat": 50.11, "lon": 8.68, "radius": 15,
+    }, ctx))
+    payload = _payload(result)
+
+    assert payload["ok"] is True
+    assert payload["data"]["results"][0]["shodan_url"] == (
+        "https://www.shodan.io/host/203.0.113.10")
+    assert "feed" not in payload["data"]["results"][0]
+    assert [call[0] for call in calls] == ["https://api.shodan.io/shodan/host/search"]
+    assert "geo:50.11000,8.68000,15" in calls[0][1]["params"]["query"]
 
 
 def test_rebuild_registers_enabled_plugin_tools(memdb):

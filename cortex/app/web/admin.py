@@ -25,10 +25,16 @@ from ..plugins.base import CATEGORY_LABELS, FieldType
 from ..plugins.registry import get_manager
 from ..secretary import CHANNEL_LABELS, secretary_settings
 from . import auth
-from ..models import set_model_override
+from ..models import (
+    ROLES,
+    model_config_snapshot,
+    protect_api_key,
+    set_model_config,
+    set_model_override,
+)
 from ..plugins import extended_catalog
 from .templates import (
-    LOGO_LONG, brand_icon, esc, font_choices, icon_html, page, set_font, set_theme,
+    LOGO_LONG, brand_icon, esc, font_choices, font_live_specs, icon_html, page, set_font, set_theme,
     theme_choices,
 )
 
@@ -38,11 +44,14 @@ DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[3]
 UPDATE_PULL_COMMAND = ["git", "pull", "--ff-only", "origin", "main"]
 UPDATE_FETCH_COMMAND = ["git", "fetch", "--tags", "origin", "main"]
 UPDATE_REBUILD_COMMAND = "docker compose up -d --build cortex"
-_GH_SVG = ('<svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor">'
-           '<path d="M12 .5A12 12 0 0 0 8.2 23.9c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.5-1.4-1.3-1.8-1.3-1.8'
-           '-1.1-.7.1-.7.1-.7 1.2 0 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.4-1.3-5.4-5.9'
-           '0-1.3.5-2.4 1.2-3.2 0-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17 4.7 18 5 18 5c.6 1.6.1 2.8.1 3.1'
-           '.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.5 5.9.5.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .5Z"/></svg>')
+_GH_SVG = (
+    '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">'
+    '<circle cx="6" cy="5" r="2.25" stroke="currentColor" stroke-width="1.8"/>'
+    '<circle cx="6" cy="19" r="2.25" stroke="currentColor" stroke-width="1.8"/>'
+    '<circle cx="18" cy="7" r="2.25" stroke="currentColor" stroke-width="1.8"/>'
+    '<path d="M6 7.5v9M8.25 7h3.25A6.5 6.5 0 0 1 18 13.5V16" '
+    'stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>'
+)
 
 log = logging.getLogger("astra.web.admin")
 router = APIRouter()
@@ -338,7 +347,7 @@ async def setup_form(request: Request):
     body = f"""<div class="center">
       <div class="auth-logo"><img src="{LOGO_LONG}" alt="ASTRA"></div>
       <div class="panel">
-        <h2>Willkommen 👋</h2>
+        <h2>Willkommen</h2>
         <p class="note" style="text-align:center;margin:-6px 0 20px">Lege ein Admin-Passwort für
           die Weboberfläche fest.</p>
         <form method="post" action="/admin/setup">
@@ -425,61 +434,6 @@ GH_NEW_ISSUE = "https://github.com/ProfessorEngineergit/ASTRA/issues/new"
 _DEFAULT_LABS = {
     "font": "inter",
     "theme": "event_horizon",
-    "density": "comfortable",
-    "motion": "normal",
-    "event_horizon": "subtle",
-    "surface_glow": "focused",
-    "accent": "platinum",
-    "catalog_view": "spacious",
-    "map_style": "dark",
-    "diagnostics": "off",
-    "save_effect": "on",
-}
-
-_LAB_SELECTS = {
-    "density": [
-        ("comfortable", "Comfortable", "ruhige Abstände, Alltagspanel"),
-        ("compact", "Compact", "mehr Inhalt pro Bildschirm"),
-        ("dense", "Dense Ops", "maximal scanbar"),
-    ],
-    "motion": [
-        ("calm", "Calm", "reduzierte Bewegung"),
-        ("normal", "Normal", "polierte Mikrointeraktionen"),
-        ("hyperspace", "Hyperspace", "mehr Energie, aber respektiert Reduce Motion"),
-    ],
-    "event_horizon": [
-        ("off", "Off", "pechschwarz"),
-        ("subtle", "Subtle", "OLED-Sternenrauschen"),
-        ("deep", "Deep Field", "mehr kosmische Tiefe"),
-    ],
-    "surface_glow": [
-        ("off", "Off", "streng und flach"),
-        ("focused", "Focused", "leichter Fokusglanz"),
-        ("cinematic", "Cinematic", "stärkeres Hover-Licht"),
-    ],
-    "accent": [
-        ("platinum", "Platinum", "neutral und edel"),
-        ("ion", "Ion", "kühles Cyan"),
-        ("aurora", "Aurora", "grün-violette Signale"),
-        ("ember", "Ember", "warme Warnlampen"),
-    ],
-    "catalog_view": [
-        ("spacious", "Spacious Cards", "Karten mit Luft"),
-        ("compact", "Compact Scan", "dichter Integrationsscanner"),
-    ],
-    "map_style": [
-        ("dark", "Dark Matter", "CARTO Dark"),
-        ("standard", "Street Grid", "OpenStreetMap Standard"),
-        ("transit", "Transit Lines", "ÖPNV-orientierte Kacheln"),
-    ],
-    "diagnostics": [
-        ("off", "Off", "saubere Oberfläche"),
-        ("on", "On", "Slug- und Source-Badges sichtbar"),
-    ],
-    "save_effect": [
-        ("off", "Off", "stilles Speichern"),
-        ("on", "Pulse", "kurzer Erfolgsimpuls"),
-    ],
 }
 
 _AREA_META = {
@@ -527,18 +481,10 @@ def _labs(s: dict) -> dict:
     labs = dict(_DEFAULT_LABS)
     stored = s.get("labs", {}) or {}
     if isinstance(stored, dict):
-        labs.update({k: v for k, v in stored.items() if v not in (None, "")})
+        labs.update({k: v for k, v in stored.items() if k in _DEFAULT_LABS and v not in (None, "")})
     if s.get("font") and not stored.get("font"):
         labs["font"] = s["font"]
     return labs
-
-
-def _opt(key: str, selected: str) -> str:
-    return "".join(
-        f'<option value="{esc(value)}" {"selected" if selected == value else ""}>'
-        f'{esc(label)} — {esc(desc)}</option>'
-        for value, label, desc in _LAB_SELECTS[key]
-    )
 
 
 def _area_for(slug: str) -> dict:
@@ -566,53 +512,14 @@ def _area_attrs(slug: str) -> str:
     )
 
 
-def _labs_css(labs: dict) -> str:
-    accent = {
-        "platinum": ("#f4f5f8", "#c7c7cc"),
-        "ion": ("#d9f3ff", "#a9c9dc"),
-        "aurora": ("#e5e9f0", "#bfc7d8"),
-        "ember": ("#f3e4bc", "#d4bd7a"),
-    }.get(labs.get("accent"), ("#f4f5f8", "#c7c7cc"))
-    event_opacity = {"off": "0", "subtle": ".35", "deep": ".62"}.get(
-        labs.get("event_horizon"), ".35"
-    )
-    density_gap = {"comfortable": "16px", "compact": "12px", "dense": "9px"}.get(
-        labs.get("density"), "16px"
-    )
-    density_pad = {"comfortable": "22px 24px", "compact": "18px 20px", "dense": "14px 16px"}.get(
-        labs.get("density"), "22px 24px"
-    )
-    motion = labs.get("motion")
-    glow = labs.get("surface_glow")
-    css = [
-        "<style>",
-        f":root{{--accent:{accent[0]};--link:{accent[1]};--ring:{accent[1]}88;}}",
-        f"body::before{{opacity:{event_opacity};}}",
-        f".panel{{padding:{density_pad};}} .toolbar,.row{{gap:{density_gap};}}",
-    ]
-    if motion == "calm":
-        css.append("*,*::before,*::after{transition-duration:.01ms!important;animation-duration:.01ms!important;}")
-    elif motion == "hyperspace":
-        css.append(".hero h1{animation:labDrift 5s ease-in-out infinite alternate;}")
-    if glow == "off":
-        css.append(".card:hover,.panel:hover{box-shadow:none!important;}")
-    elif glow == "cinematic":
-        css.append(".card:hover,.panel:hover{box-shadow:0 18px 60px color-mix(in srgb,var(--link) 18%,transparent),var(--shadow);}")
-    else:
-        css.append(".panel:hover{border-color:#292932;}")
-    css.append("@keyframes labDrift{from{filter:none}to{filter:drop-shadow(0 0 16px color-mix(in srgb,var(--link) 28%,transparent))}}")
-    css.append("@media (prefers-reduced-motion: reduce){*,*::before,*::after{animation:none!important;transition-duration:.01ms!important;}}")
-    css.append("</style>")
-    return "".join(css)
-
-
 def _theme_picker(selected: str) -> str:
     cards = []
     for key, theme in theme_choices():
         checked = " checked" if key == selected else ""
         cards.append(
             f'<label class="theme-card" style="--preview-accent:{esc(theme["accent"])};'
-            f'--preview-link:{esc(theme["link"])};--preview-signal:{esc(theme["signal"])}">'
+            f'--preview-link:{esc(theme["link"])};--preview-signal:{esc(theme["signal"])};'
+            f'--preview-radius:{esc(theme["radius"])}">'
             f'<input type="radio" name="lab_theme" value="{esc(key)}"{checked}>'
             '<span class="theme-card-visual"><i></i><i></i><i></i></span>'
             f'<span class="theme-card-copy"><b>{esc(theme["name"])}</b>'
@@ -631,20 +538,6 @@ _BEAKER_SVG = (
     'stroke-linecap="round"/><circle cx="31.5" cy="20.5" r="1.7" fill="currentColor"/>'
     '<circle cx="19" cy="27" r="1.4" fill="currentColor"/></svg>'
 )
-
-
-def _select_html(name: str, options: str, *, select_id: str | None = None) -> str:
-    attr = f' id="{esc(select_id)}"' if select_id else ""
-    return f'<select name="{esc(name)}"{attr}>{options}</select>'
-
-
-def _lab_tile(title: str, eyebrow: str, body: str, control: str) -> str:
-    return (
-        '<div class="lab-tile">'
-        f'<div class="lab-eyebrow">{esc(eyebrow)}</div>'
-        f'<div class="lab-title">{esc(title)}</div>'
-        f'<p>{esc(body)}</p>{control}</div>'
-    )
 
 
 def _card_html(p, is_fav: bool, installation_count: int = 1) -> str:
@@ -720,7 +613,6 @@ def _catalog_card_html(e) -> str:
 async def catalog(request: Request, _: bool = Depends(auth.require_admin)):
     mgr = get_manager()
     appset = await _app_settings()
-    labs = _labs(appset)
     loc = appset.get("location", {}) or {}
     region = {
         "country_code": _norm_area(loc.get("country_code")),
@@ -769,20 +661,7 @@ async def catalog(request: Request, _: bool = Depends(auth.require_admin)):
                    'stroke="currentColor" stroke-width="2" stroke-linecap="round">'
                    '<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>')
 
-    catalog_style = ""
-    if labs.get("catalog_view") == "compact":
-        catalog_style += (
-            ".grid{grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px}"
-            ".card{padding:13px;gap:9px}.card p{font-size:12.5px;line-height:1.42}"
-            ".card .icon{width:38px;height:38px;font-size:22px}.card h3{font-size:14px}"
-        )
-    if labs.get("diagnostics") == "on":
-        catalog_style += (
-            ".card::after{content:attr(data-slug);position:absolute;right:12px;top:12px;"
-            "font:10px 'JetBrains Mono',monospace;color:var(--text-faint);opacity:.72}"
-        )
-    else:
-        catalog_style += ".tag-nativ,.tag-katalog{display:none}"
+    catalog_style = ".tag-nativ,.tag-katalog{display:none}"
 
     catalog_script = (
         "<script>const astraRegion = " + json.dumps(region) + ";\n" + """
@@ -840,7 +719,7 @@ async def catalog(request: Request, _: bool = Depends(auth.require_admin)):
     )
 
     body = f"""
-    {_labs_css(labs)}<style>{catalog_style}</style>
+    <style>{catalog_style}</style>
     <div class="hero">
       <h1>Deine <span class="grad">Integrationen</span></h1>
       <p>Verbinde ASTRA mit deiner Welt — Verkehr, Smart Home, Server, Messenger und mehr.
@@ -915,7 +794,7 @@ async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.requir
                         f'{_field_input(f, val, meta.get(f.key, False))}{help_}</div>')
 
     soon = getattr(cls, "coming_soon", False)
-    soon_banner = ('<div class="flash err">🚧 Dieses Plugin ist im Katalog gelistet, aber noch '
+    soon_banner = ('<div class="flash err">Dieses Plugin ist im Katalog gelistet, aber noch '
                    'nicht implementiert. Sag ASTRA, wenn du es priorisiert haben möchtest.</div>'
                    if soon else "")
     cat_label = esc(CATEGORY_LABELS.get(cls.category, cls.category.value))
@@ -1214,8 +1093,7 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
     loc = s.get("location", {}) or {}
     labs = _labs(s)
     token = await auth.issue_csrf()
-    save_fx = " save-pulse" if saved and labs.get("save_effect") == "on" else ""
-    flash = f'<div class="flash ok{save_fx}">Gespeichert.</div>' if saved else ""
+    flash = '<div class="flash ok">Gespeichert.</div>' if saved else ""
     lat = loc.get("lat", 50.1109)
     lon = loc.get("lon", 8.6821)
     city = loc.get("city", "")
@@ -1229,7 +1107,85 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
         for t in ["Europe/Berlin", "Europe/Vienna", "Europe/Zurich", "Europe/London", "UTC"])
     units = s.get("units", "metric")
     lang = s.get("language", "de")
-    model = esc(s.get("ai_model", ""))
+    set_model_config(s.get("models"))
+    model_snapshot = model_config_snapshot()
+    stored_models = s.get("models") if isinstance(s.get("models"), dict) else {}
+    stored_providers = stored_models.get("providers") if isinstance(stored_models.get("providers"), dict) else {}
+    provider_names = list(dict.fromkeys(
+        ["openai", "openrouter", "anthropic", "ollama", *model_snapshot["providers"].keys()]
+    ))
+    provider_labels = {
+        "openai": ("OpenAI", "GPT und Codex"),
+        "openrouter": ("OpenRouter", "Modelle mehrerer Anbieter"),
+        "anthropic": ("Anthropic", "Claude"),
+        "ollama": ("Ollama", "lokale Modelle"),
+    }
+    provider_cards = []
+    for provider_name in provider_names:
+        current = model_snapshot["providers"].get(provider_name, {})
+        stored_provider = stored_providers.get(provider_name)
+        stored_provider = stored_provider if isinstance(stored_provider, dict) else {}
+        label, subtitle = provider_labels.get(
+            provider_name, (provider_name.replace("_", " ").title(), "OpenAI-kompatibel")
+        )
+        kind = str(current.get("kind") or "openai_compat")
+        configured = bool(current.get("configured"))
+        key_saved = bool(stored_provider.get("api_key"))
+        status_label = "bereit" if configured else "Key fehlt"
+        status_class = "ok" if configured else ""
+        base_url = str(stored_provider.get("base_url") or current.get("base_url") or "")
+        tools = bool(current.get("tools", kind == "openai_compat"))
+        provider_cards.append(f"""
+        <div class="card model-provider" data-provider="{esc(provider_name)}">
+          <div class="row" style="justify-content:space-between;gap:10px">
+            <div><b>{esc(label)}</b><div class="note" style="font-size:11px">{esc(subtitle)}</div></div>
+            <span class="badge {status_class}">{status_label}</span>
+          </div>
+          <input type="hidden" name="model_provider_{esc(provider_name)}_kind" value="{esc(kind)}">
+          <div class="field" style="margin-top:12px"><label>API-Key</label>
+            <input type="password" name="model_provider_{esc(provider_name)}_api_key"
+              value="" autocomplete="new-password"
+              placeholder="{"gespeichert · leer = behalten" if key_saved else "aus .env oder hier eintragen"}"></div>
+          <div class="field"><label>Base URL</label>
+            <input type="url" name="model_provider_{esc(provider_name)}_base_url"
+              value="{esc(base_url)}" placeholder="Standard-Endpunkt"></div>
+          <label class="toggle-row" style="padding:8px 0 0">
+            <input class="toggle" type="checkbox"
+              name="model_provider_{esc(provider_name)}_tools" {"checked" if tools else ""}>
+            <span><b style="font-size:12px">Tool-Calling</b>
+              <span class="note" style="font-size:11px;display:block">Nur aktivieren, wenn der Endpunkt OpenAI-kompatibel ist.</span></span>
+          </label>
+        </div>""")
+    provider_options = "".join(
+        f'<option value="{esc(name)}">{{label}}</option>'.format(
+            label=esc(provider_labels.get(name, (name, ""))[0])
+        )
+        for name in provider_names
+    )
+    role_labels = {
+        "small": ("Schnell", "Triage, Zusammenfassungen"),
+        "medium": ("Hauptmodell", "normaler Chat mit Tools"),
+        "heavy": ("Analyse", "Planung und schwierige Aufgaben"),
+        "code": ("Code", "Codex oder anderes Coding-Modell"),
+        "osint": ("Recherche", "OSINT und Recherche über Tor"),
+    }
+    role_rows = []
+    for role in ROLES:
+        target = model_snapshot["roles"].get(role, {})
+        selected_provider = str(target.get("provider") or "openai")
+        options = provider_options.replace(
+            f'value="{esc(selected_provider)}"',
+            f'value="{esc(selected_provider)}" selected',
+            1,
+        )
+        title, desc = role_labels[role]
+        role_rows.append(f"""
+        <div class="model-route">
+          <div><b>{esc(title)}</b><span class="note">{esc(desc)}</span></div>
+          <select name="model_role_{role}_provider">{options}</select>
+          <input type="text" name="model_role_{role}_model"
+            value="{esc(str(target.get('model') or ''))}" placeholder="Modell-ID">
+        </div>""")
     eco = "checked" if s.get("economy_mode") else ""
     cur_auto = s.get("autonomy", "ask")
     allow_sc = "checked" if s.get("allow_self_config", True) else ""
@@ -1245,68 +1201,14 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
     font_opts = "".join(
         f'<option value="{esc(k)}" {"selected" if k == cur_font else ""}>{esc(name)}</option>'
         for k, name in font_choices())
-    lab_tiles = "".join([
-        _lab_tile(
-            "Font Forge", "Typography",
-            "UI-Schrift mit Live-Vorschau und lokalen Fonts aus dem Fonts-Ordner.",
-            _select_html("lab_font", font_opts, select_id="lab_font"),
-        ),
-        _lab_tile(
-            "Cockpit Density", "Layout",
-            "Wechselt die Informationsdichte zwischen Lounge und Kontrollraum.",
-            _select_html("lab_density", _opt("density", labs.get("density", "comfortable"))),
-        ),
-        _lab_tile(
-            "Motion Profile", "Motion",
-            "Mikroanimationen von ruhig bis Hyperspace, mit Reduced-Motion-Respekt.",
-            _select_html("lab_motion", _opt("motion", labs.get("motion", "normal"))),
-        ),
-        _lab_tile(
-            "Event Horizon", "Backdrop",
-            "Regelt die Tiefe des OLED-Sternenfelds hinter der Oberfläche.",
-            _select_html(
-                "lab_event_horizon", _opt("event_horizon", labs.get("event_horizon", "subtle"))
-            ),
-        ),
-        _lab_tile(
-            "Surface Glow", "Surfaces",
-            "Steuert, wie stark Panels und Karten beim Fokus leuchten.",
-            _select_html("lab_surface_glow", _opt("surface_glow", labs.get("surface_glow", "focused"))),
-        ),
-        _lab_tile(
-            "Accent Spectrum", "Signal",
-            "Wählt einen zurückhaltenden Signalton für Links, Fokus und Primärflächen.",
-            _select_html("lab_accent", _opt("accent", labs.get("accent", "platinum"))),
-        ),
-        _lab_tile(
-            "Catalog View", "Scanner",
-            "Schaltet den Integrationskatalog zwischen Cards und dichtem Scan-Modus.",
-            _select_html("lab_catalog_view", _opt("catalog_view", labs.get("catalog_view", "spacious"))),
-        ),
-        _lab_tile(
-            "Map Style", "Geospatial",
-            "Wählt den Kartenlook für Standort und Umgebung.",
-            _select_html("lab_map_style", _opt("map_style", labs.get("map_style", "dark")), select_id="lab_map_style"),
-        ),
-        _lab_tile(
-            "Diagnostic Badges", "Debug",
-            "Blendet technische Slugs und Source-Marker im Katalog ein.",
-            _select_html("lab_diagnostics", _opt("diagnostics", labs.get("diagnostics", "off"))),
-        ),
-        _lab_tile(
-            "Save Effect", "Feedback",
-            "Aktiviert einen kurzen Erfolgsimpuls nach dem Speichern.",
-            _select_html("lab_save_effect", _opt("save_effect", labs.get("save_effect", "on"))),
-        ),
-    ])
     settings_script = (
-        "<script>const fontLabels = "
-        + json.dumps({key: name for key, name in font_choices()})
+        "<script>const fontSpecs = "
+        + json.dumps(font_live_specs())
         + ";\n"
         + """
       const $ = id => document.getElementById(id);
       const status = $('geostatus'), addr = $('addr'), results = $('addrresults');
-      const latInput = $('lat'), lonInput = $('lon'), mapStyle = $('lab_map_style');
+      const latInput = $('lat'), lonInput = $('lon');
       let aborter = null, searchTimer = null, lastResults = [];
 
       function setStatus(text, kind='') {
@@ -1467,14 +1369,20 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
         const p = e.target.getLatLng();
         place(p.lat, p.lng, 'Pin verschoben.');
       });
-      if (mapStyle) {
-        setMapStyle(mapStyle.value);
-        mapStyle.addEventListener('change', () => setMapStyle(mapStyle.value));
-      }
+      setMapStyle('dark');
       const fontSelect = $('lab_font'), preview = $('fontpreview');
       function updateFontPreview() {
-        const name = fontLabels[fontSelect.value] || fontSelect.value || 'Inter';
-        preview.style.setProperty('--ui-font-preview', `'${name}'`);
+        const spec = fontSpecs[fontSelect.value] || {name:'Inter',family:"'Inter'",query:''};
+        if (spec.query && !document.getElementById('live-font-' + fontSelect.value)) {
+          const link = document.createElement('link');
+          link.id = 'live-font-' + fontSelect.value;
+          link.rel = 'stylesheet';
+          link.href = 'https://fonts.googleapis.com/css2?family=' + spec.query + '&display=swap';
+          document.head.appendChild(link);
+        }
+        document.documentElement.style.setProperty('--ui-font', spec.family);
+        preview.style.setProperty('--ui-font-preview', spec.family);
+        const name = spec.name || fontSelect.value || 'Inter';
         preview.querySelector('span').textContent = `FONT FORGE · ${name}`;
       }
       fontSelect.addEventListener('change', updateFontPreview);
@@ -1489,7 +1397,6 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
     </script>"""
     )
     body = f"""
-    {_labs_css(labs)}
     <div class="settings-hero">
       <div class="hero" style="margin:0">
         <h1>Einstellungen</h1>
@@ -1502,11 +1409,6 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
       </a>
     </div>
     {flash}
-    <div class="settings-tabs">
-      <a href="#settings-general">Allgemein</a>
-      <a href="#settings-location">Standort</a>
-      <a href="#settings-labs">Labs</a>
-    </div>
     <form method="post" action="/admin/settings" id="settings-form">
       <input type="hidden" name="csrf" value="{esc(token)}">
       <div class="panel" id="settings-general" style="margin-bottom:16px">
@@ -1528,17 +1430,26 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
         </div>
       </div>
 
-      <div class="panel" style="margin-bottom:16px">
-        <h2 style="margin:0 0 12px;font-size:15px">KI-Modell</h2>
-        <div class="field"><label>Chat-Modell</label>
-          <input type="text" name="ai_model" value="{model}" placeholder="z. B. gpt-4o, gpt-4o-mini, o3-mini">
-          <div class="help">Überschreibt die .env-Vorgabe live. Kleinere Modelle sparen Geld.
-            Links: <a href="https://platform.openai.com/docs/models" target="_blank" rel="noopener">OpenAI-Modelle ↗</a> ·
-            <a href="https://platform.openai.com/usage" target="_blank" rel="noopener">Nutzung &amp; Kosten ↗</a></div></div>
+      <div class="panel model-picker" style="margin-bottom:16px">
+        <div class="section-head">
+          <div><h2>Model Routing</h2>
+            <p>Ein Anbieter pro Aufgabe. Änderungen gelten sofort und brauchen keinen Neustart.</p></div>
+          <span class="badge">5 Rollen</span>
+        </div>
+        <div class="model-routes">{"".join(role_rows)}</div>
+        <div class="section-head" style="margin-top:24px">
+          <div><h2>Anbieter</h2>
+            <p>Keys werden verschlüsselt gespeichert und nie wieder im Klartext angezeigt.</p></div>
+        </div>
+        <div class="grid model-providers">{"".join(provider_cards)}</div>
+        <div class="note" style="margin-top:12px">Das <b>Hauptmodell</b> benötigt einen
+          OpenAI-kompatiblen Anbieter für ASTRA-Tools. Claude funktioniert direkt in den
+          Rollen Analyse, Code oder Recherche. „Nutze Claude“ kann ASTRA über die
+          zugeordnete Rolle ausführen. Codex ist eine Modell-ID in der Rolle Code.</div>
         <div class="toggle-row"><input class="toggle" type="checkbox" name="economy" {eco}>
           <div><div style="font-weight:600;font-size:14px">Sparmodus</div>
-            <div class="note" style="font-size:12px">Reduziert proaktive API-Aufrufe (Briefing-Quellen,
-              Health-Checks) — weniger Requests, weniger Kosten.</div></div></div>
+            <div class="note" style="font-size:12px">Normaler Chat nutzt vorübergehend die
+              Rolle Schnell — weniger Kosten, gleiche Routing-Regeln.</div></div></div>
       </div>
 
       <div class="panel" style="margin-bottom:16px">
@@ -1596,22 +1507,26 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
           {_BEAKER_SVG}
           <div>
             <div class="lab-eyebrow">ASTRA Labs</div>
-            <h2>Experimental Console</h2>
-            <p>Polierte Nerd-Schalter für Oberfläche, Karten, Scanner und Feedback. Eigene Fonts
-              in <code>cortex/app/web/static/fonts/</code> erscheinen automatisch.</p>
+            <h2>Theme &amp; Typografie</h2>
+            <p>Zwei Regler, die sofort auf die gesamte Oberfläche wirken.</p>
           </div>
-        </div>
-        <div class="font-preview" id="fontpreview">
-          <span>FONT FORGE PREVIEW</span>
-          <strong>ASTRA sieht scharf aus, wenn der Kontrollraum scharf ist.</strong>
         </div>
         <div class="theme-lab">
           <div class="lab-eyebrow">Theme Deck</div>
           <h3>Zehn OLED-Kontrollräume</h3>
-          <p>Jedes Theme bleibt auf echtem Schwarz. Farbe wird nur für Signale, Fokus und Instrumente eingesetzt.</p>
+          <p>Nicht nur Farbe: Navigation, Einzüge, Kanten, Überschriften und Instrumente wechseln live mit.</p>
           {_theme_picker(labs.get("theme", "event_horizon"))}
         </div>
-        <div class="labs-grid">{lab_tiles}</div>
+        <div class="typography-lab">
+          <div class="lab-eyebrow">Typography</div>
+          <h3>UI-Schrift</h3>
+          <p>Wirkt sofort global. Eigene Fonts im Fonts-Ordner erscheinen automatisch.</p>
+          <select name="lab_font" id="lab_font">{font_opts}</select>
+          <div class="font-preview" id="fontpreview">
+            <span>LIVE TYPE</span>
+            <strong>ASTRA kontrolliert den Raum.</strong>
+          </div>
+        </div>
       </div>
 
       <button class="btn" type="submit">Alles speichern</button>
@@ -1640,22 +1555,43 @@ async def settings_save(request: Request, _: bool = Depends(auth.require_admin))
     labs = {
         "font": font_choice,
         "theme": form.get("lab_theme", _DEFAULT_LABS["theme"]),
-        "density": form.get("lab_density", _DEFAULT_LABS["density"]),
-        "motion": form.get("lab_motion", _DEFAULT_LABS["motion"]),
-        "event_horizon": form.get("lab_event_horizon", _DEFAULT_LABS["event_horizon"]),
-        "surface_glow": form.get("lab_surface_glow", _DEFAULT_LABS["surface_glow"]),
-        "accent": form.get("lab_accent", _DEFAULT_LABS["accent"]),
-        "catalog_view": form.get("lab_catalog_view", _DEFAULT_LABS["catalog_view"]),
-        "map_style": form.get("lab_map_style", _DEFAULT_LABS["map_style"]),
-        "diagnostics": form.get("lab_diagnostics", _DEFAULT_LABS["diagnostics"]),
-        "save_effect": form.get("lab_save_effect", _DEFAULT_LABS["save_effect"]),
     }
+    old_models = s.get("models") if isinstance(s.get("models"), dict) else {}
+    old_providers = old_models.get("providers") if isinstance(old_models.get("providers"), dict) else {}
+    provider_names = {"openai", "openrouter", "anthropic", "ollama"}
+    provider_names.update(
+        key.removeprefix("model_provider_").removesuffix("_kind")
+        for key in form.keys()
+        if key.startswith("model_provider_") and key.endswith("_kind")
+    )
+    model_providers: dict[str, dict] = {}
+    for name in sorted(provider_names):
+        old = old_providers.get(name)
+        old = old if isinstance(old, dict) else {}
+        api_key = str(form.get(f"model_provider_{name}_api_key") or "").strip()
+        saved_key = protect_api_key(api_key) if api_key else old.get("api_key", "")
+        model_providers[name] = {
+            "kind": str(form.get(f"model_provider_{name}_kind") or old.get("kind")
+                        or ("anthropic" if name == "anthropic" else "openai_compat")),
+            "base_url": str(form.get(f"model_provider_{name}_base_url") or "").strip(),
+            "api_key": saved_key,
+            "tools": f"model_provider_{name}_tools" in form,
+        }
+    model_roles = {
+        role: {
+            "provider": str(form.get(f"model_role_{role}_provider") or "").strip(),
+            "model": str(form.get(f"model_role_{role}_model") or "").strip(),
+        }
+        for role in ROLES
+    }
+    model_config = {"providers": model_providers, "roles": model_roles}
     s.update({
         "owner_name": form.get("owner_name", "").strip(),
         "timezone": form.get("timezone", "Europe/Berlin"),
         "units": form.get("units", "metric"),
         "language": form.get("language", "de"),
-        "ai_model": form.get("ai_model", "").strip(),
+        "ai_model": "",
+        "models": model_config,
         "autonomy": form.get("autonomy", "ask"),
         "allow_self_config": "allow_self_config" in form,
         "economy_mode": "economy" in form,
@@ -1672,13 +1608,14 @@ async def settings_save(request: Request, _: bool = Depends(auth.require_admin))
                      "postcode": form.get("postcode", "").strip()},
     })
     await db.set_setting("app_settings", s)
-    set_model_override(s["ai_model"])     # live, no restart
+    set_model_override(None)
+    set_model_config(model_config)
     set_font(s["font"])
     set_theme(labs["theme"])
     from ..brain import set_autonomy
     set_autonomy(s["autonomy"])
     await db.audit("settings_change", actor="owner",
-                   detail={"city": s["location"]["city"], "model": s["ai_model"],
+                   detail={"city": s["location"]["city"], "models": model_roles,
                            "font": s["font"], "county": s["location"]["county"]})
     return RedirectResponse("/admin/settings?saved=1", status_code=303)
 
@@ -5107,45 +5044,53 @@ async def brain_add_person(request: Request, _: bool = Depends(auth.require_admi
 
 
 # ─── OSINT / Recon tab ─────────────────────────────────────────────────────────
-# The frontend for the (owner-only, off-by-default) osint plugin. Actively scans
-# ONLY the networks Bahrian authorizes in the plugin config; every card runs a
-# gated tool. Location for "in der Nähe" comes from HA (phone) or the browser.
+# A compact frontend for passive Shodan metadata and Tor-routed research. Active
+# audit tools still exist for explicitly authorized owner chat, but do not clutter
+# the day-to-day Recon surface.
 _OSINT_CARDS = [
-    ("osint_net_scan", "Netz-Audit", "Offene Ports auf deinem freigegebenen Netz "
-     "(Drucker, Kamera, SSH …). Nur autorisierte Netze.", "target", "CIDR/Host, leer = 1. Netz"),
-    ("osint_self_exposure", "Meine Exposition", "Was von dir im Internet sichtbar ist "
-     "(Shodan über deine IP).", "ip", "IP (leer = eigene)"),
-    ("osint_breach_check", "Breach-Check", "Taucht eine Mailadresse in Daten-Leaks auf?",
-     "email", "deine@mail.de"),
-    ("osint_dns", "DNS & Subdomains", "A-Records + Cert-Transparency (crt.sh) einer Domain.",
-     "domain", "example.com"),
-    ("osint_webcams", "Öffentliche Webcams", "Frei zugängliche Kameras in der Nähe "
-     "(Windy). Standort via HA/Browser.", "where", "Ort (leer = hier)"),
-    ("osint_search", "Recherche (Tor)", "Offene Quellen über Tor durchsuchen.",
-     "query", "Suchbegriff"),
-    ("osint_image_exif", "Bild-EXIF", "Kamera/Zeit/GPS aus einem hochgeladenen Bild.",
-     "file", "Dateiname aus dem Chat-Upload"),
-    ("osint_exit_ip", "Tor-Status", "Läuft die Recherche wirklich über Tor?", "", ""),
+    ("osint_nearby_exposure", "Kameras in der Nähe",
+     "Passive Shodan-Metadaten. Kein Feed, kein Gerätezugriff.", "", "", "cameras"),
+    ("osint_nearby_exposure", "Drucker in der Nähe",
+     "Indexierte Druckdienste im Radius, ausschließlich als Shodan-Verweis.",
+     "", "", "printers"),
+    ("osint_search", "OSINT-Recherche",
+     "Offene Quellen über deine SearXNG-Instanz und Tor durchsuchen.",
+     "query", "Wonach soll ASTRA recherchieren?", ""),
+    ("osint_exit_ip", "Tor-Verbindung",
+     "Prüft Exit-IP und ob Recherche wirklich durch Tor läuft.", "", "", ""),
 ]
 
 
-def _osint_card(tool: str, title: str, desc: str, field: str, placeholder: str) -> str:
+def _osint_card(
+    tool: str,
+    title: str,
+    desc: str,
+    field: str,
+    placeholder: str,
+    category: str,
+) -> str:
     from ..web.templates import esc
     input_html = (f'<input name="value" placeholder="{esc(placeholder)}" '
                   f'style="flex:1;min-width:0">' if field else "")
+    nearby = tool == "osint_nearby_exposure"
     latlon = ('<input type="hidden" name="lat" class="osint-lat">'
               '<input type="hidden" name="lon" class="osint-lon">'
-              if tool == "osint_webcams" else "")
+              f'<input type="hidden" name="category" value="{esc(category)}">'
+              '<label class="recon-radius"><span>Radius</span>'
+              '<select name="radius"><option value="5">5 km</option>'
+              '<option value="15" selected>15 km</option><option value="30">30 km</option>'
+              '<option value="50">50 km</option></select></label>'
+              if nearby else "")
+    action = "Suchen" if tool != "osint_exit_ip" else "Verbindung prüfen"
     return f"""
 <div class="card osint-card" data-tool="{tool}">
-  <div style="font-weight:600">{esc(title)}</div>
-  <div class="note" style="font-size:12px;margin:4px 0 8px">{esc(desc)}</div>
-  <form class="osint-form" data-tool="{tool}" style="display:flex;gap:6px">
+  <div class="recon-card-head"><span class="recon-mark" aria-hidden="true"></span>
+    <div><h2>{esc(title)}</h2><p>{esc(desc)}</p></div></div>
+  <form class="osint-form" data-tool="{tool}">
     {input_html}{latlon}
-    <button class="btn sm" type="submit">Los</button>
+    <button class="btn sm" type="submit">{action}</button>
   </form>
-  <pre class="osint-out" style="white-space:pre-wrap;font-size:12px;margin-top:8px;
-       max-height:220px;overflow:auto;opacity:.85"></pre>
+  <div class="osint-out" hidden aria-live="polite"></div>
 </div>"""
 
 
@@ -5155,46 +5100,88 @@ async def osint_page(request: Request, _: bool = Depends(auth.require_admin)):
     plugin = get_manager().get("osint")
     enabled = bool(plugin and plugin.enabled)
     banner = ("" if enabled else
-              '<div class="card" style="border-color:#c94">Das OSINT-Plugin ist noch nicht '
+              '<div class="card recon-banner">Das OSINT-Plugin ist noch nicht '
               'aktiv. Richte es unter <a href="/admin/plugin/osint">Plugins → OSINT</a> ein '
-              '(Tor-Proxy, und für den Netz-Audit deine eigenen Netze unter „scan_networks“).</div>')
-    nets = ", ".join(plugin.scan_networks()) if enabled else ""
+              '(Tor-Proxy, Shodan-Key und optional SearXNG).</div>')
+    appset = await _app_settings()
+    saved_location = appset.get("location") if isinstance(appset.get("location"), dict) else {}
+    initial_lat = saved_location.get("lat")
+    initial_lon = saved_location.get("lon")
+    initial_city = str(saved_location.get("city") or "")
     cards = "".join(_osint_card(*c) for c in _OSINT_CARDS)
     body = f"""
-<section class="hero"><h1>Recon &amp; OSINT</h1>
-<p class="note">Nur offene Quellen und <b>deine eigenen/autorisierten</b> Netze. Aktives
-Scannen ist auf die in den Plugin-Einstellungen freigegebenen Netze begrenzt
-({esc(nets) or 'noch keine'}). Ausgang über Tor.</p>
-<div id="osint-loc" class="note" style="font-size:12px">Standort: unbekannt
- · <a href="#" id="osint-locate">Browser-Standort freigeben</a></div>
+<section class="hero recon-hero"><div><div class="lab-eyebrow">PASSIVE RECON</div>
+<h1>Recon</h1>
+<p>Shodan-Metadaten in deiner Nähe und OSINT-Recherche über Tor. ASTRA verbindet
+sich niemals mit einem gefundenen Gerät.</p></div>
+<div class="recon-policy"><b>Nur Metadaten</b><span>Nur eigene oder ausdrücklich
+autorisierte Systeme weiter prüfen.</span></div>
 </section>
+<div class="recon-location"><span class="recon-location-dot"></span>
+  <span id="osint-loc">Standort: {esc(initial_city) if initial_city else "nicht gesetzt"}</span>
+  <button class="btn ghost sm" type="button" id="osint-locate">Aktuellen Standort nutzen</button>
+</div>
+<div class="recon-privacy">Shodan und Recherche werden serverseitig über den konfigurierten
+Tor-Proxy abgefragt. Links öffnen die Shodan-Hostseite in deinem Browser – niemals direkt den Dienst.</div>
 {banner}
-<div class="grid" style="display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(280px,1fr))">
+<div class="grid recon-grid">
 {cards}
 </div>
 <script>
 const locBadge = document.getElementById('osint-loc');
-let here = {{lat:null, lon:null}};
+let here = {{lat:{json.dumps(initial_lat)}, lon:{json.dumps(initial_lon)}}};
+function syncLocation() {{
+  document.querySelectorAll('.osint-lat').forEach(i => i.value = here.lat ?? '');
+  document.querySelectorAll('.osint-lon').forEach(i => i.value = here.lon ?? '');
+}}
+syncLocation();
 document.getElementById('osint-locate').onclick = (e) => {{
   e.preventDefault();
   navigator.geolocation.getCurrentPosition(p => {{
     here = {{lat:p.coords.latitude, lon:p.coords.longitude}};
-    locBadge.innerHTML = 'Standort (Browser): ' + here.lat.toFixed(4) + ', ' + here.lon.toFixed(4);
-    document.querySelectorAll('.osint-lat').forEach(i => i.value = here.lat);
-    document.querySelectorAll('.osint-lon').forEach(i => i.value = here.lon);
-  }}, () => locBadge.textContent = 'Standort: Freigabe verweigert (HA-Standort wird genutzt)');
+    locBadge.textContent = 'Standort: ' + here.lat.toFixed(4) + ', ' + here.lon.toFixed(4);
+    syncLocation();
+  }}, () => locBadge.textContent = 'Standort nicht freigegeben · gespeicherter Standort bleibt aktiv');
 }};
+function appendText(parent, tag, text, cls='') {{
+  const el = document.createElement(tag); el.textContent = text; if (cls) el.className = cls;
+  parent.appendChild(el); return el;
+}}
+function renderResult(out, payload) {{
+  out.replaceChildren(); out.hidden = false;
+  const data = payload.data || {{}};
+  const rows = Array.isArray(data.results) ? data.results : [];
+  if (!rows.length) {{
+    appendText(out, 'p', payload.summary || payload.error || 'Keine Treffer.', 'recon-summary');
+    return;
+  }}
+  appendText(out, 'div', rows.length + ' Treffer · ausschließlich Metadaten', 'recon-result-count');
+  rows.forEach(row => {{
+    const item = document.createElement('a');
+    item.className = 'recon-result'; item.href = row.shodan_url || row.url || '#';
+    item.target = '_blank'; item.rel = 'noopener';
+    const title = row.product || row.title || row.ip || 'Shodan-Treffer';
+    appendText(item, 'b', title);
+    const where = [row.city, row.distance_km != null ? row.distance_km + ' km' : '',
+      row.org].filter(Boolean).join(' · ');
+    appendText(item, 'span', where || row.content || 'Öffentliche Quelle');
+    if (row.port) appendText(item, 'small', (row.transport || 'tcp') + '/' + row.port);
+    out.appendChild(item);
+  }});
+}}
 document.querySelectorAll('.osint-form').forEach(f => {{
   f.addEventListener('submit', async (e) => {{
     e.preventDefault();
     const out = f.parentElement.querySelector('.osint-out');
-    out.textContent = '… läuft (über Tor, kann dauern) …';
+    out.hidden = false; out.classList.add('loading');
+    out.textContent = 'Abfrage läuft über Tor…';
     const fd = new FormData(f); fd.append('tool', f.dataset.tool);
     try {{
       const r = await fetch('/admin/osint/run', {{method:'POST', body:fd}});
       const j = await r.json();
-      out.textContent = j.summary || j.error || '(keine Ausgabe)';
+      renderResult(out, j);
     }} catch (err) {{ out.textContent = 'Fehler: ' + err; }}
+    finally {{ out.classList.remove('loading'); }}
   }});
 }});
 </script>"""
@@ -5209,15 +5196,17 @@ async def osint_run(request: Request, _: bool = Depends(auth.require_admin)):
     if not tool.startswith("osint_") or tool not in REGISTRY:
         return JSONResponse({"error": "Unbekanntes Tool."}, status_code=400)
     # Map the single visible field back to the tool's real argument name.
-    field_map = {"osint_net_scan": "target", "osint_self_exposure": "ip",
-                 "osint_breach_check": "email", "osint_dns": "domain",
-                 "osint_webcams": "where", "osint_search": "query",
-                 "osint_image_exif": "file"}
+    field_map = {"osint_search": "query"}
     args: dict = {}
     value = str(form.get("value") or "").strip()
     if tool in field_map and value:
         args[field_map[tool]] = value
-    if tool == "osint_webcams":
+    if tool == "osint_nearby_exposure":
+        args["category"] = str(form.get("category") or "")
+        try:
+            args["radius"] = int(form.get("radius") or 15)
+        except (TypeError, ValueError):
+            args["radius"] = 15
         for k in ("lat", "lon"):
             if form.get(k):
                 try:
@@ -5226,5 +5215,7 @@ async def osint_run(request: Request, _: bool = Depends(auth.require_admin)):
                     pass
     raw = await dispatch(tool, args, ToolContext(
         thread_id="web-osint", channel="web", contact={"id": "owner"}, is_owner=True))
-    _ok, summary, _p = result_summary(raw)
-    return JSONResponse({"summary": summary})
+    ok, summary, payload = result_summary(raw)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    warnings = payload.get("warnings") if isinstance(payload, dict) else []
+    return JSONResponse({"ok": ok, "summary": summary, "data": data, "warnings": warnings})

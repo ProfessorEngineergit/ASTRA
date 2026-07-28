@@ -100,11 +100,16 @@ def test_settings_labs_and_region_save(memdb):
     r = c.get("/admin/settings")
     assert r.status_code == 200
     assert "github-capsule" in r.text
-    assert "Experimental Console" in r.text
+    assert "Theme &amp; Typografie" in r.text
     assert r.text.count('<input type="radio" name="lab_theme"') == 10
     assert "LCARS 2364" in r.text
     assert "Retro Terminal" in r.text
-    assert "lab_density" in r.text
+    assert "Model Routing" in r.text
+    assert "Hauptmodell" in r.text
+    assert "OpenRouter" in r.text
+    assert "Anthropic" in r.text
+    assert "lab_density" not in r.text
+    assert "settings-tabs" not in r.text
     assert "addrresults" in r.text
     assert 'name="country_code"' in r.text
     assert 'href="#settings-updates"' not in r.text
@@ -118,20 +123,30 @@ def test_settings_labs_and_region_save(memdb):
         "timezone": "Europe/Berlin",
         "units": "metric",
         "language": "de",
-        "ai_model": "gpt-4o",
+        "model_provider_openai_kind": "openai_compat",
+        "model_provider_openai_tools": "on",
+        "model_provider_openrouter_kind": "openai_compat",
+        "model_provider_openrouter_base_url": "https://openrouter.ai/api/v1",
+        "model_provider_openrouter_api_key": "secret-openrouter",
+        "model_provider_openrouter_tools": "on",
+        "model_provider_anthropic_kind": "anthropic",
+        "model_provider_ollama_kind": "openai_compat",
+        "model_provider_ollama_base_url": "http://ollama:11434/v1",
+        "model_provider_ollama_tools": "on",
+        "model_role_small_provider": "openai",
+        "model_role_small_model": "gpt-4o-mini",
+        "model_role_medium_provider": "openai",
+        "model_role_medium_model": "gpt-4o",
+        "model_role_heavy_provider": "anthropic",
+        "model_role_heavy_model": "claude-sonnet-4-5",
+        "model_role_code_provider": "openai",
+        "model_role_code_model": "gpt-5-codex",
+        "model_role_osint_provider": "openrouter",
+        "model_role_osint_model": "openai/gpt-5.6-terra",
         "autonomy": "confident",
         "allow_self_config": "on",
         "lab_font": "orbitron",
         "lab_theme": "tng_lcars",
-        "lab_density": "dense",
-        "lab_motion": "hyperspace",
-        "lab_event_horizon": "deep",
-        "lab_surface_glow": "cinematic",
-        "lab_accent": "ion",
-        "lab_catalog_view": "compact",
-        "lab_map_style": "transit",
-        "lab_diagnostics": "on",
-        "lab_save_effect": "on",
         "address": "Frankfurt am Main",
         "city": "Frankfurt am Main",
         "lat": "50.1109",
@@ -149,8 +164,13 @@ def test_settings_labs_and_region_save(memdb):
     assert saved["allow_self_config"] is True
     assert saved["font"] == "orbitron"
     assert saved["labs"]["theme"] == "tng_lcars"
-    assert saved["labs"]["density"] == "dense"
-    assert saved["labs"]["catalog_view"] == "compact"
+    assert set(saved["labs"]) == {"font", "theme"}
+    assert saved["ai_model"] == ""
+    assert saved["models"]["roles"]["medium"] == {
+        "provider": "openai", "model": "gpt-4o"}
+    assert saved["models"]["roles"]["osint"]["provider"] == "openrouter"
+    assert saved["models"]["providers"]["openrouter"]["api_key"].startswith("fernet:")
+    assert "secret-openrouter" not in saved["models"]["providers"]["openrouter"]["api_key"]
     assert saved["location"]["country_code"] == "de"
     assert saved["location"]["state"] == "Hessen"
     assert saved["location"]["county"] == "Frankfurt am Main"
@@ -674,8 +694,12 @@ def test_osint_tab_renders_and_run_endpoint_gates_tool(memdb):
 
     r = c.get("/admin/osint")
     assert r.status_code == 200
-    assert "Recon" in r.text and "Netz-Audit" in r.text
-    # Plugin ist im Test aus → Hinweis-Banner statt Scan-Funktion
+    assert "Recon" in r.text and "Kameras in der Nähe" in r.text
+    assert "Drucker in der Nähe" in r.text
+    assert "OSINT-Recherche" in r.text
+    assert "Netz-Audit" not in r.text
+    assert "Breach-Check" not in r.text
+    # Plugin ist im Test aus → Hinweis-Banner statt einer scheinbar aktiven Suche.
     assert "noch nicht aktiv" in r.text
 
     # Der Run-Endpoint lässt nur registrierte osint_-Tools zu. Ein Nicht-OSINT-Tool

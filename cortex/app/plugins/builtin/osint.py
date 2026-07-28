@@ -19,7 +19,9 @@ Anonymität. Das steht auch so in der Statusmeldung.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 from typing import Any
 
 import httpx
@@ -40,7 +42,7 @@ class OsintPlugin(Plugin):
     name = "OSINT & Recherche"
     description = "Offene Quellen und öffentliche Webcams — Ausgang über Tor."
     category = PluginCategory.INFRA_AI
-    icon = "🔎"
+    icon = ""
     config_fields = [
         # BEWUSST ohne Default: ein Pflichtfeld mit Vorgabewert gilt dem
         # ConfigStore als „erfüllt" und würde das Plugin von selbst aktivieren.
@@ -252,6 +254,106 @@ class OsintPlugin(Plugin):
                         f"Org: {data.get('org', '?')}",
                 data={"ip": ip, "ports": ports, "hostnames": data.get("hostnames")})
 
+        async def _nearby_exposure(args: dict, ctx: ToolContext) -> str:
+            """Passive Shodan search around Bahrian's location.
+
+            Returns metadata plus Shodan host pages only. It never connects to the
+            indexed device and deliberately does not expose camera/player URLs.
+            """
+            if not self.enabled:
+                return tool_result(ok=False, source=self.slug, summary="OSINT ist deaktiviert.")
+            key = str(self.get("shodan_key") or "").strip()
+            if not key:
+                return tool_result(
+                    ok=False, source=self.slug,
+                    summary="Kein Shodan-Key hinterlegt. Öffne Plugins → OSINT & Recherche.")
+            category = str(args.get("category") or "cameras").strip().lower()
+            if category not in {"cameras", "printers"}:
+                return tool_result(ok=False, source=self.slug,
+                                   summary="Kategorie muss cameras oder printers sein.")
+            lat, lon = args.get("lat"), args.get("lon")
+            if lat is None or lon is None:
+                location = await self._here()
+                if location.get("ok"):
+                    lat, lon = location.get("lat"), location.get("lon")
+            try:
+                lat, lon = float(lat), float(lon)
+            except (TypeError, ValueError):
+                return tool_result(
+                    ok=False, source=self.slug,
+                    summary="Kein Standort verfügbar. Im Recon-Tab Standort freigeben "
+                            "oder Home Assistant verbinden.")
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                return tool_result(ok=False, source=self.slug, summary="Ungültige Koordinaten.")
+            radius = max(1, min(50, int(args.get("radius") or 15)))
+            limit = max(1, min(20, int(args.get("limit") or 12)))
+            signature = (
+                "has_screenshot:true"
+                if category == "cameras"
+                else "port:9100,631"
+            )
+            query = f"{signature} geo:{lat:.5f},{lon:.5f},{radius}"
+            fields = "ip_str,port,product,org,hostnames,location,transport,timestamp"
+            try:
+                async with self._client() as client:
+                    response = await client.get(
+                        "https://api.shodan.io/shodan/host/search",
+                        params={"key": key, "query": query, "minify": "true", "fields": fields},
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+            except Exception as exc:  # noqa: BLE001
+                return tool_result(ok=False, source=self.slug,
+                                   summary=f"Shodan-Suche über Tor fehlgeschlagen: {exc}")
+
+            rows = []
+            for match in (payload.get("matches") or [])[:limit]:
+                ip = str(match.get("ip_str") or "").strip()
+                if not ip:
+                    continue
+                location = match.get("location") if isinstance(match.get("location"), dict) else {}
+                try:
+                    dlat = math.radians(float(location.get("latitude")) - lat)
+                    dlon = math.radians(float(location.get("longitude")) - lon)
+                    a = (math.sin(dlat / 2) ** 2
+                         + math.cos(math.radians(lat))
+                         * math.cos(math.radians(float(location.get("latitude"))))
+                         * math.sin(dlon / 2) ** 2)
+                    distance = round(6371 * 2 * math.asin(min(1, math.sqrt(a))), 1)
+                except (TypeError, ValueError):
+                    distance = None
+                rows.append({
+                    "ip": ip,
+                    "port": match.get("port"),
+                    "transport": match.get("transport") or "tcp",
+                    "product": match.get("product") or "",
+                    "org": match.get("org") or "",
+                    "city": location.get("city") or "",
+                    "country": location.get("country_name") or "",
+                    "distance_km": distance,
+                    "updated": match.get("timestamp") or "",
+                    "shodan_url": f"https://www.shodan.io/host/{ip}",
+                })
+            label = "Kameras" if category == "cameras" else "Drucker"
+            if not rows:
+                return tool_result(
+                    ok=True, source=self.slug,
+                    summary=f"Keine von Shodan indexierten {label} im Radius von {radius} km.",
+                    data={"category": category, "radius_km": radius, "results": []})
+            lines = [
+                f"• {row['product'] or label[:-1]} · {row['city'] or 'Ort unbekannt'}"
+                + (f" · {row['distance_km']} km" if row["distance_km"] is not None else "")
+                + f" · {row['shodan_url']}"
+                for row in rows
+            ]
+            return tool_result(
+                ok=True, source=self.slug,
+                summary=f"{len(rows)} Shodan-Treffer für {label} (nur Metadaten):\n"
+                        + "\n".join(lines),
+                data={"category": category, "radius_km": radius,
+                      "total": payload.get("total", len(rows)), "results": rows},
+                warnings=["Nur Systeme öffnen oder prüfen, für die du ausdrücklich autorisiert bist."])
+
         async def _breach_check(args: dict, ctx: ToolContext) -> str:
             if not self.enabled:
                 return tool_result(ok=False, source=self.slug, summary="OSINT ist deaktiviert.")
@@ -268,7 +370,7 @@ class OsintPlugin(Plugin):
                         headers={"hibp-api-key": key, "user-agent": "ASTRA"})
                     if r.status_code == 404:
                         return tool_result(ok=True, source=self.slug,
-                                           summary=f"{account}: in keinem bekannten Leak. 👍")
+                                           summary=f"{account}: in keinem bekannten Leak.")
                     r.raise_for_status()
                     breaches = [b.get("Name") for b in r.json()]
             except Exception as e:  # noqa: BLE001
@@ -458,6 +560,21 @@ class OsintPlugin(Plugin):
                      "radius": {"type": "number", "description": "km, Standard 50"}}},
                  handler=_webcams, owner_only=True, source=self.slug,
                  safety="external_send", intents=["research"]),
+            Tool(name="osint_nearby_exposure",
+                 description="Finde über Shodan passiv indexierte Kameras oder Drucker in der "
+                             "Nähe. Liefert ausschließlich Metadaten und Shodan-Hostseiten; "
+                             "verbindet sich nie mit Geräten und liefert keine Kamera-Feeds. "
+                             "Nutze das nur für eigene oder ausdrücklich autorisierte Systeme.",
+                 parameters={"type": "object", "properties": {
+                     "category": {"type": "string", "enum": ["cameras", "printers"]},
+                     "lat": {"type": "number"}, "lon": {"type": "number"},
+                     "radius": {"type": "integer", "minimum": 1, "maximum": 50},
+                     "limit": {"type": "integer", "minimum": 1, "maximum": 20}},
+                     "required": ["category"]},
+                 handler=_nearby_exposure, owner_only=True, source=self.slug,
+                 safety="external_send", intents=["research"],
+                 examples=["zeige mir über shodan kameras in meiner nähe",
+                           "welche drucker sind bei mir in der nähe indexiert"]),
             Tool(name="osint_exit_ip",
                  description="Prüfe, ob die Recherche wirklich über Tor läuft, und zeige die "
                              "Exit-IP.",

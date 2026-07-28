@@ -450,7 +450,7 @@ async def _models_add_provider(args: dict, ctx: ToolContext) -> str:
     if args.get("base_url"):
         entry["base_url"] = str(args["base_url"]).strip()
     if args.get("api_key"):
-        entry["api_key"] = str(args["api_key"]).strip()
+        entry["api_key"] = m.protect_api_key(str(args["api_key"]).strip())
     entry["tools"] = bool(args.get("tools", entry.get("tools", entry["kind"] == "openai_compat")))
     provs[name] = entry
     cfg["providers"] = provs
@@ -459,6 +459,31 @@ async def _models_add_provider(args: dict, ctx: ToolContext) -> str:
     m.set_model_config(cfg)
     await db.audit("model_provider_set", actor="astra", detail={"provider": name})
     return f"Anbieter '{name}' gespeichert ({entry['kind']})."
+
+
+async def _model_run(args: dict, ctx: ToolContext) -> str:
+    """Run one explicit subtask through a selected configured role."""
+    from . import models as m
+    role = str(args.get("role") or m.HEAVY).strip().lower()
+    if role not in m.ROLES:
+        return f"Unbekannte Rolle. Erlaubt: {', '.join(m.ROLES)}."
+    prompt = str(args.get("prompt") or "").strip()
+    if not prompt:
+        return "Bitte 'prompt' angeben."
+    system = str(args.get("system") or "").strip() or (
+        "Du bist ein spezialisiertes Teilmodell innerhalb von ASTRA. Bearbeite den "
+        "Teilauftrag präzise. Behaupte keine ausgeführten Aktionen und gib keine "
+        "Geheimnisse aus."
+    )
+    try:
+        answer = await m.get_gateway().complete(
+            role, system, prompt,
+            max_tokens=max(256, min(8000, int(args.get("max_tokens") or 2500))),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"Modell-Aufruf für Rolle '{role}' fehlgeschlagen: {exc}"
+    provider, model = m.role_target(role)
+    return f"[{role} · {provider.name}/{model}]\n{answer}"
 
 
 async def _delegate_job(args: dict, ctx: ToolContext) -> str:
@@ -1027,6 +1052,19 @@ def register_admin_tools() -> None:
              "api_key": {"type": "string"},
              "tools": {"type": "boolean"}},
           "required": ["name"]}, _models_add_provider),
+        ("astra_model_run",
+         "Führe einen einzelnen Teilauftrag über eine konfigurierte Modell-Rolle aus. Nutze "
+         "dieses Tool insbesondere, wenn Bahrian ausdrücklich sagt „nutze Claude“, „nutze "
+         "Codex“ oder „nutze das Recherche-Modell“: Claude liegt typischerweise auf heavy, "
+         "Codex auf code und OSINT auf osint. Der Aufruf ist Text-only und führt selbst keine "
+         "Aktionen aus.",
+         {"type": "object", "properties": {
+             "role": {"type": "string",
+                      "enum": ["small", "medium", "heavy", "code", "osint"]},
+             "prompt": {"type": "string"},
+             "system": {"type": "string"},
+             "max_tokens": {"type": "integer", "minimum": 256, "maximum": 8000}},
+          "required": ["role", "prompt"]}, _model_run),
         ("astra_delegate_job",
          "Gib eine schwere HomeLab-/Analyse-Aufgabe an das große Modell (Claude) ab, statt sie "
          "selbst zu lösen. goal=Ziel im Klartext, hosts=Liste erlaubter Hosts (Rechte-Umschlag!), "
@@ -1104,6 +1142,11 @@ def register_admin_tools() -> None:
         intents = ["status", "list"] if "list" in name or "status" in name else ["control"] if safety == "mutation" else ["status"]
         register(Tool(name=name, description=desc, parameters=params, handler=handler,
                       owner_only=True, source="core", safety=safety, intents=intents))
+
+    model_tool = REGISTRY.get("astra_model_run")
+    if model_tool:
+        model_tool.safety = "external_send"
+        model_tool.intents = ["research", "control"]
 
     register(Tool(
         name="astra_send_message",

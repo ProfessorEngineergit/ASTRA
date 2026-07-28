@@ -46,9 +46,12 @@ class Provider:
     base_url: str = ""   # leer = offizieller OpenAI-Endpoint
     api_key: str = ""
     tools: bool = True   # unterstützt OpenAI-Tool-Calling in diesem Loop?
+    requires_key: bool = False
 
     @property
     def configured(self) -> bool:
+        if self.requires_key or self.kind == "anthropic":
+            return bool(self.api_key)
         return bool(self.api_key) or self.kind == "openai_compat" and bool(self.base_url)
 
 
@@ -59,12 +62,12 @@ class ModelError(RuntimeError):
 def _builtin_providers() -> dict[str, Provider]:
     s = get_settings()
     return {
-        "openai": Provider("openai", "openai_compat", "", s.openai_api_key, True),
+        "openai": Provider("openai", "openai_compat", "", s.openai_api_key, True, True),
         "openrouter": Provider("openrouter", "openai_compat", s.openrouter_base_url,
-                               s.openrouter_api_key, True),
+                               s.openrouter_api_key, True, True),
         # Ollama spricht seit v0.2 den OpenAI-kompatiblen /v1-Pfad; der Key ist ein Dummy.
-        "ollama": Provider("ollama", "openai_compat", s.ollama_base_url, "ollama", True),
-        "anthropic": Provider("anthropic", "anthropic", "", s.anthropic_api_key, False),
+        "ollama": Provider("ollama", "openai_compat", s.ollama_base_url, "ollama", True, False),
+        "anthropic": Provider("anthropic", "anthropic", "", s.anthropic_api_key, False, True),
     }
 
 
@@ -86,6 +89,24 @@ def _default_roles() -> dict[str, dict[str, str]]:
 # Live aus den Web-Einstellungen gesetzt (app_settings["models"]).
 _PROVIDER_OVERRIDES: dict[str, dict] = {}
 _ROLE_OVERRIDES: dict[str, dict[str, str]] = {}
+_SECRET_PREFIX = "fernet:"
+
+
+def protect_api_key(value: str) -> str:
+    """Encrypt a provider key before it is persisted in the general settings JSON."""
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    from .config_store import get_config_store
+    return _SECRET_PREFIX + get_config_store().encrypt(value)
+
+
+def _reveal_api_key(value: Any) -> str:
+    raw = str(value or "")
+    if not raw.startswith(_SECRET_PREFIX):
+        return raw  # backward compatibility for existing installs
+    from .config_store import get_config_store
+    return get_config_store().decrypt(raw[len(_SECRET_PREFIX):])
 
 
 def set_model_config(cfg: dict | None) -> None:
@@ -95,6 +116,9 @@ def set_model_config(cfg: dict | None) -> None:
     _PROVIDER_OVERRIDES = dict(cfg.get("providers") or {})
     _ROLE_OVERRIDES = {k: dict(v) for k, v in (cfg.get("roles") or {}).items()
                        if isinstance(v, dict)}
+    gateway = globals().get("_gateway")
+    if gateway is not None:
+        gateway._clients.clear()
 
 
 def providers() -> dict[str, Provider]:
@@ -107,10 +131,29 @@ def providers() -> dict[str, Provider]:
             name=name,
             kind=str(raw.get("kind") or (base.kind if base else "openai_compat")),
             base_url=str(raw.get("base_url") or (base.base_url if base else "")),
-            api_key=str(raw.get("api_key") or (base.api_key if base else "")),
+            api_key=_reveal_api_key(raw.get("api_key")) or (base.api_key if base else ""),
             tools=bool(raw.get("tools", base.tools if base else True)),
+            requires_key=bool(raw.get("requires_key", base.requires_key if base else False)),
         )
     return out
+
+
+def model_config_snapshot() -> dict[str, Any]:
+    """Secret-free data for the model picker and ASTRA's own status output."""
+    role_rows = {**_default_roles(), **_ROLE_OVERRIDES}
+    return {
+        "roles": {role: dict(role_rows.get(role) or {}) for role in ROLES},
+        "providers": {
+            name: {
+                "kind": provider.kind,
+                "base_url": provider.base_url,
+                "tools": provider.tools,
+                "requires_key": provider.requires_key,
+                "configured": provider.configured,
+            }
+            for name, provider in providers().items()
+        },
+    }
 
 
 def role_target(role: str) -> tuple[Provider, str]:
