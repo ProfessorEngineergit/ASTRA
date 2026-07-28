@@ -833,12 +833,20 @@ async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.requir
     test_script = '' if soon else f"""
     <script>
       document.getElementById('testbtn').onclick=async()=>{{
-        const out=document.getElementById('testresult'); out.textContent='Teste…';
+        const btn=document.getElementById('testbtn');
+        const out=document.getElementById('testresult');
+        const limit=20000; const controller=new AbortController();
+        const timer=setTimeout(()=>controller.abort(),limit);
+        btn.disabled=true; out.textContent='Teste… (max. 20 s)';
         const fd=new FormData(document.getElementById('plugin-config-form'));
         fd.set('installation_id','{esc(active_inst.installation_id)}');
-        const r=await fetch('/admin/plugin/{esc(slug)}/test',{{method:'POST',body:fd}});
-        const d=await r.json();
-        out.textContent=(d.state==='ok'?'OK · ':d.state==='error'?'FEHLER · ':'— ')+d.message;
+        try {{
+          const r=await fetch('/admin/plugin/{esc(slug)}/test',{{method:'POST',body:fd,signal:controller.signal}});
+          const d=await r.json();
+          out.textContent=(d.state==='ok'?'OK · ':d.state==='error'?'FEHLER · ':'— ')+d.message;
+        }} catch (err) {{
+          out.textContent=err.name==='AbortError'?'FEHLER · Verbindungstest nach 20 s abgebrochen.':'FEHLER · '+err;
+        }} finally {{ clearTimeout(timer); btn.disabled=false; }}
       }};
     </script>"""
 
@@ -981,9 +989,16 @@ async def plugin_test(slug: str, request: Request, _: bool = Depends(auth.requir
             if sub not in ("", SECRET_SENTINEL):
                 cfg[f.key] = f.coerce(sub)
     cfg["__enabled"] = True  # test connectivity regardless of toggle
+    # A plugin must never hold the admin UI open indefinitely. OSINT gets the
+    # shorter limit because a dead Tor sidecar otherwise looks like a frozen page.
+    test_timeout = 15.0 if slug == "osint" else 30.0
     try:
-        status = await cls(cfg).health_check()
+        status = await asyncio.wait_for(cls(cfg).health_check(), timeout=test_timeout)
         return JSONResponse({"state": status.state.value, "message": status.message})
+    except asyncio.TimeoutError:
+        return JSONResponse({"state": "error",
+                             "message": f"Verbindungstest nach {int(test_timeout)} s abgebrochen. "
+                                        "Erreichbarkeit und Konfiguration prüfen."})
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"state": "error", "message": str(e)})
 
@@ -5179,16 +5194,30 @@ function renderResult(out, payload) {{
 document.querySelectorAll('.osint-form').forEach(f => {{
   f.addEventListener('submit', async (e) => {{
     e.preventDefault();
+    const submit = f.querySelector('button[type=submit]');
     const out = f.parentElement.querySelector('.osint-out');
+    const limit = 25000; const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), limit);
+    const started = Date.now();
+    const ticker = setInterval(() => {{
+      out.textContent = 'Abfrage läuft über Tor… ' + Math.floor((Date.now()-started)/1000) + ' s';
+    }}, 1000);
+    if (submit) submit.disabled = true;
     out.hidden = false; out.classList.add('loading');
-    out.textContent = 'Abfrage läuft über Tor…';
+    out.textContent = 'Abfrage läuft über Tor… 0 s (max. 25 s)';
     const fd = new FormData(f); fd.append('tool', f.dataset.tool);
     try {{
-      const r = await fetch('/admin/osint/run', {{method:'POST', body:fd}});
+      const r = await fetch('/admin/osint/run', {{method:'POST', body:fd, signal:controller.signal}});
       const j = await r.json();
       renderResult(out, j);
-    }} catch (err) {{ out.textContent = 'Fehler: ' + err; }}
-    finally {{ out.classList.remove('loading'); }}
+    }} catch (err) {{
+      out.textContent = err.name === 'AbortError'
+        ? 'Timeout nach 25 s. Tor-Sidecar und Plugin-Konfiguration prüfen.'
+        : 'Fehler: ' + err;
+    }} finally {{
+      clearTimeout(timer); clearInterval(ticker); out.classList.remove('loading');
+      if (submit) submit.disabled = false;
+    }}
   }});
 }});
 </script>"""
@@ -5241,8 +5270,14 @@ async def osint_run(request: Request, _: bool = Depends(auth.require_admin)):
                     args[k] = float(form.get(k))
                 except (TypeError, ValueError):
                     pass
-    raw = await dispatch(tool, args, ToolContext(
-        thread_id="web-osint", channel="web", contact={"id": "owner"}, is_owner=True))
+    try:
+        raw = await asyncio.wait_for(dispatch(tool, args, ToolContext(
+            thread_id="web-osint", channel="web", contact={"id": "owner"}, is_owner=True)),
+            timeout=25.0)
+    except asyncio.TimeoutError:
+        return JSONResponse({"ok": False,
+                             "summary": "Recon-Timeout nach 25 s. Tor-Sidecar und Plugin-Konfiguration prüfen.",
+                             "data": None, "warnings": []}, status_code=504)
     ok, summary, payload = result_summary(raw)
     data = payload.get("data") if isinstance(payload, dict) else None
     warnings = payload.get("warnings") if isinstance(payload, dict) else []

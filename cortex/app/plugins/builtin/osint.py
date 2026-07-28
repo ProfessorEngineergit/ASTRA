@@ -68,7 +68,8 @@ class OsintPlugin(Plugin):
                     secret=True, help="Für Selbst-Exposition (öffentliche Daten über deine IP)"),
         ConfigField("hibp_key", "HaveIBeenPwned API-Key", FieldType.PASSWORD, required=False,
                     secret=True, help="Für Breach-Check deiner eigenen Mailadressen"),
-        ConfigField("timeout", "Timeout (Sekunden)", FieldType.NUMBER, default=45),
+        ConfigField("timeout", "Timeout (Sekunden)", FieldType.NUMBER, default=20,
+                    help="Maximal 25 Sekunden pro externer Anfrage."),
     ]
 
     # Häufige „interessante" Ports für den Netz-Audit (Drucker, Kamera, Web, SSH …).
@@ -129,10 +130,18 @@ class OsintPlugin(Plugin):
     def _proxy(self) -> str | None:
         return str(self.get("tor_proxy") or "").strip() or None
 
-    def _client(self) -> httpx.AsyncClient:
-        """HTTP-Client, dessen Verkehr durch Tor läuft."""
+    def _request_timeout(self, requested: float | None = None, *, ceiling: float = 25.0) -> float:
+        """Return a bounded timeout so a broken Tor sidecar cannot hang a request."""
+        try:
+            value = float(requested if requested is not None else (self.get("timeout") or 20))
+        except (TypeError, ValueError):
+            value = 20.0
+        return max(3.0, min(float(ceiling), value))
+
+    def _client(self, timeout: float | None = None) -> httpx.AsyncClient:
+        """HTTP-Client, dessen Verkehr durch Tor läuft, mit harter Obergrenze."""
         proxy = self._proxy()
-        kwargs: dict[str, Any] = {"timeout": float(self.get("timeout") or 45),
+        kwargs: dict[str, Any] = {"timeout": self._request_timeout(timeout),
                                   "follow_redirects": True,
                                   "headers": {"User-Agent": "Mozilla/5.0"}}
         if proxy:
@@ -144,7 +153,7 @@ class OsintPlugin(Plugin):
         if base.state.value != "ok":
             return base
         try:
-            async with self._client() as c:
+            async with self._client(10.0) as c:
                 r = await c.get(_TOR_CHECK)
                 r.raise_for_status()
                 data = r.json()
