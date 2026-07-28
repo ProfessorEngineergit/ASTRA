@@ -694,6 +694,9 @@ def test_osint_tab_renders_and_run_endpoint_gates_tool(memdb):
 
     r = c.get("/admin/osint")
     assert r.status_code == 200
+    assert "connect-src 'self'" in r.headers["content-security-policy"]
+    assert r.headers["referrer-policy"] == "no-referrer"
+    assert "fonts.googleapis.com" not in r.text
     csrf = c.cookies.get(auth.CSRF_COOKIE)
     location = c.post("/admin/osint/location", data={
         "csrf": csrf, "lat": "50.123456", "lon": "8.654321",
@@ -705,6 +708,9 @@ def test_osint_tab_renders_and_run_endpoint_gates_tool(memdb):
     assert "Recon" in r.text and "Kameras in der Nähe" in r.text
     assert "Drucker in der Nähe" in r.text
     assert "OSINT-Recherche" in r.text
+    assert "TOR KILL-SWITCH" in r.text
+    assert "externe Browser-Links" in r.text
+    assert "row.shodan_url" not in r.text
     assert "Netz-Audit" not in r.text
     assert "Breach-Check" not in r.text
     # Plugin ist im Test aus → Hinweis-Banner statt einer scheinbar aktiven Suche.

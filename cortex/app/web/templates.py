@@ -320,7 +320,7 @@ def _theme_head() -> str:
     return "<style>" + "".join(rules) + "</style>"
 
 
-def _font_head() -> str:
+def _font_head(*, external_assets: bool = True) -> str:
     """<link>/@font-face + the --ui-font variable for the active font."""
     locals_ = local_fonts()
     faces = ""
@@ -333,7 +333,9 @@ def _font_head() -> str:
     if active in FONTS:
         _disp, family, query = FONTS[active]
         link = (f'<link href="https://fonts.googleapis.com/css2?family={query}&display=swap" '
-                f'rel="stylesheet">') if query else ""
+                f'rel="stylesheet">') if query and external_assets else ""
+        if query and not external_assets:
+            family = "system-ui, -apple-system, sans-serif"
     else:
         family = f"'{active}'"
         link = ""
@@ -1026,7 +1028,14 @@ details.adv[open] > summary { margin-bottom: 12px; }
 """
 
 
-def page(title: str, body: str, *, nav: bool = True, active: str = "") -> str:
+def page(
+    title: str,
+    body: str,
+    *,
+    nav: bool = True,
+    active: str = "",
+    external_assets: bool = True,
+) -> str:
     def navlink(href: str, label: str, key: str) -> str:
         cls = " active" if active == key else ""
         return f'<a href="{href}" class="navlink{cls}">{label}</a>'
@@ -1047,12 +1056,16 @@ def page(title: str, body: str, *, nav: bool = True, active: str = "") -> str:
             '<button class="btn ghost sm" type="submit">Logout</button></form>'
             '</nav>'
         )
+    preconnect = (
+        '<link rel="preconnect" href="https://fonts.googleapis.com">'
+        '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+        if external_assets else ""
+    )
     return f"""<!doctype html><html lang="de" data-astra-theme="{esc(_ACTIVE_THEME)}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{esc(title)} · ASTRA</title>{favicon_link()}
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-{_font_head()}
+{preconnect}
+{_font_head(external_assets=external_assets)}
 {_theme_head()}
 <style>{_CSS}</style></head><body>
 <header class="topbar"><a class="brand" href="/admin"><img src="{LOGO_LONG}" alt="ASTRA"></a>{navhtml}</header>

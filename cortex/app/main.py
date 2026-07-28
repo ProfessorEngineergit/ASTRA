@@ -310,6 +310,10 @@ async def lifespan(app: FastAPI):
         level=s.log_level.upper(),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    # HTTPX request logs contain full URLs. Several APIs carry credentials in
+    # query parameters, so suppress request-line logging even in debug mode.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     log.info("ASTRA cortex starting up…")
     knowledge.ensure_seeded()

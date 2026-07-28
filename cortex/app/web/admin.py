@@ -5064,9 +5064,9 @@ async def brain_add_person(request: Request, _: bool = Depends(auth.require_admi
 # the day-to-day Recon surface.
 _OSINT_CARDS = [
     ("osint_nearby_exposure", "Kameras in der Nähe",
-     "Passive Shodan-Metadaten. Kein Feed, kein Gerätezugriff.", "", "", "cameras"),
+     "Passive Shodan-Metadaten. Kein Feed, kein Direktlink.", "", "", "cameras"),
     ("osint_nearby_exposure", "Drucker in der Nähe",
-     "Indexierte Druckdienste im Radius, ausschließlich als Shodan-Verweis.",
+     "Indexierte Druckdienste im Radius, ohne Verbindung zum Gerät.",
      "", "", "printers"),
     ("osint_search", "OSINT-Recherche",
      "Offene Quellen über deine SearXNG-Instanz und Tor durchsuchen.",
@@ -5130,15 +5130,16 @@ async def osint_page(request: Request, _: bool = Depends(auth.require_admin)):
 <h1>Recon</h1>
 <p>Shodan-Metadaten in deiner Nähe und OSINT-Recherche über Tor. ASTRA verbindet
 sich niemals mit einem gefundenen Gerät.</p></div>
-<div class="recon-policy"><b>Nur Metadaten</b><span>Nur eigene oder ausdrücklich
-autorisierte Systeme weiter prüfen.</span></div>
+<div class="recon-policy"><b>TOR KILL-SWITCH</b><span>Kein verifizierter Tor-Ausgang,
+keine externe Anfrage.</span></div>
 </section>
 <div class="recon-location"><span class="recon-location-dot"></span>
   <span id="osint-loc">Standort: {esc(initial_city) if initial_city else "nicht gesetzt"}</span>
   <button class="btn ghost sm" type="button" id="osint-locate">Aktuellen Standort nutzen</button>
 </div>
-<div class="recon-privacy">Shodan und Recherche werden serverseitig über den konfigurierten
-Tor-Proxy abgefragt. Links öffnen die Shodan-Hostseite in deinem Browser – niemals direkt den Dienst.</div>
+<div class="recon-privacy">Fail-closed: Shodan, DNS und Recherche laufen serverseitig über
+den verifizierten Tor-Proxy. Es gibt weder direkte Fallbacks noch externe Browser-Links.
+Der Standort wird vor Shodan auf ungefähr einen Kilometer vergröbert.</div>
 {banner}
 <div class="grid recon-grid">
 {cards}
@@ -5179,14 +5180,13 @@ function renderResult(out, payload) {{
   }}
   appendText(out, 'div', rows.length + ' Treffer · ausschließlich Metadaten', 'recon-result-count');
   rows.forEach(row => {{
-    const item = document.createElement('a');
-    item.className = 'recon-result'; item.href = row.shodan_url || row.url || '#';
-    item.target = '_blank'; item.rel = 'noopener';
+    const item = document.createElement('div');
+    item.className = 'recon-result';
     const title = row.product || row.title || row.ip || 'Shodan-Treffer';
     appendText(item, 'b', title);
     const where = [row.city, row.distance_km != null ? row.distance_km + ' km' : '',
       row.org].filter(Boolean).join(' · ');
-    appendText(item, 'span', where || row.content || 'Öffentliche Quelle');
+    appendText(item, 'span', where || row.content || row.source || 'Öffentliche Quelle');
     if (row.port) appendText(item, 'small', (row.transport || 'tcp') + '/' + row.port);
     out.appendChild(item);
   }});
@@ -5221,7 +5221,17 @@ document.querySelectorAll('.osint-form').forEach(f => {{
   }});
 }});
 </script>"""
-    return _html_with_csrf(page("Recon", body, active="osint"), token)
+    response = _html_with_csrf(
+        page("Recon", body, active="osint", external_assets=False), token)
+    # The Recon document itself may contact only ASTRA. This also prevents a
+    # future theme/icon change from silently adding a browser-side egress.
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; connect-src 'self'; img-src 'self' data:; "
+        "font-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'")
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "geolocation=(self)"
+    return response
 
 
 @router.post("/admin/osint/location")

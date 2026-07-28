@@ -7,6 +7,9 @@ import sys
 import types
 from datetime import time
 
+import httpx
+import pytest
+
 from app import tools
 from app.config_store import get_config_store
 from app.plugins import extended_catalog
@@ -112,22 +115,76 @@ def test_osint_nearby_is_passive_shodan_metadata(monkeypatch):
         "tor_proxy": "socks5://tor:9050",
         "shodan_key": "secret",
     })
+    async def tor_verified(**_kwargs):
+        return True, "Tor-Kill-Switch aktiv"
+
+    monkeypatch.setattr(plugin, "_verify_tor", tor_verified)
     monkeypatch.setattr(plugin, "_client", lambda: FakeClient())
     tool = next(t for t in plugin.tools() if t.name == "osint_nearby_exposure")
     ctx = ToolContext(thread_id="web-owner:test", channel="web",
                       contact={"id": "owner"}, is_owner=True)
 
     result = asyncio.run(tool.handler({
-        "category": "cameras", "lat": 50.11, "lon": 8.68, "radius": 15,
+        "category": "cameras", "lat": 50.114321, "lon": 8.684321, "radius": 15,
     }, ctx))
     payload = _payload(result)
 
     assert payload["ok"] is True
-    assert payload["data"]["results"][0]["shodan_url"] == (
-        "https://www.shodan.io/host/203.0.113.10")
+    assert payload["data"]["results"][0]["ip"] == "203.0.113.10"
+    assert "shodan_url" not in payload["data"]["results"][0]
     assert "feed" not in payload["data"]["results"][0]
     assert [call[0] for call in calls] == ["https://api.shodan.io/shodan/host/search"]
-    assert "geo:50.11000,8.68000,15" in calls[0][1]["params"]["query"]
+    assert "geo:50.11,8.68,15" in calls[0][1]["params"]["query"]
+
+
+def test_osint_client_fails_closed_without_valid_tor_proxy():
+    for proxy in ("", "http://proxy:8080", "socks5://user:secret@tor:9050"):
+        plugin = OsintPlugin({"__enabled": True, "tor_proxy": proxy})
+        with pytest.raises(RuntimeError, match="Kill-Switch"):
+            plugin._client()
+
+
+def test_osint_http_error_never_exposes_secret_url():
+    request = httpx.Request(
+        "GET", "https://api.shodan.io/shodan/host/search?key=visible-secret&query=test")
+    response = httpx.Response(403, request=request)
+    exc = httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    message = OsintPlugin._safe_http_error("Shodan", exc)
+
+    assert "403" in message
+    assert "visible-secret" not in message
+    assert "api.shodan.io" not in message
+    assert "direkten Fallback" in message
+
+
+def test_osint_public_scan_uses_tor_probe_only(monkeypatch):
+    plugin = OsintPlugin({
+        "__enabled": True,
+        "tor_proxy": "socks5://tor:9050",
+        "scan_targets": "8.8.8.8",
+    })
+    calls = []
+
+    async def tor_verified(**_kwargs):
+        return True, "Tor-Kill-Switch aktiv"
+
+    async def tor_probe(host, port, timeout):
+        calls.append((host, port, timeout))
+        return True
+
+    async def direct_probe(*_args, **_kwargs):
+        raise AssertionError("public target must never use direct TCP")
+
+    monkeypatch.setattr(plugin, "_verify_tor", tor_verified)
+    monkeypatch.setattr(plugin, "_probe_via_tor", tor_probe)
+    monkeypatch.setattr(plugin, "_probe", direct_probe)
+
+    result = asyncio.run(plugin.scan("8.8.8.8", ports=[443]))
+
+    assert result["ok"] is True
+    assert result["found"]["8.8.8.8"][0]["port"] == 443
+    assert calls and calls[0][:2] == ("8.8.8.8", 443)
 
 
 def test_osint_location_falls_back_to_browser_saved_setting(memdb):

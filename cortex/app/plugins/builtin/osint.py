@@ -14,15 +14,19 @@ Was dieses Plugin tut — und was ausdrücklich nicht:
 Die Ziel-Prüfung (`netguard`) erzwingt zusätzlich, dass nie nach innen gezeigt wird
 — weder ins Heim-LAN noch auf Container dieses Stacks.
 
-„Untrackable" ist best effort: Tor verschleiert die Herkunft, garantiert aber keine
-Anonymität. Das steht auch so in der Statusmeldung.
+Der Anonymitätsmodus arbeitet fail-closed: kein verifizierter Tor-Ausgang, keine
+externe Recherche. Es gibt keinen stillen direkten Fallback.
 """
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import math
+import struct
+import time
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -35,6 +39,7 @@ log = logging.getLogger("astra.plugin.osint")
 
 _TOR_CHECK = "https://check.torproject.org/api/ip"
 _WINDY_WEBCAMS = "https://api.windy.com/webcams/api/v3/webcams"
+_TOR_VERIFY_TTL = 60.0
 
 
 class OsintPlugin(Plugin):
@@ -91,7 +96,6 @@ class OsintPlugin(Plugin):
 
     def _public_target_allowed(self, target: str) -> bool:
         """Public target is permitted only when it is inside the explicit target list."""
-        import ipaddress
         try:
             target_net = ipaddress.ip_network(target.strip(), strict=False)
         except ValueError:
@@ -128,7 +132,20 @@ class OsintPlugin(Plugin):
         return {"ok": False, "reason": "kein Home-Assistant-Standort verfügbar"}
 
     def _proxy(self) -> str | None:
-        return str(self.get("tor_proxy") or "").strip() or None
+        raw = str(self.get("tor_proxy") or "").strip()
+        if not raw:
+            return None
+        try:
+            parsed = urlparse(raw)
+            port = parsed.port
+        except ValueError:
+            return None
+        # Fail closed: OSINT accepts only an unauthenticated SOCKS5 endpoint.
+        # HTTP proxies and URLs containing credentials are rejected.
+        if (parsed.scheme != "socks5" or not parsed.hostname
+                or not port or parsed.username or parsed.password):
+            return None
+        return raw
 
     def _request_timeout(self, requested: float | None = None, *, ceiling: float = 25.0) -> float:
         """Return a bounded timeout so a broken Tor sidecar cannot hang a request."""
@@ -139,50 +156,91 @@ class OsintPlugin(Plugin):
         return max(3.0, min(float(ceiling), value))
 
     def _client(self, timeout: float | None = None) -> httpx.AsyncClient:
-        """HTTP-Client, dessen Verkehr durch Tor läuft, mit harter Obergrenze."""
+        """HTTP client with a mandatory SOCKS5 proxy and a hard timeout."""
         proxy = self._proxy()
+        if not proxy:
+            raise RuntimeError(
+                "Tor-Kill-Switch: kein gültiger SOCKS5-Proxy konfiguriert. "
+                "Direkte Verbindung verweigert.")
         kwargs: dict[str, Any] = {"timeout": self._request_timeout(timeout),
                                   "follow_redirects": True,
-                                  "headers": {"User-Agent": "Mozilla/5.0"}}
-        if proxy:
-            kwargs["proxy"] = proxy
+                                  "headers": {"User-Agent": "ASTRA-Recon/1.0"},
+                                  "proxy": proxy}
         return httpx.AsyncClient(**kwargs)
+
+    @staticmethod
+    def _safe_http_error(service: str, exc: Exception) -> str:
+        """Return an actionable error without URLs, query strings or secrets."""
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code
+            if service == "Shodan" and status == 403:
+                return (
+                    "Shodan verweigert die Suche (403). Der Tor-Ausgang kann blockiert "
+                    "sein oder der API-Tarif erlaubt diese Suchfilter nicht. "
+                    "Der Anonymitäts-Kill-Switch verhindert einen direkten Fallback.")
+            if status == 401:
+                return f"{service}: Zugangsdaten abgelehnt (401)."
+            if status == 429:
+                return f"{service}: Rate-Limit erreicht (429)."
+            return f"{service} antwortet mit HTTP {status}."
+        if isinstance(exc, httpx.TimeoutException):
+            return f"{service} über Tor: Timeout."
+        if isinstance(exc, (httpx.ConnectError, httpx.ProxyError)):
+            return f"{service} über Tor nicht erreichbar. Tor-Sidecar prüfen."
+        return f"{service} über Tor fehlgeschlagen ({type(exc).__name__})."
+
+    async def _verify_tor(self, *, force: bool = False) -> tuple[bool, str]:
+        """Verify the current egress and cache only successful checks briefly."""
+        now = time.monotonic()
+        if not force and now < float(getattr(self, "_tor_verified_until", 0.0)):
+            exit_ip = str(getattr(self, "_tor_exit_ip", "?"))
+            return True, f"Tor-Kill-Switch aktiv · Exit-IP {exit_ip}"
+        try:
+            async with self._client(8.0) as client:
+                response = await client.get(_TOR_CHECK)
+                response.raise_for_status()
+                data = response.json()
+        except Exception as exc:  # noqa: BLE001
+            return False, self._safe_http_error("Tor-Prüfung", exc)
+        if not data.get("IsTor"):
+            return False, "Tor-Prüfung fehlgeschlagen. Direkte Verbindung verweigert."
+        self._tor_exit_ip = str(data.get("IP") or "?")
+        self._tor_verified_until = now + _TOR_VERIFY_TTL
+        return True, f"Tor-Kill-Switch aktiv · Exit-IP {self._tor_exit_ip}"
 
     async def health_check(self) -> HealthStatus:
         base = await super().health_check()
         if base.state.value != "ok":
             return base
-        try:
-            async with self._client(10.0) as c:
-                r = await c.get(_TOR_CHECK)
-                r.raise_for_status()
-                data = r.json()
-        except Exception as e:  # noqa: BLE001
-            return HealthStatus.error(
-                f"Tor nicht erreichbar ({e}). Starte im ASTRA-Verzeichnis "
-                "'docker compose up -d tor' und prüfe 'docker compose ps tor'.")
-        if data.get("IsTor"):
+        ok, message = await self._verify_tor(force=True)
+        if ok:
             return HealthStatus.ok(
-                f"Ausgang über Tor (Exit-IP {data.get('IP', '?')}). "
-                "Hinweis: verschleiert die Herkunft, garantiert keine Anonymität.")
+                f"{message}. Fail-closed: direkte Fallbacks und externe Browser-Links "
+                "sind gesperrt.")
         return HealthStatus.error(
-            f"Verkehr läuft NICHT über Tor (IP {data.get('IP', '?')}) — "
-            "ich recherchiere so nicht.")
+            f"{message} Starte 'docker compose up -d tor' und prüfe "
+            "'docker compose ps tor'.")
 
     # ── Abrufe ───────────────────────────────────────────────────────────────
     async def fetch(self, url: str) -> dict:
         """Eine öffentliche Seite über Tor holen (Text). Prüft das Ziel vorher."""
-        ok, reason = netguard.check_url(url)
+        # Do not let the host resolver see research domains. Literal/internal
+        # targets are still rejected here; hostname resolution happens at Tor.
+        ok, reason = netguard.check_url(url, resolve=False)
         if not ok:
             return {"ok": False, "text": "", "reason": reason}
+        tor_ok, tor_message = await self._verify_tor()
+        if not tor_ok:
+            return {"ok": False, "text": "", "reason": tor_message}
         try:
             async with self._client() as c:
                 r = await c.get(url)
                 r.raise_for_status()
                 return {"ok": True, "text": r.text, "status": r.status_code,
                         "content_type": r.headers.get("content-type", "")}
-        except Exception as e:  # noqa: BLE001
-            return {"ok": False, "text": "", "reason": str(e)}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "text": "",
+                    "reason": self._safe_http_error("Abruf", exc)}
 
     # ── Autorisierter Netz-Audit (nur eigene/freigegebene Netze) ─────────────
     async def _probe(self, host: str, port: int, timeout: float) -> bool:
@@ -199,14 +257,63 @@ class OsintPlugin(Plugin):
         except Exception:  # noqa: BLE001
             return False
 
+    async def _probe_via_tor(self, host: str, port: int, timeout: float) -> bool:
+        """TCP connect through the configured Tor SOCKS5 proxy (no direct fallback)."""
+        parsed = urlparse(self._proxy() or "")
+        if not parsed.hostname:
+            return False
+        writer = None
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(parsed.hostname, parsed.port or 1080),
+                timeout=timeout)
+            writer.write(b"\x05\x01\x00")
+            await writer.drain()
+            if await asyncio.wait_for(reader.readexactly(2), timeout) != b"\x05\x00":
+                return False
+            ip = ipaddress.ip_address(host)
+            if ip.version == 4:
+                address = b"\x01" + ip.packed
+            else:
+                address = b"\x04" + ip.packed
+            writer.write(b"\x05\x01\x00" + address + struct.pack("!H", port))
+            await writer.drain()
+            reply = await asyncio.wait_for(reader.readexactly(4), timeout)
+            if reply[0] != 5 or reply[1] != 0:
+                return False
+            if reply[3] == 1:
+                await asyncio.wait_for(reader.readexactly(4), timeout)
+            elif reply[3] == 4:
+                await asyncio.wait_for(reader.readexactly(16), timeout)
+            elif reply[3] == 3:
+                length = (await asyncio.wait_for(reader.readexactly(1), timeout))[0]
+                await asyncio.wait_for(reader.readexactly(length), timeout)
+            else:
+                return False
+            await asyncio.wait_for(reader.readexactly(2), timeout)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+        finally:
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:  # noqa: BLE001
+                    pass
+
     async def scan(self, target: str, *, ports: list[int] | None = None,
                    max_hosts: int = 64) -> dict:
         """TCP-Connect-Audit eines freigegebenen Netzes. Prüft die Autorisierung."""
-        import ipaddress
+        public_target = self._public_target_allowed(target)
         ok, reason = netguard.scan_target_ok(
-            target, self._scan_allowlist(), allow_public=self._public_target_allowed(target))
+            target, self._scan_allowlist(), allow_public=public_target)
         if not ok:
             return {"ok": False, "reason": reason}
+        if public_target:
+            tor_ok, tor_message = await self._verify_tor()
+            if not tor_ok:
+                return {"ok": False, "reason": tor_message}
         ports = ports or list(self._AUDIT_PORTS)
         try:
             net = ipaddress.ip_network(target.strip(), strict=False)
@@ -222,7 +329,8 @@ class OsintPlugin(Plugin):
 
         async def probe_one(host: str, port: int):
             async with sem:
-                return host, port, await self._probe(host, port, timeout)
+                probe = self._probe_via_tor if public_target else self._probe
+                return host, port, await probe(host, port, timeout)
 
         results = await asyncio.gather(*(probe_one(h, p) for h in hosts for p in ports))
         found: dict[str, list[dict]] = {}
@@ -276,11 +384,23 @@ class OsintPlugin(Plugin):
                 return tool_result(ok=False, source=self.slug,
                                    summary="Kein Shodan-Key hinterlegt.")
             ip = str(args.get("ip") or "").strip()
+            if not ip:
+                return tool_result(
+                    ok=False, source=self.slug,
+                    summary="Öffentliche IP ausdrücklich angeben. ASTRA ermittelt sie nicht "
+                            "über eine direkte Verbindung; über Tor wäre nur die Exit-IP sichtbar.")
+            try:
+                parsed_ip = ipaddress.ip_address(ip)
+                if not parsed_ip.is_global:
+                    raise ValueError
+            except ValueError:
+                return tool_result(ok=False, source=self.slug,
+                                   summary="Eine gültige öffentliche IP angeben.")
+            tor_ok, tor_message = await self._verify_tor()
+            if not tor_ok:
+                return tool_result(ok=False, source=self.slug, summary=tor_message)
             try:
                 async with self._client() as c:
-                    if not ip:
-                        rr = await c.get("https://api.ipify.org", params={"format": "json"})
-                        ip = rr.json().get("ip", "")
                     r = await c.get(f"https://api.shodan.io/shodan/host/{ip}",
                                     params={"key": key})
                     if r.status_code == 404:
@@ -289,9 +409,9 @@ class OsintPlugin(Plugin):
                                                    "(gut — nichts öffentlich indexiert).")
                     r.raise_for_status()
                     data = r.json()
-            except Exception as e:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 return tool_result(ok=False, source=self.slug,
-                                   summary=f"Shodan-Abfrage fehlgeschlagen: {e}")
+                                   summary=self._safe_http_error("Shodan", exc))
             ports = data.get("ports") or []
             return tool_result(
                 ok=True, source=self.slug,
@@ -303,8 +423,8 @@ class OsintPlugin(Plugin):
         async def _nearby_exposure(args: dict, ctx: ToolContext) -> str:
             """Passive Shodan search around Bahrian's location.
 
-            Returns metadata plus Shodan host pages only. It never connects to the
-            indexed device and deliberately does not expose camera/player URLs.
+            Returns metadata only. It never connects to the indexed device and
+            deliberately does not expose camera/player/provider URLs.
             """
             if not self.enabled:
                 return tool_result(ok=False, source=self.slug, summary="OSINT ist deaktiviert.")
@@ -338,8 +458,14 @@ class OsintPlugin(Plugin):
                 if category == "cameras"
                 else "port:9100,631"
             )
-            query = f"{signature} geo:{lat:.5f},{lon:.5f},{radius}"
+            # Do not disclose the browser's metre-accurate position to Shodan.
+            # Two decimals are roughly kilometre precision at German latitudes.
+            query_lat, query_lon = round(lat, 2), round(lon, 2)
+            query = f"{signature} geo:{query_lat:.2f},{query_lon:.2f},{radius}"
             fields = "ip_str,port,product,org,hostnames,location,transport,timestamp"
+            tor_ok, tor_message = await self._verify_tor()
+            if not tor_ok:
+                return tool_result(ok=False, source=self.slug, summary=tor_message)
             try:
                 async with self._client() as client:
                     response = await client.get(
@@ -350,7 +476,7 @@ class OsintPlugin(Plugin):
                     payload = response.json()
             except Exception as exc:  # noqa: BLE001
                 return tool_result(ok=False, source=self.slug,
-                                   summary=f"Shodan-Suche über Tor fehlgeschlagen: {exc}")
+                                   summary=self._safe_http_error("Shodan", exc))
 
             rows = []
             for match in (payload.get("matches") or [])[:limit]:
@@ -378,7 +504,6 @@ class OsintPlugin(Plugin):
                     "country": location.get("country_name") or "",
                     "distance_km": distance,
                     "updated": match.get("timestamp") or "",
-                    "shodan_url": f"https://www.shodan.io/host/{ip}",
                 })
             label = "Kameras" if category == "cameras" else "Drucker"
             if not rows:
@@ -389,7 +514,7 @@ class OsintPlugin(Plugin):
             lines = [
                 f"• {row['product'] or label[:-1]} · {row['city'] or 'Ort unbekannt'}"
                 + (f" · {row['distance_km']} km" if row["distance_km"] is not None else "")
-                + f" · {row['shodan_url']}"
+                + f" · {row['transport']}/{row['port']} · IP {row['ip']}"
                 for row in rows
             ]
             return tool_result(
@@ -398,7 +523,10 @@ class OsintPlugin(Plugin):
                         + "\n".join(lines),
                 data={"category": category, "radius_km": radius,
                       "total": payload.get("total", len(rows)), "results": rows},
-                warnings=["Nur Systeme öffnen oder prüfen, für die du ausdrücklich autorisiert bist."])
+                warnings=[
+                    "Standort wurde vor der Shodan-Anfrage auf ca. 1 km vergröbert.",
+                    "Nur Systeme prüfen, für die du ausdrücklich autorisiert bist.",
+                ])
 
         async def _breach_check(args: dict, ctx: ToolContext) -> str:
             if not self.enabled:
@@ -409,6 +537,9 @@ class OsintPlugin(Plugin):
                 return tool_result(ok=False, source=self.slug, summary="Kein HIBP-Key hinterlegt.")
             if not account:
                 return tool_result(ok=False, source=self.slug, summary="Keine Mailadresse angegeben.")
+            tor_ok, tor_message = await self._verify_tor()
+            if not tor_ok:
+                return tool_result(ok=False, source=self.slug, summary=tor_message)
             try:
                 async with self._client() as c:
                     r = await c.get(
@@ -419,8 +550,9 @@ class OsintPlugin(Plugin):
                                            summary=f"{account}: in keinem bekannten Leak.")
                     r.raise_for_status()
                     breaches = [b.get("Name") for b in r.json()]
-            except Exception as e:  # noqa: BLE001
-                return tool_result(ok=False, source=self.slug, summary=f"HIBP fehlgeschlagen: {e}")
+            except Exception as exc:  # noqa: BLE001
+                return tool_result(ok=False, source=self.slug,
+                                   summary=self._safe_http_error("HIBP", exc))
             return tool_result(ok=True, source=self.slug,
                                summary=f"{account} in {len(breaches)} Leak(s): {', '.join(breaches)}",
                                data={"breaches": breaches})
@@ -432,14 +564,25 @@ class OsintPlugin(Plugin):
             domain = str(args.get("domain") or "").strip().lower()
             if not domain or "." not in domain:
                 return tool_result(ok=False, source=self.slug, summary="Gültige Domain angeben.")
-            import socket as _socket
             out: dict[str, Any] = {"domain": domain}
+            tor_ok, tor_message = await self._verify_tor()
+            if not tor_ok:
+                return tool_result(ok=False, source=self.slug, summary=tor_message)
             try:
-                out["a"] = sorted({info[4][0]
-                                   for info in _socket.getaddrinfo(domain, None)})
-            except OSError as e:
+                # DNS-over-HTTPS travels through the same verified Tor client.
+                # socket.getaddrinfo() here would leak the query to the host resolver.
+                async with self._client() as c:
+                    dns = await c.get("https://dns.google/resolve",
+                                      params={"name": domain, "type": "A"})
+                    dns.raise_for_status()
+                    answers = dns.json().get("Answer") or []
+                    out["a"] = sorted({
+                        str(answer.get("data") or "")
+                        for answer in answers if answer.get("type") == 1 and answer.get("data")
+                    })
+            except Exception as exc:  # noqa: BLE001
                 out["a"] = []
-                out["dns_error"] = str(e)
+                out["dns_error"] = self._safe_http_error("DNS-over-HTTPS", exc)
             try:
                 async with self._client() as c:
                     r = await c.get("https://crt.sh/", params={"q": domain, "output": "json"})
@@ -499,21 +642,31 @@ class OsintPlugin(Plugin):
                             "im Feld 'searx_url' ein — oder nutze osint_fetch mit einer "
                             "konkreten URL.")
             url = f"{searx.rstrip('/')}/search"
+            tor_ok, tor_message = await self._verify_tor()
+            if not tor_ok:
+                return tool_result(ok=False, source=self.slug, summary=tor_message)
             try:
                 async with self._client() as c:
                     r = await c.get(url, params={"q": query, "format": "json"})
                     r.raise_for_status()
                     results = (r.json().get("results") or [])[:8]
-            except Exception as e:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 return tool_result(ok=False, source=self.slug,
-                                   summary=f"Suche fehlgeschlagen: {e}")
+                                   summary=self._safe_http_error("Suche", exc))
             if not results:
                 return tool_result(ok=True, source=self.slug, summary="Keine Treffer.")
-            lines = [f"• {x.get('title', '')} — {x.get('url', '')}\n  {x.get('content', '')[:160]}"
-                     for x in results]
+            safe_results = [{
+                "title": str(x.get("title") or ""),
+                "source": urlparse(str(x.get("url") or "")).hostname or "",
+                "content": str(x.get("content") or "")[:500],
+            } for x in results]
+            lines = [f"• {x['title']} — {x['source']}\n  {x['content'][:160]}"
+                     for x in safe_results]
             return tool_result(ok=True, source=self.slug,
                                summary="Treffer (über Tor):\n" + "\n".join(lines),
-                               data={"results": results})
+                               data={"results": safe_results},
+                               warnings=["Keine externen Direktlinks ausgegeben. Inhalte mit "
+                                         "osint_fetch serverseitig über Tor abrufen."])
 
         async def _fetch(args: dict, ctx: ToolContext) -> str:
             if not self.enabled:
@@ -554,29 +707,37 @@ class OsintPlugin(Plugin):
             params: dict[str, Any] = {"limit": 8, "include": "location,urls,player"}
             if lat is not None:
                 params["nearby"] = f"{lat},{lon},{args.get('radius', 50)}"
+            tor_ok, tor_message = await self._verify_tor()
+            if not tor_ok:
+                return tool_result(ok=False, source=self.slug, summary=tor_message)
             try:
                 async with self._client() as c:
                     r = await c.get(_WINDY_WEBCAMS, params=params,
                                     headers={"x-windy-api-key": key})
                     r.raise_for_status()
                     cams = (r.json().get("webcams") or [])[:8]
-            except Exception as e:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 return tool_result(ok=False, source=self.slug,
-                                   summary=f"Webcam-Abfrage fehlgeschlagen: {e}")
+                                   summary=self._safe_http_error("Windy-Webcams", exc))
             if not cams:
                 return tool_result(ok=True, source=self.slug,
                                    summary=f"Keine öffentlichen Webcams gefunden"
                                            + (f" für {where}." if where else "."))
             lines = []
+            safe_cams = []
             for cam in cams:
                 loc = (cam.get("location") or {})
-                link = ((cam.get("urls") or {}).get("detail")
-                        or (cam.get("player") or {}).get("live", ""))
                 lines.append(f"• {cam.get('title', '?')} ({loc.get('city', '')}, "
-                             f"{loc.get('country', '')}) {link}")
+                             f"{loc.get('country', '')})")
+                safe_cams.append({
+                    "title": cam.get("title") or "",
+                    "location": {"city": loc.get("city") or "",
+                                 "country": loc.get("country") or ""},
+                })
             return tool_result(ok=True, source=self.slug,
                                summary="Öffentliche Webcams:\n" + "\n".join(lines),
-                               data={"webcams": cams})
+                               data={"webcams": safe_cams},
+                               warnings=["Keine direkten Player- oder Geräte-URLs ausgegeben."])
 
         async def _exit_ip(args: dict, ctx: ToolContext) -> str:
             hs = await self.health_check()
@@ -608,7 +769,7 @@ class OsintPlugin(Plugin):
                  safety="external_send", intents=["research"]),
             Tool(name="osint_nearby_exposure",
                  description="Finde über Shodan passiv indexierte Kameras oder Drucker in der "
-                             "Nähe. Liefert ausschließlich Metadaten und Shodan-Hostseiten; "
+                             "Nähe. Liefert ausschließlich Metadaten ohne externe Direktlinks; "
                              "verbindet sich nie mit Geräten und liefert keine Kamera-Feeds. "
                              "Nutze das nur für eigene oder ausdrücklich autorisierte Systeme.",
                  parameters={"type": "object", "properties": {
@@ -639,10 +800,11 @@ class OsintPlugin(Plugin):
                  safety="external_send", intents=["research"],
                  examples=["welche geräte in meinem netz haben offene ports"]),
             Tool(name="osint_self_exposure",
-                 description="Zeigt, was von DIR im Internet sichtbar ist (Shodan über deine "
-                             "öffentliche IP) — liest nur veröffentlichte Daten, scannt nichts.",
+                 description="Zeigt, was von einer ausdrücklich angegebenen eigenen öffentlichen "
+                             "IP bei Shodan sichtbar ist — liest nur veröffentlichte Daten.",
                  parameters={"type": "object", "properties": {
-                     "ip": {"type": "string", "description": "optional, sonst eigene IP"}}},
+                     "ip": {"type": "string", "description": "eigene öffentliche IP"}},
+                     "required": ["ip"]},
                  handler=_self_exposure, owner_only=True, source=self.slug,
                  safety="external_send", intents=["research", "status"]),
             Tool(name="osint_breach_check",

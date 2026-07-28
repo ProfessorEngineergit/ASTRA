@@ -17,6 +17,10 @@ networks:
   research:
     driver: bridge
     internal: true
+  # Tor gets a dedicated Internet-facing edge and is not attached to ASTRA's
+  # data plane (Postgres, Redis, messengers, Home Assistant).
+  tor_egress:
+    driver: bridge
 
 volumes:
   postgres_data:
@@ -92,7 +96,7 @@ services:
       SIGNAL_BASE_URL: http://signal-cli:8080
       BRAIN_DATA_DIR: /srv/data          # durable, editable knowledge (volume below)
       ASTRA_UPDATE_REPO_ROOT: /opt/astra # host checkout mounted below for web updates
-      # Recherche-Pfeiler (nur aktiv mit --profile research)
+      # Recherche-Pfeiler: fail-closed im Plugin, kein direkter Fallback.
       TOR_PROXY_URL: socks5://tor:9050
       BROWSER_WS_URL: ws://browser:3000
     volumes:
@@ -177,15 +181,14 @@ services:
     networks: [astra]
 
   # ─── Tor (SOCKS5) — einziger Ausgang für die Recherche ─────────────────────
-  # Kein Port nach außen: nur cortex und der Browser dürfen ihn im Netz erreichen.
-  # OSINT-Verkehr geht ausschließlich hierüber. "Untrackable" bleibt best effort:
-  # Tor verschleiert die Herkunft, garantiert aber keine Anonymität.
+  # Kein Port nach außen. Tor hängt nicht am ASTRA-Datennetz, sondern nur am
+  # internen Recherche-Netz und an einer separaten Egress-Bridge.
   tor:
     image: dperson/torproxy:latest
     <<: *restart
     environment:
       TOR_NewCircuitPeriod: "60"
-    networks: [astra, research]
+    networks: [research, tor_egress]
 
   # ─── Headless-Browser für Recherche (netz-isoliert!) ───────────────────────
   # Hängt bewusst NICHT am astra-Netz-Internetpfad, sondern nur am internen
