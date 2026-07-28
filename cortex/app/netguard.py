@@ -97,12 +97,13 @@ def _networks(allowed_cidrs: list[str]) -> list[ipaddress.IPv4Network | ipaddres
     return nets
 
 
-def scan_target_ok(target: str, allowed_cidrs: list[str]) -> tuple[bool, str]:
+def scan_target_ok(target: str, allowed_cidrs: list[str], *, allow_public: bool = False) -> tuple[bool, str]:
     """(erlaubt, Grund) für ein Scan-Ziel (Host oder CIDR).
 
     Erlaubt NUR, wenn das Ziel vollständig in einem der freigegebenen Netze liegt.
-    Öffentliche Adressen sind selbst dann tabu, wenn jemand sie einträgt — Scannen
-    im offenen Internet ist keine autorisierte Demo."""
+    Öffentliche Adressen bleiben standardmäßig tabu. Eine öffentliche Adresse darf
+    nur passieren, wenn der aufrufende Plugin-Kontext sie zuvor über eine separate,
+    explizite Eigentümer-Allowlist freigegeben hat (`allow_public=True`)."""
     raw = (target or "").strip()
     if not raw:
         return False, "leeres Ziel"
@@ -116,7 +117,7 @@ def scan_target_ok(target: str, allowed_cidrs: list[str]) -> tuple[bool, str]:
     # Öffentliche Ziele grundsätzlich ablehnen, egal was in der Liste steht.
     hosts_public = any(_is_public_ip(ip) for ip in
                        (target_net.network_address, target_net.broadcast_address))
-    if hosts_public:
+    if hosts_public and not allow_public:
         return False, f"'{raw}' ist öffentlich — aktives Scannen nur im eigenen Netz"
     for net in allowed:
         if target_net.version == net.version and target_net.subnet_of(net):

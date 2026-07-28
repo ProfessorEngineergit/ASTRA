@@ -130,6 +130,15 @@ def test_osint_nearby_is_passive_shodan_metadata(monkeypatch):
     assert "geo:50.11000,8.68000,15" in calls[0][1]["params"]["query"]
 
 
+def test_osint_location_falls_back_to_browser_saved_setting(memdb):
+    memdb["app_settings"] = {"location": {"lat": 50.123456, "lon": 8.654321}}
+    plugin = OsintPlugin({"__enabled": True, "tor_proxy": "socks5://tor:9050"})
+    here = asyncio.run(plugin._here())
+    assert here["ok"] is True
+    assert here["source"] == "browser_saved"
+    assert here["lat"] == 50.123456
+
+
 def test_rebuild_registers_enabled_plugin_tools(memdb):
     cs = get_config_store()
     # Configure + enable RMV, then rebuild the registry.

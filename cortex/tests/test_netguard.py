@@ -64,9 +64,15 @@ def test_scan_allowed_inside_configured_private_net(target):
 
 @_pytest.mark.parametrize("target", ["1.1.1.1", "8.8.8.0/24", "93.184.216.34"])
 def test_scan_refuses_public_even_if_listed(target):
-    # Öffentliche Ziele bleiben tabu, selbst wenn jemand sie einträgt.
+    # Der Default bleibt restriktiv; ein Plugin darf eine separate Eigentümer-
+    # Allowlist nur explizit per allow_public öffnen.
     ok, _r = netguard.scan_target_ok(target, [target, "192.168.178.0/24"])
     assert ok is False
+
+
+def test_scan_allows_explicitly_authorized_public_target():
+    ok, _r = netguard.scan_target_ok("203.0.113.10", ["203.0.113.10"], allow_public=True)
+    assert ok is True
 
 
 def test_scan_refuses_target_outside_allowlist():

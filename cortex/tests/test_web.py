@@ -694,6 +694,14 @@ def test_osint_tab_renders_and_run_endpoint_gates_tool(memdb):
 
     r = c.get("/admin/osint")
     assert r.status_code == 200
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    location = c.post("/admin/osint/location", data={
+        "csrf": csrf, "lat": "50.123456", "lon": "8.654321",
+    })
+    assert location.status_code == 200
+    assert location.json()["ok"] is True
+    assert memdb["app_settings"]["location"]["source"] == "browser"
+    assert memdb["app_settings"]["location"]["lat"] == 50.123456
     assert "Recon" in r.text and "Kameras in der Nähe" in r.text
     assert "Drucker in der Nähe" in r.text
     assert "OSINT-Recherche" in r.text

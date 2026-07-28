@@ -5098,6 +5098,7 @@ def _osint_card(
 async def osint_page(request: Request, _: bool = Depends(auth.require_admin)):
     from ..plugins.registry import get_manager
     plugin = get_manager().get("osint")
+    token = await auth.issue_csrf()
     enabled = bool(plugin and plugin.enabled)
     banner = ("" if enabled else
               '<div class="card recon-banner">Das OSINT-Plugin ist noch nicht '
@@ -5130,6 +5131,7 @@ Tor-Proxy abgefragt. Links öffnen die Shodan-Hostseite in deinem Browser – ni
 <script>
 const locBadge = document.getElementById('osint-loc');
 let here = {{lat:{json.dumps(initial_lat)}, lon:{json.dumps(initial_lon)}}};
+const osintCsrf = {json.dumps(token)};
 function syncLocation() {{
   document.querySelectorAll('.osint-lat').forEach(i => i.value = here.lat ?? '');
   document.querySelectorAll('.osint-lon').forEach(i => i.value = here.lon ?? '');
@@ -5141,6 +5143,11 @@ document.getElementById('osint-locate').onclick = (e) => {{
     here = {{lat:p.coords.latitude, lon:p.coords.longitude}};
     locBadge.textContent = 'Standort: ' + here.lat.toFixed(4) + ', ' + here.lon.toFixed(4);
     syncLocation();
+    const fd = new FormData(); fd.append('csrf', osintCsrf);
+    fd.append('lat', String(here.lat)); fd.append('lon', String(here.lon));
+    fetch('/admin/osint/location', {{method:'POST', body:fd}}).then(r => {{
+      if (!r.ok) throw new Error('Standort konnte nicht gespeichert werden');
+    }}).catch(() => {{ locBadge.textContent += ' · nicht gespeichert'; }});
   }}, () => locBadge.textContent = 'Standort nicht freigegeben · gespeicherter Standort bleibt aktiv');
 }};
 function appendText(parent, tag, text, cls='') {{
@@ -5185,7 +5192,28 @@ document.querySelectorAll('.osint-form').forEach(f => {{
   }});
 }});
 </script>"""
-    return HTMLResponse(page("Recon", body, active="osint"))
+    return _html_with_csrf(page("Recon", body, active="osint"), token)
+
+
+@router.post("/admin/osint/location")
+async def osint_location(request: Request, _: bool = Depends(auth.require_admin)):
+    """Persist a browser-approved location for owner chat/Telegram fallbacks."""
+    form = await request.form()
+    if not await _check_csrf(request, form):
+        return JSONResponse({"ok": False, "error": "CSRF-Prüfung fehlgeschlagen."}, status_code=403)
+    try:
+        lat, lon = float(form.get("lat")), float(form.get("lon"))
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "Ungültige Koordinaten."}, status_code=400)
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return JSONResponse({"ok": False, "error": "Ungültige Koordinaten."}, status_code=400)
+    appset = await _app_settings()
+    location = appset.get("location") if isinstance(appset.get("location"), dict) else {}
+    location.update({"lat": round(lat, 6), "lon": round(lon, 6), "source": "browser"})
+    appset["location"] = location
+    await db.set_setting("app_settings", appset)
+    await db.audit("osint_location_saved", actor="owner", detail={"source": "browser"})
+    return JSONResponse({"ok": True, "lat": lat, "lon": lon})
 
 
 @router.post("/admin/osint/run")

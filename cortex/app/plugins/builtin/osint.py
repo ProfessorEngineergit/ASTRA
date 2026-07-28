@@ -2,7 +2,7 @@
 
 Der zweite Pfeiler neben dem Sekretär. Alles hier ist **owner-only** und
 standardmäßig **aus**; der Verkehr verlässt das Haus ausschließlich über den
-Tor-Container (siehe docker-compose, Profil `research`).
+Tor-Container (Cortex startet ihn als Abhängigkeit).
 
 Was dieses Plugin tut — und was ausdrücklich nicht:
   ✓ öffentlich zugängliche Quellen durchsuchen und lesen
@@ -26,7 +26,7 @@ from typing import Any
 
 import httpx
 
-from ... import netguard
+from ... import db, netguard
 from ...config import get_settings
 from ...tools import Tool, ToolContext, tool_result
 from ..base import ConfigField, FieldType, HealthStatus, Plugin, PluginCategory
@@ -49,7 +49,7 @@ class OsintPlugin(Plugin):
         # Recherche muss man einschalten, nicht ausschalten müssen.
         ConfigField("tor_proxy", "Tor SOCKS5-Proxy", required=True,
                     env_fallback="tor_proxy_url",
-                    help="Trage socks5://tor:9050 ein (Container aus dem 'research'-Profil)"),
+                    help="Trage socks5://tor:9050 ein (Tor-Sidecar im Compose-Stack)"),
         ConfigField("searx_url", "SearXNG-Instanz", required=False,
                     help="Selbstgehostete Meta-Suche, z. B. http://searxng:8080"),
         ConfigField("windy_key", "Windy-Webcams API-Key", FieldType.PASSWORD,
@@ -61,6 +61,9 @@ class OsintPlugin(Plugin):
         # hier eingetragenen eigenen/freigegebenen Netzen — die Prüfung erzwingt es.
         ConfigField("scan_networks", "Freigegebene Scan-Netze (CIDR)", required=False,
                     help="Kommagetrennt, NUR eigene/autorisierte, z. B. 192.168.178.0/24"),
+        ConfigField("scan_targets", "Freigegebene Pen-Test-Ziele (IP/CIDR)", required=False,
+                    help="Kommagetrennt. Öffentliche Ziele nur mit ausdrücklicher Autorisierung; "
+                         "z. B. 203.0.113.10 oder 198.51.100.0/24"),
         ConfigField("shodan_key", "Shodan API-Key", FieldType.PASSWORD, required=False,
                     secret=True, help="Für Selbst-Exposition (öffentliche Daten über deine IP)"),
         ConfigField("hibp_key", "HaveIBeenPwned API-Key", FieldType.PASSWORD, required=False,
@@ -79,6 +82,28 @@ class OsintPlugin(Plugin):
     def scan_networks(self) -> list[str]:
         return [c.strip() for c in str(self.get("scan_networks") or "").split(",") if c.strip()]
 
+    def scan_targets(self) -> list[str]:
+        return [c.strip() for c in str(self.get("scan_targets") or "").split(",") if c.strip()]
+
+    def _scan_allowlist(self) -> list[str]:
+        return self.scan_networks() + self.scan_targets()
+
+    def _public_target_allowed(self, target: str) -> bool:
+        """Public target is permitted only when it is inside the explicit target list."""
+        import ipaddress
+        try:
+            target_net = ipaddress.ip_network(target.strip(), strict=False)
+        except ValueError:
+            return False
+        for raw in self.scan_targets():
+            try:
+                allowed = ipaddress.ip_network(raw, strict=False)
+            except ValueError:
+                continue
+            if target_net.version == allowed.version and target_net.subnet_of(allowed):
+                return True
+        return False
+
     async def _here(self) -> dict:
         """Aktueller Standort für 'in der Nähe' — vom Handy über die HA-Companion-App."""
         try:
@@ -86,6 +111,17 @@ class OsintPlugin(Plugin):
             ha = get_manager().get("home_assistant")
             if ha and ha.enabled:
                 return await ha.location()
+        except Exception:  # noqa: BLE001
+            pass
+        # Fallback für den Browser: der Recon-Tab speichert eine ausdrücklich
+        # freigegebene Position in app_settings, damit Telegram/WhatsApp dieselbe
+        # Position verwenden können. Kein stiller Standortzugriff.
+        try:
+            appset = await db.get_setting("app_settings", {}) or {}
+            loc = appset.get("location") if isinstance(appset, dict) else None
+            if isinstance(loc, dict) and loc.get("lat") is not None and loc.get("lon") is not None:
+                return {"ok": True, "lat": float(loc["lat"]), "lon": float(loc["lon"]),
+                        "source": "browser_saved"}
         except Exception:  # noqa: BLE001
             pass
         return {"ok": False, "reason": "kein Home-Assistant-Standort verfügbar"}
@@ -114,8 +150,8 @@ class OsintPlugin(Plugin):
                 data = r.json()
         except Exception as e:  # noqa: BLE001
             return HealthStatus.error(
-                f"Tor nicht erreichbar ({e}). Läuft der Stack mit "
-                "'docker compose --profile research up -d'?")
+                f"Tor nicht erreichbar ({e}). Starte im ASTRA-Verzeichnis "
+                "'docker compose up -d tor' und prüfe 'docker compose ps tor'.")
         if data.get("IsTor"):
             return HealthStatus.ok(
                 f"Ausgang über Tor (Exit-IP {data.get('IP', '?')}). "
@@ -158,7 +194,8 @@ class OsintPlugin(Plugin):
                    max_hosts: int = 64) -> dict:
         """TCP-Connect-Audit eines freigegebenen Netzes. Prüft die Autorisierung."""
         import ipaddress
-        ok, reason = netguard.scan_target_ok(target, self.scan_networks())
+        ok, reason = netguard.scan_target_ok(
+            target, self._scan_allowlist(), allow_public=self._public_target_allowed(target))
         if not ok:
             return {"ok": False, "reason": reason}
         ports = ports or list(self._AUDIT_PORTS)
@@ -192,15 +229,15 @@ class OsintPlugin(Plugin):
             if not self.enabled:
                 return tool_result(ok=False, source=self.slug, summary="OSINT ist deaktiviert.")
             target = str(args.get("target") or "").strip()
-            nets = self.scan_networks()
-            if not nets:
+            targets = self._scan_allowlist()
+            if not targets:
                 return tool_result(
                     ok=False, source=self.slug,
-                    summary="Kein Netz freigegeben. Trage im Feld 'scan_networks' NUR deine "
-                            "eigenen/autorisierten Netze ein (z. B. 192.168.178.0/24). Aktives "
-                            "Scannen fremder Netze mache ich nicht.")
+                    summary="Kein Ziel freigegeben. Trage unter 'scan_networks' private Netze "
+                            "oder unter 'scan_targets' ausdrücklich autorisierte IPs/CIDRs ein. "
+                            "Beliebige Ziele werden nicht gescannt.")
             if not target:
-                target = nets[0]
+                target = targets[0]
             res = await self.scan(target)
             if not res["ok"]:
                 return tool_result(ok=False, source=self.slug,
@@ -584,9 +621,9 @@ class OsintPlugin(Plugin):
             Tool(name="osint_net_scan",
                  description=(
                      "Netz-Audit: findet offene Ports (Drucker 9100/631, Kamera 554, SSH, "
-                     "Web …) — NUR auf deinen eigenen/freigegebenen Netzen aus 'scan_networks'. "
-                     "Fremde Netze lehnt die Prüfung ab. target=CIDR oder Host, leer=erstes "
-                     "freigegebenes Netz."
+                     "Web …) — auf privaten Netzen aus 'scan_networks' oder ausdrücklich "
+                     "autorisierten öffentlichen IPs/CIDRs aus 'scan_targets'. Beliebige "
+                     "Fremdziele lehnt die Prüfung ab. target=CIDR/Host, leer=erstes Ziel."
                  ),
                  parameters={"type": "object", "properties": {"target": {"type": "string"}}},
                  handler=_net_scan, owner_only=True, source=self.slug,

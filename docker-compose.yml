@@ -101,6 +101,9 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
+      # Recon/OSINT uses this local Tor sidecar. Keeping it as a dependency makes
+      # `docker compose up -d --build cortex` sufficient; no hidden profile step.
+      tor: { condition: service_started }
     ports:
       - "8088:8000"              # LAN access: http://192.168.178.189:8088/admin
     healthcheck:
@@ -183,7 +186,6 @@ services:
     environment:
       TOR_NewCircuitPeriod: "60"
     networks: [astra, research]
-    profiles: ["research"]        # startet nur mit: docker compose --profile research up -d
 
   # ─── Headless-Browser für Recherche (netz-isoliert!) ───────────────────────
   # Hängt bewusst NICHT am astra-Netz-Internetpfad, sondern nur am internen
