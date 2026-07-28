@@ -101,6 +101,9 @@ def test_settings_labs_and_region_save(memdb):
     assert r.status_code == 200
     assert "github-capsule" in r.text
     assert "Experimental Console" in r.text
+    assert r.text.count('<input type="radio" name="lab_theme"') == 10
+    assert "LCARS 2364" in r.text
+    assert "Retro Terminal" in r.text
     assert "lab_density" in r.text
     assert "addrresults" in r.text
     assert 'name="country_code"' in r.text
@@ -119,6 +122,7 @@ def test_settings_labs_and_region_save(memdb):
         "autonomy": "confident",
         "allow_self_config": "on",
         "lab_font": "orbitron",
+        "lab_theme": "tng_lcars",
         "lab_density": "dense",
         "lab_motion": "hyperspace",
         "lab_event_horizon": "deep",
@@ -144,6 +148,7 @@ def test_settings_labs_and_region_save(memdb):
     assert saved["autonomy"] == "confident"
     assert saved["allow_self_config"] is True
     assert saved["font"] == "orbitron"
+    assert saved["labs"]["theme"] == "tng_lcars"
     assert saved["labs"]["density"] == "dense"
     assert saved["labs"]["catalog_view"] == "compact"
     assert saved["location"]["country_code"] == "de"
@@ -506,6 +511,34 @@ def test_secretary_waha_start_is_success_when_session_is_already_starting(memdb,
 
     assert r.json()["ok"] is True
     assert calls == [("/api/sessions/default", "GET")]
+
+
+def test_secretary_waha_start_accepts_legacy_already_started_response(memdb, monkeypatch):
+    _prime_manager()
+
+    async def fake_waha_request(base_url, path, *, api_key="", method="GET", json_body=None):
+        if method == "GET":
+            return {"ok": True, "status": 200, "text": '{"status":"STOPPED"}'}
+        return {
+            "ok": False,
+            "status": 422,
+            "text": '{"message":"Session default is already started","error":"Unprocessable Entity"}',
+        }
+
+    monkeypatch.setattr(web_admin, "_waha_request", fake_waha_request)
+    c = TestClient(_app())
+    c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+
+    r = c.post("/admin/secretary/waha/start", json={
+        "waha_base_url": "http://waha:3000",
+        "waha_session": "default",
+        "waha_api_key": "secret",
+    })
+
+    assert r.json()["ok"] is True
 
 
 def test_secretary_waha_qr_marks_starting_session_retryable(memdb, monkeypatch):

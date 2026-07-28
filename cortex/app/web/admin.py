@@ -28,7 +28,8 @@ from . import auth
 from ..models import set_model_override
 from ..plugins import extended_catalog
 from .templates import (
-    LOGO_LONG, brand_icon, esc, font_choices, icon_html, page, set_font,
+    LOGO_LONG, brand_icon, esc, font_choices, icon_html, page, set_font, set_theme,
+    theme_choices,
 )
 
 GH_REPO = "https://github.com/ProfessorEngineergit/ASTRA"
@@ -423,6 +424,7 @@ GH_NEW_ISSUE = "https://github.com/ProfessorEngineergit/ASTRA/issues/new"
 
 _DEFAULT_LABS = {
     "font": "inter",
+    "theme": "event_horizon",
     "density": "comfortable",
     "motion": "normal",
     "event_horizon": "subtle",
@@ -566,11 +568,11 @@ def _area_attrs(slug: str) -> str:
 
 def _labs_css(labs: dict) -> str:
     accent = {
-        "platinum": ("#f4f5f8", "#aab4d6"),
+        "platinum": ("#f4f5f8", "#c7c7cc"),
         "ion": ("#d9f3ff", "#a9c9dc"),
         "aurora": ("#e5e9f0", "#bfc7d8"),
         "ember": ("#f3e4bc", "#d4bd7a"),
-    }.get(labs.get("accent"), ("#f4f5f8", "#aab4d6"))
+    }.get(labs.get("accent"), ("#f4f5f8", "#c7c7cc"))
     event_opacity = {"off": "0", "subtle": ".35", "deep": ".62"}.get(
         labs.get("event_horizon"), ".35"
     )
@@ -595,13 +597,28 @@ def _labs_css(labs: dict) -> str:
     if glow == "off":
         css.append(".card:hover,.panel:hover{box-shadow:none!important;}")
     elif glow == "cinematic":
-        css.append(".card:hover,.panel:hover{box-shadow:0 18px 60px rgba(170,180,214,.18),var(--shadow);}")
+        css.append(".card:hover,.panel:hover{box-shadow:0 18px 60px color-mix(in srgb,var(--link) 18%,transparent),var(--shadow);}")
     else:
         css.append(".panel:hover{border-color:#292932;}")
-    css.append("@keyframes labDrift{from{filter:none}to{filter:drop-shadow(0 0 16px rgba(170,180,214,.24))}}")
+    css.append("@keyframes labDrift{from{filter:none}to{filter:drop-shadow(0 0 16px color-mix(in srgb,var(--link) 28%,transparent))}}")
     css.append("@media (prefers-reduced-motion: reduce){*,*::before,*::after{animation:none!important;transition-duration:.01ms!important;}}")
     css.append("</style>")
     return "".join(css)
+
+
+def _theme_picker(selected: str) -> str:
+    cards = []
+    for key, theme in theme_choices():
+        checked = " checked" if key == selected else ""
+        cards.append(
+            f'<label class="theme-card" style="--preview-accent:{esc(theme["accent"])};'
+            f'--preview-link:{esc(theme["link"])};--preview-signal:{esc(theme["signal"])}">'
+            f'<input type="radio" name="lab_theme" value="{esc(key)}"{checked}>'
+            '<span class="theme-card-visual"><i></i><i></i><i></i></span>'
+            f'<span class="theme-card-copy"><b>{esc(theme["name"])}</b>'
+            f'<small>{esc(theme["desc"])}</small></span></label>'
+        )
+    return '<div class="theme-picker" id="themePicker">' + "".join(cards) + "</div>"
 
 
 _BEAKER_SVG = (
@@ -831,7 +848,7 @@ async def catalog(request: Request, _: bool = Depends(auth.require_admin)):
       <div class="stats">
         <div class="stat"><span class="dot" style="background:var(--ok)"></span><b>{n_active}</b> aktiv</div>
         <div class="stat"><span class="dot" style="background:var(--link)"></span><b>{n_ready}</b> startklar</div>
-        <div class="stat"><span class="dot" style="background:#a78bfa"></span><b>{len(plugins)}</b> nativ</div>
+        <div class="stat"><span class="dot" style="background:var(--theme-signal)"></span><b>{len(plugins)}</b> nativ</div>
         <div class="stat"><span class="dot" style="background:var(--text-faint)"></span><b>{len(cat_entries)}</b> im Katalog</div>
       </div>
     </div>
@@ -942,7 +959,7 @@ async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.requir
         fd.set('installation_id','{esc(active_inst.installation_id)}');
         const r=await fetch('/admin/plugin/{esc(slug)}/test',{{method:'POST',body:fd}});
         const d=await r.json();
-        out.textContent=(d.state==='ok'?'✅ ':d.state==='error'?'❌ ':'• ')+d.message;
+        out.textContent=(d.state==='ok'?'OK · ':d.state==='error'?'FEHLER · ':'— ')+d.message;
       }};
     </script>"""
 
@@ -956,9 +973,7 @@ async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.requir
     </style>
     <div class="crumb"><a href="/admin">← Alle Plugins</a> · {cat_label}</div>
     <div class="hero" style="display:flex;align-items:center;gap:16px;margin-bottom:20px">
-      <span class="icon" style="font-size:34px;width:60px;height:60px;display:grid;
-        place-items:center;background:var(--surface-2);border:1px solid var(--border-soft);
-        border-radius:var(--r-lg)">{esc(cls.icon)}</span>
+      {icon_html(slug, cls.icon)}
       <div><h1 style="font-size:24px;margin:0 0 4px">{esc(cls.name)}</h1>
         <p style="margin:0">{esc(cls.description)}</p></div>
     </div>
@@ -1464,6 +1479,11 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
       }
       fontSelect.addEventListener('change', updateFontPreview);
       updateFontPreview();
+      document.querySelectorAll('input[name="lab_theme"]').forEach(input => {{
+        input.addEventListener('change', () => {{
+          if (input.checked) document.documentElement.dataset.astraTheme = input.value;
+        }});
+      }});
       updateChips();
       setTimeout(() => map.invalidateSize(), 200);
     </script>"""
@@ -1585,6 +1605,12 @@ async def settings_form(request: Request, _: bool = Depends(auth.require_admin),
           <span>FONT FORGE PREVIEW</span>
           <strong>ASTRA sieht scharf aus, wenn der Kontrollraum scharf ist.</strong>
         </div>
+        <div class="theme-lab">
+          <div class="lab-eyebrow">Theme Deck</div>
+          <h3>Zehn OLED-Kontrollräume</h3>
+          <p>Jedes Theme bleibt auf echtem Schwarz. Farbe wird nur für Signale, Fokus und Instrumente eingesetzt.</p>
+          {_theme_picker(labs.get("theme", "event_horizon"))}
+        </div>
         <div class="labs-grid">{lab_tiles}</div>
       </div>
 
@@ -1613,6 +1639,7 @@ async def settings_save(request: Request, _: bool = Depends(auth.require_admin))
     font_choice = form.get("lab_font", form.get("font", s.get("font", "inter")))
     labs = {
         "font": font_choice,
+        "theme": form.get("lab_theme", _DEFAULT_LABS["theme"]),
         "density": form.get("lab_density", _DEFAULT_LABS["density"]),
         "motion": form.get("lab_motion", _DEFAULT_LABS["motion"]),
         "event_horizon": form.get("lab_event_horizon", _DEFAULT_LABS["event_horizon"]),
@@ -1647,6 +1674,7 @@ async def settings_save(request: Request, _: bool = Depends(auth.require_admin))
     await db.set_setting("app_settings", s)
     set_model_override(s["ai_model"])     # live, no restart
     set_font(s["font"])
+    set_theme(labs["theme"])
     from ..brain import set_autonomy
     set_autonomy(s["autonomy"])
     await db.audit("settings_change", actor="owner",
@@ -1738,7 +1766,7 @@ async def system_page(request: Request, _: bool = Depends(auth.require_admin)):
     </div>"""
 
     recs = "".join(
-        f'<div class="rec {r["level"]}">{"⚠️" if r["level"]=="warn" else "✅"}&nbsp; {esc(r["text"])}</div>'
+        f'<div class="rec {r["level"]}"><b>{"WARN" if r["level"]=="warn" else "OK"}</b>&nbsp; {esc(r["text"])}</div>'
         for r in snap["recommendations"])
 
     services = [
@@ -2491,7 +2519,7 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
         const steps = wrap.querySelectorAll('.pairing-steps span');
         steps.forEach((step, i) => step.classList.toggle('active', i <= (value >= 100 ? 2 : value >= 45 ? 1 : 0)));
       }}
-      async function loadWahaQr(attempt = 0) {{
+      async function loadWahaQr(attempt = 0, recovery = 0) {{
         const box = document.querySelector('[data-qr-box]');
         if (!box) return;
         box.hidden = false;
@@ -2511,9 +2539,20 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
           setWahaProgress(100, 'WhatsApp ist verbunden');
           box.textContent = d.message || 'WhatsApp ist bereits verbunden.';
           setTimeout(() => location.reload(), 600);
-        }} else if (d.retryable && attempt < 15) {{
+        }} else if (d.retryable && attempt < 40) {{
           box.textContent = d.message || 'QR wird vorbereitet…';
-          setTimeout(() => loadWahaQr(attempt + 1), 1000);
+          setTimeout(() => loadWahaQr(attempt + 1, recovery), 1000);
+        }} else if (recovery < 1) {{
+          setWahaProgress(35, 'Session wird automatisch neu gestartet…');
+          box.textContent = 'WhatsApp braucht einen zweiten Anlauf. ASTRA übernimmt das automatisch…';
+          try {{
+            await fetch('/admin/secretary/waha/start', {{
+              method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(formContext('waha'))
+            }});
+            setTimeout(() => loadWahaQr(0, recovery + 1), 1200);
+          }} catch (e) {{
+            box.textContent = 'WAHA ist gerade nicht erreichbar.';
+          }}
         }} else box.textContent = d.message || d.error || 'Kein QR verfügbar.';
       }}
       const connectBtn = document.querySelector('[data-waha-connect]');
@@ -2985,6 +3024,11 @@ def _waha_state(result: dict) -> str:
     return str(data.get("status") or data.get("state") or "").upper()
 
 
+def _waha_already_running(result: dict) -> bool:
+    text = str(result.get("text") or result.get("message") or "").lower()
+    return result.get("status") == 422 and "already started" in text
+
+
 async def _waha_session_status(base_url: str, session: str, api_key: str) -> dict:
     """Query WAHA for the live session state. connected == True means a phone is paired."""
     result = await _waha_request(base_url, f"/api/sessions/{session}", api_key=api_key)
@@ -3061,7 +3105,7 @@ async def secretary_waha_start(request: Request, _: bool = Depends(auth.require_
         )
     else:
         result = status
-    if result.get("ok"):
+    if result.get("ok") or _waha_already_running(result):
         return JSONResponse({"ok": True, "message": f"WAHA-Session {session} wurde gestartet."})
     return JSONResponse({"ok": False, "message": result.get("text") or result.get("message") or "Start fehlgeschlagen."})
 

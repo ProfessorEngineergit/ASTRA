@@ -54,12 +54,18 @@ BRAND_ICONS: dict[str, str] = {
 
 
 def brand_icon(brand: str | None, emoji: str) -> str:
-    """Icon box with a monochrome Simple-Icons brand logo, emoji fallback on error."""
+    """Monochrome brand mark with a neutral ASTRA glyph as the only fallback."""
+    fallback = (
+        '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7.5h16M4 12h16M4 16.5h16'
+        'M7.5 4v16M12 4v16M16.5 4v16" fill="none" stroke="currentColor" '
+        'stroke-width="1.35" stroke-linecap="round"/></svg>'
+    )
     if brand:
-        return (f'<span class="icon" data-emoji="{esc(emoji)}">'
+        return (f'<span class="icon">'
                 f'<img src="https://cdn.simpleicons.org/{brand}/d8dbe3" alt="" loading="lazy" '
-                f'onerror="this.parentNode.textContent=this.parentNode.dataset.emoji"></span>')
-    return f'<span class="icon">{esc(emoji)}</span>'
+                f'onerror="this.hidden=true;this.nextElementSibling.hidden=false">'
+                f'<span class="generic-icon" hidden>{fallback}</span></span>')
+    return f'<span class="icon"><span class="generic-icon">{fallback}</span></span>'
 
 
 def icon_html(slug: str, emoji: str) -> str:
@@ -79,6 +85,73 @@ FONTS: dict[str, tuple[str, str, str | None]] = {
     "jetbrains": ("JetBrains Mono", "'JetBrains Mono'", "JetBrains+Mono:wght@400;500;700"),
 }
 _ACTIVE_FONT = "inter"
+
+
+# All themes retain a real #000 OLED canvas. They alter instruments, typography,
+# geometry and signals without turning ASTRA into a conventional coloured dashboard.
+THEMES: dict[str, dict[str, str]] = {
+    "event_horizon": {
+        "name": "Event Horizon", "desc": "ASTRA pur: Schwarz, Platin, harte Ruhe.",
+        "accent": "#f2f2f3", "link": "#c7c7cc", "signal": "#8d8d94",
+        "surface": "#09090b", "surface2": "#101012", "border": "#222225",
+        "radius": "13px", "font": "inter",
+    },
+    "tng_lcars": {
+        "name": "LCARS 2364", "desc": "Next-Gen-Konsole mit Orange, Violett und Pillen.",
+        "accent": "#ffcc66", "link": "#ff9966", "signal": "#cc99cc",
+        "surface": "#080709", "surface2": "#121014", "border": "#493441",
+        "radius": "22px", "font": "rajdhani",
+    },
+    "retro_terminal": {
+        "name": "Retro Terminal", "desc": "Phosphorgrün, Raster und kompromisslose Monospace.",
+        "accent": "#b6ffb0", "link": "#72e879", "signal": "#34a853",
+        "surface": "#030704", "surface2": "#071008", "border": "#183d20",
+        "radius": "3px", "font": "jetbrains",
+    },
+    "amber_crt": {
+        "name": "Amber CRT", "desc": "Bernsteinmonitor, warme Statuslampen, Null Ablenkung.",
+        "accent": "#ffd27a", "link": "#e7a83c", "signal": "#9b671f",
+        "surface": "#090603", "surface2": "#120d05", "border": "#493117",
+        "radius": "4px", "font": "jetbrains",
+    },
+    "red_alert": {
+        "name": "Red Alert", "desc": "Taktische Rotkonsole für klare Prioritäten.",
+        "accent": "#ffe3e3", "link": "#ff6b6b", "signal": "#a3212d",
+        "surface": "#090304", "surface2": "#130608", "border": "#4a171d",
+        "radius": "7px", "font": "chakra",
+    },
+    "synthwave": {
+        "name": "Synthwave 84", "desc": "Magenta und Violett auf echtem OLED-Schwarz.",
+        "accent": "#ffe9ff", "link": "#f08cff", "signal": "#8b5cf6",
+        "surface": "#080309", "surface2": "#110713", "border": "#41204a",
+        "radius": "14px", "font": "spacegrotesk",
+    },
+    "cyberdeck": {
+        "name": "Cyberdeck", "desc": "Kühles Cyan, enge Instrumente, technische Präzision.",
+        "accent": "#e6ffff", "link": "#65e5e7", "signal": "#1e8f99",
+        "surface": "#020708", "surface2": "#061113", "border": "#174148",
+        "radius": "5px", "font": "chakra",
+    },
+    "industrial": {
+        "name": "Industrial Ops", "desc": "Graphit, Sicherheitsorange und robuste Kanten.",
+        "accent": "#fff2dd", "link": "#ff9f43", "signal": "#b85c00",
+        "surface": "#080706", "surface2": "#12100d", "border": "#3f3020",
+        "radius": "2px", "font": "rajdhani",
+    },
+    "noir": {
+        "name": "Noir", "desc": "Schwarzweiß, redaktionell, fast vollständig farblos.",
+        "accent": "#ffffff", "link": "#d4d4d4", "signal": "#787878",
+        "surface": "#080808", "surface2": "#111111", "border": "#292929",
+        "radius": "0px", "font": "spacegrotesk",
+    },
+    "deep_space": {
+        "name": "Deep Space", "desc": "Dunkles Violett und Gold für lange Nachtschichten.",
+        "accent": "#fff0c2", "link": "#d6b86a", "signal": "#7963a8",
+        "surface": "#070609", "surface2": "#0f0c14", "border": "#302840",
+        "radius": "10px", "font": "exo2",
+    },
+}
+_ACTIVE_THEME = "event_horizon"
 
 
 def _font_dir():
@@ -109,6 +182,44 @@ def set_font(key: str | None) -> None:
     global _ACTIVE_FONT
     if key and (key in FONTS or key in local_fonts()):
         _ACTIVE_FONT = key
+
+
+def set_theme(key: str | None) -> None:
+    global _ACTIVE_THEME
+    if key in THEMES:
+        _ACTIVE_THEME = str(key)
+
+
+def theme_choices() -> list[tuple[str, dict[str, str]]]:
+    return list(THEMES.items())
+
+
+def _theme_head() -> str:
+    rules = []
+    for key, theme in THEMES.items():
+        rules.append(
+            f':root[data-astra-theme="{key}"]{{'
+            f'--accent:{theme["accent"]};--link:{theme["link"]};--ring:{theme["link"]}88;'
+            f'--theme-signal:{theme["signal"]};--surface:{theme["surface"]};'
+            f'--surface-2:{theme["surface2"]};--border:{theme["border"]};'
+            f'--r-sm:{theme["radius"]};--r:{theme["radius"]};'
+            f'}}'
+        )
+    rules.append(
+        ':root[data-astra-theme="retro_terminal"] body::after,'
+        ':root[data-astra-theme="amber_crt"] body::after{content:"";position:fixed;inset:0;'
+        'pointer-events:none;z-index:50;opacity:.12;background:repeating-linear-gradient('
+        '0deg,transparent 0,transparent 3px,rgba(255,255,255,.12) 4px);mix-blend-mode:screen}'
+    )
+    rules.append(
+        ':root[data-astra-theme="tng_lcars"] .navlink.active,'
+        ':root[data-astra-theme="tng_lcars"] .btn:not(.ghost){border-radius:999px;'
+        'border-left:12px solid var(--theme-signal)}'
+    )
+    rules.append(
+        ':root[data-astra-theme="noir"] *{text-shadow:none!important;box-shadow:none!important}'
+    )
+    return "<style>" + "".join(rules) + "</style>"
 
 
 def _font_head() -> str:
@@ -148,8 +259,9 @@ _CSS = """
   --text-faint: #5f5f6a;
   --accent: #f4f5f8;        /* platinum primary */
   --accent-ink: #07070a;
-  --link: #aab4d6;
-  --ring: rgba(170,180,214,.55);
+  --link: #c7c7cc;
+  --ring: rgba(199,199,204,.55);
+  --theme-signal: #8d8d94;
   --star: #d9b25a;
   --ok: #36d399; --ok-bg: rgba(54,211,153,.10);
   --warn: #f5c451; --warn-bg: rgba(245,196,81,.10);
@@ -176,7 +288,7 @@ body::before {
     radial-gradient(1px 1px at 78% 82%, #fff3, transparent);
 }
 a { color: var(--link); text-decoration: none; transition: color .15s; }
-a:hover { color: #c9d1ea; }
+a:hover { color: var(--accent); }
 
 /* ── header: opaque black behind the logo, glass/blur toward the nav ── */
 header.topbar {
@@ -216,8 +328,8 @@ input[type=text], input[type=password], input[type=number], input[type=email], s
   border-radius: var(--r-sm); padding: 11px 13px; font-size: 14px; font-family: inherit;
   transition: border-color .15s, box-shadow .15s; }
 .search { padding-left: 40px !important; }
-input:focus, select:focus { outline: none; border-color: #34343f;
-  box-shadow: 0 0 0 3px rgba(170,180,214,.12); }
+input:focus, select:focus { outline: none; border-color: var(--link);
+  box-shadow: 0 0 0 3px color-mix(in srgb,var(--link) 18%,transparent); }
 input::placeholder { color: var(--text-faint); }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 24px; }
 .chip { padding: 6px 14px; border: 1px solid var(--border); border-radius: 999px; font-size: 13px;
@@ -353,7 +465,7 @@ details.card.brain[open] .chev { transform: rotate(180deg); }
   background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--r-sm);
   color: var(--text); font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 13px;
   line-height: 1.55; }
-.brain-edit:focus { outline: none; border-color: #34343f; box-shadow: 0 0 0 3px rgba(170,180,214,.12); }
+.brain-edit:focus { outline: none; border-color: var(--link); box-shadow: 0 0 0 3px color-mix(in srgb,var(--link) 18%,transparent); }
 
 /* system metrics */
 .metrics { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px,1fr)); gap: 14px; }
@@ -362,7 +474,7 @@ details.card.brain[open] .chev { transform: rotate(180deg); }
 .metric .v { font-size: 26px; font-weight: 700; margin: 6px 0 4px; letter-spacing: -.5px; }
 .metric .sub { font-size: 12px; color: var(--text-dim); }
 .meter { height: 7px; border-radius: 999px; background: var(--surface-3); overflow: hidden; margin-top: 10px; }
-.meter > i { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg,#36d399,#a78bfa); }
+.meter > i { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg,var(--ok),var(--theme-signal)); }
 .meter.warn > i { background: linear-gradient(90deg,#f5c451,#fb7185); }
 .rec { display: flex; gap: 10px; align-items: flex-start; padding: 11px 14px; border-radius: var(--r);
   background: var(--surface-2); border: 1px solid var(--border-soft); margin-bottom: 8px; font-size: 13.5px; }
@@ -403,11 +515,11 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
 .thread span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; font-weight: 600; }
 .thread small, .arch-note { color: var(--text-faint); font-size: 11px; }
 .source-tag { display: inline-flex; align-items: center; width: fit-content; padding: 2px 7px;
-  border: 1px solid rgba(170,180,214,.24); border-radius: 999px; background: rgba(170,180,214,.08);
-  color: #c9d1ea; font-size: 10.5px; font-weight: 650; letter-spacing: 0; text-transform: none; }
+  border: 1px solid color-mix(in srgb,var(--link) 28%,transparent); border-radius: 999px; background: color-mix(in srgb,var(--link) 10%,transparent);
+  color: var(--link); font-size: 10.5px; font-weight: 650; letter-spacing: 0; text-transform: none; }
 .thread .source-tag { margin-right: 5px; }
 .chat-title h1 .source-tag { display: inline-flex !important; vertical-align: middle; margin-left: 6px;
-  color: #c9d1ea !important; font-size: 10.5px !important; letter-spacing: 0 !important;
+  color: var(--link) !important; font-size: 10.5px !important; letter-spacing: 0 !important;
   text-transform: none !important; }
 .perm-box { margin-top: auto; display: grid; gap: 12px; padding: 14px; background: #050507;
   border: 1px solid #24242c; border-radius: var(--r); box-shadow: inset 0 1px 0 rgba(255,255,255,.035); }
@@ -452,7 +564,7 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
 .msg-row.sys { align-self: center; }
 .msg { padding: 14px 16px; border-radius: 16px; font-size: 14.5px; line-height: 1.56;
   white-space: pre-wrap; overflow-wrap: anywhere; box-shadow: 0 10px 30px rgba(0,0,0,.22); }
-.msg.user { background: linear-gradient(180deg, #f4f5f8, #d8dbe3); color: var(--accent-ink);
+.msg.user { background: linear-gradient(180deg, var(--accent), color-mix(in srgb,var(--accent) 78%,#777)); color: var(--accent-ink);
   border-bottom-right-radius: 5px; box-shadow: 0 14px 34px rgba(255,255,255,.08); }
 .msg.bot { background: #0d0d11; border: 1px solid #23232b; border-bottom-left-radius: 5px; }
 .msg.sys { color: var(--text-faint); font-size: 12px; background: none; }
@@ -506,7 +618,7 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
 .chat-input textarea { flex: 1; resize: none; min-height: 50px; max-height: 220px;
   background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: var(--r);
   padding: 12px 13px; font: inherit; }
-.chat-input textarea:focus { outline: none; border-color: #34343f; box-shadow: 0 0 0 3px rgba(170,180,214,.12); }
+.chat-input textarea:focus { outline: none; border-color: var(--link); box-shadow: 0 0 0 3px color-mix(in srgb,var(--link) 18%,transparent); }
 .send-btn svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2;
   stroke-linecap: round; stroke-linejoin: round; }
 .chat-input.archived { justify-content: space-between; align-items: center; }
@@ -536,7 +648,7 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
 .secretary-cards { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
 .secretary-card { display: grid; gap: 12px; padding: 16px; background: var(--surface);
   border: 1px solid var(--border); border-radius: var(--r-lg); }
-.secretary-card.active { border-color: rgba(170,180,214,.34); box-shadow: inset 0 1px 0 rgba(255,255,255,.04), 0 18px 42px rgba(0,0,0,.28); }
+.secretary-card.active { border-color: color-mix(in srgb,var(--link) 38%,transparent); box-shadow: inset 0 1px 0 rgba(255,255,255,.04), 0 18px 42px rgba(0,0,0,.28); }
 .secretary-card h3 { margin: 0; font-size: 15px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .secretary-card p { margin: 0; color: var(--text-dim); font-size: 12.5px; line-height: 1.45; }
 .secretary-card .mini { color: var(--text-faint); font-size: 11px; }
@@ -626,7 +738,7 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
 .pairing-progress-head b { color: var(--text); font-variant-numeric: tabular-nums; }
 .pairing-progress-track { height: 6px; overflow: hidden; border-radius: 99px; background: rgba(255,255,255,.08); }
 .pairing-progress-track i { display: block; width: 0; height: 100%; border-radius: inherit;
-  background: linear-gradient(90deg, #aab4d6, #eef1ff); box-shadow: 0 0 16px rgba(202,211,246,.28);
+  background: linear-gradient(90deg, var(--theme-signal), var(--accent)); box-shadow: 0 0 16px color-mix(in srgb,var(--link) 30%,transparent);
   transition: width .35s ease; }
 .pairing-steps { display: flex; justify-content: space-between; gap: 8px; }
 .pairing-steps span { color: var(--text-faint) !important; font-size: 10px !important; }
@@ -657,10 +769,10 @@ details.adv[open] > summary { margin-bottom: 12px; }
   margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--hair); }
 .install-policy .setup-field { margin: 0; }
 .labs-head { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; }
-.labs-head .beaker { color: #d8dbe3; flex-shrink: 0; filter: drop-shadow(0 0 16px rgba(216,219,227,.16)); }
+.labs-head .beaker { color: var(--accent); flex-shrink: 0; filter: drop-shadow(0 0 16px color-mix(in srgb,var(--link) 20%,transparent)); }
 .labs-head h2 { margin: 0 0 4px; font-size: 19px; }
 .labs-head p { margin: 0; color: var(--text-dim); font-size: 13px; line-height: 1.5; }
-.lab-eyebrow { color: #c7ccda; font: 700 10px 'JetBrains Mono', monospace; letter-spacing: .08em;
+.lab-eyebrow { color: var(--link); font: 700 10px 'JetBrains Mono', monospace; letter-spacing: .08em;
   text-transform: uppercase; margin-bottom: 5px; }
 .labs-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
 .lab-tile { min-height: 174px; display: flex; flex-direction: column; gap: 8px; padding: 15px;
@@ -673,6 +785,28 @@ details.adv[open] > summary { margin-bottom: 12px; }
   background: var(--surface-2); border: 1px solid var(--border-soft); border-radius: var(--r); }
 .font-preview span { color: var(--text-faint); font: 700 10px 'JetBrains Mono', monospace; letter-spacing: .08em; }
 .font-preview strong { font-family: var(--ui-font-preview, var(--ui-font)); font-size: 17px; font-weight: 700; }
+.theme-lab { display: grid; gap: 9px; margin: 0 0 16px; padding: 16px; border: 1px solid var(--border);
+  border-radius: var(--r); background: #000; }
+.theme-lab h3 { margin: 0; font-size: 16px; }
+.theme-lab > p { margin: 0 0 5px; color: var(--text-dim); font-size: 12.5px; }
+.theme-picker { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 9px; }
+.theme-card { position: relative; display: grid; grid-template-columns: 76px minmax(0,1fr); gap: 12px;
+  align-items: center; min-height: 78px; padding: 10px; border: 1px solid var(--border-soft);
+  border-radius: 11px; background: var(--surface); cursor: pointer; transition: border-color .15s,transform .15s; }
+.theme-card:hover { transform: translateY(-1px); border-color: var(--preview-link); }
+.theme-card:has(input:checked) { border-color: var(--preview-link); box-shadow: inset 3px 0 0 var(--preview-accent); }
+.theme-card input { position: absolute; opacity: 0; pointer-events: none; }
+.theme-card-visual { height: 52px; display: grid; grid-template-columns: 9px 1fr; grid-template-rows: 10px 1fr;
+  gap: 5px; padding: 7px; border: 1px solid color-mix(in srgb,var(--preview-link) 40%,#181818);
+  border-radius: 7px; background:#000; }
+.theme-card-visual i { display:block; border-radius: 3px; background:var(--preview-signal); }
+.theme-card-visual i:first-child { grid-row:1/3; background:var(--preview-accent); }
+.theme-card-visual i:nth-child(2) { background:var(--preview-link); }
+.theme-card-visual i:nth-child(3) { opacity:.45; }
+.theme-card-copy { display:grid; gap:3px; }
+.theme-card-copy b { font-size:12.5px; color:var(--text); }
+.theme-card-copy small { color:var(--text-faint); font-size:10.5px; line-height:1.3; }
+@media(max-width:720px){.theme-picker{grid-template-columns:1fr}}
 .address-box { position: relative; flex: 1; min-width: 260px; }
 .address-results { position: absolute; left: 0; right: 0; top: calc(100% + 6px); z-index: 20;
   max-height: 280px; overflow: auto; background: var(--surface-2); border: 1px solid var(--border);
@@ -728,6 +862,9 @@ details.adv[open] > summary { margin-bottom: 12px; }
   .address-box { width: 100%; min-width: 0; }
   .github-capsule { width: 38px; height: 38px; }
 }
+.icon .generic-icon { width: 24px; height: 24px; display: grid; place-items: center; color: #a6a6ad; }
+.icon .generic-icon[hidden] { display: none; }
+.icon .generic-icon svg { width: 24px; height: 24px; }
 """
 
 
@@ -752,12 +889,13 @@ def page(title: str, body: str, *, nav: bool = True, active: str = "") -> str:
             '<button class="btn ghost sm" type="submit">Logout</button></form>'
             '</nav>'
         )
-    return f"""<!doctype html><html lang="de"><head><meta charset="utf-8">
+    return f"""<!doctype html><html lang="de" data-astra-theme="{esc(_ACTIVE_THEME)}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{esc(title)} · ASTRA</title>{favicon_link()}
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 {_font_head()}
+{_theme_head()}
 <style>{_CSS}</style></head><body>
 <header class="topbar"><a class="brand" href="/admin"><img src="{LOGO_LONG}" alt="ASTRA"></a>{navhtml}</header>
 <main>{body}</main></body></html>"""

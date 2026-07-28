@@ -328,11 +328,12 @@ async def lifespan(app: FastAPI):
         appset = await db.get_setting("app_settings", {}) or {}
         from .brain import set_autonomy
         from .models import set_economy, set_model_config, set_model_override
-        from .web.templates import set_font
+        from .web.templates import set_font, set_theme
         set_model_override(appset.get("ai_model"))
         set_economy(bool(appset.get("economy_mode")))
         set_model_config(appset.get("models"))   # provider registry + role assignment
         set_font(appset.get("font"))
+        set_theme((appset.get("labs") or {}).get("theme"))
         set_autonomy(appset.get("autonomy", "ask"))
     except Exception:  # noqa: BLE001
         log.warning("Could not apply saved app_settings.", exc_info=True)
