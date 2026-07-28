@@ -2011,18 +2011,22 @@ def _channel_setup_fields(channel: str, inst: dict, connected: bool = False) -> 
                 '<details class="adv waha-test" data-waha-test-wrap hidden>'
                 '<summary>Live-Test (Selbst-Chat)</summary>'
                 '<div class="waha-test-box" data-waha-test-box></div></details>'
-                '<div class="qr-box" data-qr-box></div></div>'
+                '<div class="qr-box" data-qr-box hidden></div></div>'
             )
         else:
             pairing = (
                 '<div class="pairing-panel primary" data-waha-pairing>'
-                '<div><b>WhatsApp verbinden</b><span>1 · Session starten &nbsp;→&nbsp; 2 · in WhatsApp unter '
-                '<i>Verknüpfte Geräte</i> den QR scannen. Server, Key &amp; Session sind schon '
-                'automatisch gesetzt — mehr brauchst du nicht.</span></div>'
+                '<div><b>WhatsApp verbinden</b><span>Ein Klick bereitet alles vor. Öffne danach in WhatsApp '
+                '<i>Verknüpfte Geräte</i> und scanne den QR-Code.</span></div>'
                 '<div class="pairing-actions">'
-                '<button class="btn sm" type="button" data-waha-start>1 · Session starten</button>'
-                '<button class="btn sm" type="button" data-waha-qr>2 · QR anzeigen</button></div>'
-                '<div class="qr-box" data-qr-box></div></div>'
+                '<button class="btn" type="button" data-waha-connect>WhatsApp verbinden</button></div>'
+                '<div class="pairing-progress" data-waha-progress hidden>'
+                '<div class="pairing-progress-head"><span data-waha-progress-label>Verbindung wird vorbereitet…</span>'
+                '<b data-waha-progress-value>10%</b></div>'
+                '<div class="pairing-progress-track"><i data-waha-progress-bar></i></div>'
+                '<div class="pairing-steps"><span class="active">Session prüfen</span>'
+                '<span>WhatsApp vorbereiten</span><span>QR bereit</span></div></div>'
+                '<div class="qr-box" data-qr-box hidden></div></div>'
             )
         return (
             pairing
@@ -2144,7 +2148,6 @@ def _secretary_channel_card(channel: str, cfg: dict, inst: dict) -> str:
         "slack": "Slack-Bot (xoxb-Token, Scope chat:write). Eingang via Slack Events API auf /ingress/slack.",
         "email": "Mail-Ingress: /ingress/email fuer normalisierte IMAP/Gmail-Events. Senden bleibt bestaetigungspflichtig.",
     }[channel]
-    setup_store = cfg.get("_setup_store") or {}
     live = cfg.get("_live") or {}
     connected = bool(live.get("connected"))
     meta = SECRETARY_CHANNEL_SETUP[channel]
@@ -2181,7 +2184,6 @@ def _secretary_channel_card(channel: str, cfg: dict, inst: dict) -> str:
             <button class="btn sm" type="submit" style="margin-left:auto">Speichern ↑</button>
           </div>
         </div>
-        {_render_setup_chat(channel, _setup_messages(setup_store, channel))}
         <div class="mini">{esc(channel)}</div>
       </div>
     """
@@ -2214,7 +2216,6 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
     messages = await db.recent_messages(active_id, 80) if active_id else []
     title = selected.get("who") if selected else "Keine Threads"
     token = await auth.issue_csrf()
-    setup_store = await db.get_setting("secretary_setup_chats", {}) or {}
     raw_secretary = (appset or {}).get("secretary", {}) or {}
     installations = _secretary_installations(raw_secretary)
     installations["email"]["_accounts"] = _email_accounts(raw_secretary)
@@ -2241,7 +2242,7 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
     channel_cards = "".join(
         _secretary_channel_card(
             ch,
-            {**settings["channels"][ch], "_setup_store": setup_store, "_live": live_status.get(ch) or {}},
+            {**settings["channels"][ch], "_live": live_status.get(ch) or {}},
             installations[ch],
         )
         for ch in SECRETARY_SETUP_CHANNELS
@@ -2263,8 +2264,8 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
       <section class="panel">
         <h2 style="margin:0 0 6px;font-size:17px">Kanäle</h2>
         <p class="note" style="margin:0 0 14px">Server, Keys und Sessions sind – wo möglich –
-          automatisch befüllt. Meist musst du nur den QR scannen oder den Token einfügen. Pro Karte
-          hilft dir ASTRA direkt im kleinen Setup-Chat.</p>
+          automatisch befüllt. Öffne den gewünschten Kanal und folge nur den sichtbaren Schritten;
+          technische Details bleiben standardmäßig eingeklappt.</p>
         <div class="secretary-cards">{channel_cards}</div>
       </section>
 
@@ -2357,7 +2358,6 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
         activeSetup.channel = channel;
         document.querySelectorAll('.install-card').forEach(card => card.classList.toggle('active', card.dataset.install === channel));
         document.querySelectorAll('.install-config').forEach(cfg => cfg.hidden = cfg.dataset.config !== channel);
-        document.querySelectorAll('.setup-chatbox').forEach(box => box.hidden = box.dataset.setupChannel !== channel);
         const ci = document.getElementById('coachIntro');
         if (ci) ci.textContent = `Einrichtung fuer ${{labels[channel]}}.`;
         const ca = document.getElementById('coachAwareness');
@@ -2480,61 +2480,72 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
         if (countEl) countEl.value = idx + 1;
       }};
 
-      document.querySelectorAll('.setup-chatbox').forEach(box => {{
-        const channel = box.dataset.setupChannel;
-        const input = box.querySelector('input');
-        const btn = box.querySelector('button');
-        const log = box.querySelector('.setup-log');
-        const add = (role, text) => {{
-          const row = document.createElement('div');
-          row.className = 'setup-msg ' + (role === 'user' ? 'user' : 'bot');
-          row.innerHTML = '<b>' + (role === 'user' ? 'Du' : 'ASTRA') + '</b><span></span>';
-          row.querySelector('span').textContent = text;
-          log.appendChild(row);
-          log.scrollTop = log.scrollHeight;
-        }};
-        const send = async () => {{
-          const text = input.value.trim();
-          if (!text) return;
-          input.value = '';
-          add('user', text);
-          btn.disabled = true;
-          try {{
-            const r = await fetch('/admin/secretary/setup-chat', {{
-              method: 'POST',
-              headers: {{'Content-Type': 'application/json'}},
-              body: JSON.stringify({{channel, message: text, context: formContext(channel)}})
-            }});
-            const d = await r.json();
-            add('assistant', d.reply || 'Ich habe dazu gerade keine Antwort.');
-          }} catch (e) {{
-            add('assistant', 'Setup-Chat konnte gerade nicht antworten.');
-          }}
-          btn.disabled = false;
-        }};
-        btn.onclick = send;
-        input.addEventListener('keydown', e => {{ if (e.key === 'Enter') send(); }});
-      }});
-      async function loadWahaQr() {{
+      function setWahaProgress(percent, label) {{
+        const wrap = document.querySelector('[data-waha-progress]');
+        if (!wrap) return;
+        wrap.hidden = false;
+        const value = Math.max(0, Math.min(100, percent));
+        wrap.querySelector('[data-waha-progress-bar]').style.width = value + '%';
+        wrap.querySelector('[data-waha-progress-value]').textContent = value + '%';
+        wrap.querySelector('[data-waha-progress-label]').textContent = label;
+        const steps = wrap.querySelectorAll('.pairing-steps span');
+        steps.forEach((step, i) => step.classList.toggle('active', i <= (value >= 100 ? 2 : value >= 45 ? 1 : 0)));
+      }}
+      async function loadWahaQr(attempt = 0) {{
         const box = document.querySelector('[data-qr-box]');
         if (!box) return;
-        box.textContent = 'QR wird geladen...';
+        box.hidden = false;
+        setWahaProgress(Math.min(90, 45 + attempt * 3), attempt ? 'WhatsApp erstellt den QR-Code…' : 'QR-Code wird angefordert…');
+        box.textContent = attempt ? 'QR wird vorbereitet…' : 'QR wird geladen...';
         const r = await fetch('/admin/secretary/waha/qr', {{
           method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(formContext('waha'))
         }});
         const d = await r.json();
         if (d.image) {{
+          setWahaProgress(100, 'QR-Code ist bereit');
+          const connect = document.querySelector('[data-waha-connect]');
+          if (connect) connect.textContent = 'QR neu laden';
           box.innerHTML = `<img src="${{d.image}}" alt="WhatsApp QR"><small>Nach dem Scannen bestätigt sich die Verbindung automatisch…</small>`;
           pollWahaStatus();
-        }} else box.textContent = d.message || d.error || 'Kein QR verfuegbar.';
+        }} else if (d.connected) {{
+          setWahaProgress(100, 'WhatsApp ist verbunden');
+          box.textContent = d.message || 'WhatsApp ist bereits verbunden.';
+          setTimeout(() => location.reload(), 600);
+        }} else if (d.retryable && attempt < 15) {{
+          box.textContent = d.message || 'QR wird vorbereitet…';
+          setTimeout(() => loadWahaQr(attempt + 1), 1000);
+        }} else box.textContent = d.message || d.error || 'Kein QR verfügbar.';
       }}
-      const qrBtn = document.querySelector('[data-waha-qr]');
-      if (qrBtn) qrBtn.onclick = loadWahaQr;
+      const connectBtn = document.querySelector('[data-waha-connect]');
+      if (connectBtn) connectBtn.onclick = async () => {{
+        const box = document.querySelector('[data-qr-box]');
+        connectBtn.disabled = true;
+        setWahaProgress(10, 'Session wird geprüft…');
+        if (box) {{ box.hidden = true; box.textContent = ''; }}
+        try {{
+          const r = await fetch('/admin/secretary/waha/start', {{
+            method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(formContext('waha'))
+          }});
+          const d = await r.json();
+          if (!d.ok) {{
+            setWahaProgress(0, 'Verbindung konnte nicht gestartet werden');
+            if (box) box.textContent = d.message || 'Start fehlgeschlagen.';
+            return;
+          }}
+          setWahaProgress(45, 'WhatsApp wird vorbereitet…');
+          loadWahaQr();
+        }} catch (e) {{
+          setWahaProgress(0, 'WAHA ist nicht erreichbar');
+          if (box) box.textContent = 'Verbindung konnte nicht gestartet werden.';
+        }} finally {{
+          connectBtn.disabled = false;
+        }}
+      }};
       const recoupleBtn = document.querySelector('[data-waha-recouple]');
       if (recoupleBtn) recoupleBtn.onclick = async () => {{
         if (!confirm('WhatsApp wirklich neu koppeln? Die aktuelle Verbindung wird dabei getrennt, bis du den neuen QR-Code gescannt hast.')) return;
         const box = document.querySelector('[data-qr-box]');
-        if (box) box.textContent = 'Alte Verbindung wird entfernt…';
+        if (box) {{ box.hidden = false; box.textContent = 'Alte Verbindung wird entfernt…'; }}
         recoupleBtn.disabled = true;
         try {{
           const r = await fetch('/admin/secretary/waha/recouple', {{
@@ -2665,16 +2676,6 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
           if (tries > 40) {{ clearInterval(wahaPoll); wahaPoll = null; }}
         }}, 3000);
       }}
-      const startBtn = document.querySelector('[data-waha-start]');
-      if (startBtn) startBtn.onclick = async () => {{
-        const box = document.querySelector('[data-qr-box]');
-        box.textContent = 'Session wird gestartet...';
-        const r = await fetch('/admin/secretary/waha/start', {{
-          method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(formContext('waha'))
-        }});
-        const d = await r.json();
-        box.textContent = d.message || (d.ok ? 'Session gestartet.' : 'Start fehlgeschlagen.');
-      }};
     </script>"""
     return _html_with_csrf(page("Secretary", body, active="secretary"), token)
 
@@ -2971,6 +2972,17 @@ async def _waha_request(base_url: str, path: str, *, api_key: str = "", method: 
 
 
 _WAHA_CONNECTED_STATES = {"WORKING", "CONNECTED", "AUTHENTICATED"}
+_WAHA_RUNNING_STATES = _WAHA_CONNECTED_STATES | {
+    "STARTING", "SCAN_QR_CODE", "PASSKEY_REQUIRED", "PASSKEY_CONFIRMATION_REQUIRED",
+}
+
+
+def _waha_state(result: dict) -> str:
+    try:
+        data = json.loads(result.get("text") or "{}")
+    except json.JSONDecodeError:
+        return ""
+    return str(data.get("status") or data.get("state") or "").upper()
 
 
 async def _waha_session_status(base_url: str, session: str, api_key: str) -> dict:
@@ -3027,9 +3039,21 @@ async def secretary_waha_start(request: Request, _: bool = Depends(auth.require_
     api_key = str(data.get("waha_api_key") or data.get("api_key") or "")
     status = await _waha_request(base_url, f"/api/sessions/{session}", api_key=api_key)
     if status.get("ok"):
-        result = await _waha_request(
-            base_url, f"/api/sessions/{session}/start", api_key=api_key, method="POST",
-        )
+        state = _waha_state(status)
+        if state in _WAHA_RUNNING_STATES:
+            result = {"ok": True}
+        elif state == "FAILED":
+            result = await _waha_request(
+                base_url, f"/api/sessions/{session}/logout", api_key=api_key, method="POST",
+            )
+            if result.get("ok"):
+                result = await _waha_request(
+                    base_url, f"/api/sessions/{session}/start", api_key=api_key, method="POST",
+                )
+        else:
+            result = await _waha_request(
+                base_url, f"/api/sessions/{session}/start", api_key=api_key, method="POST",
+            )
     elif status.get("status") == 404:
         result = await _waha_request(
             base_url, "/api/sessions", api_key=api_key, method="POST",
@@ -3376,6 +3400,13 @@ async def secretary_waha_qr(request: Request, _: bool = Depends(auth.require_adm
     base_url = str(data.get("waha_base_url") or data.get("base_url") or "")
     session = str(data.get("waha_session") or data.get("session") or "default")
     api_key = str(data.get("waha_api_key") or data.get("api_key") or "")
+    status = await _waha_session_status(base_url, session, api_key)
+    if status.get("connected"):
+        return JSONResponse({
+            "ok": True,
+            "connected": True,
+            "message": "WhatsApp ist bereits verbunden.",
+        })
     attempts = [
         (f"/api/{session}/auth/qr", "auth qr"),
         (f"/api/screenshot?session={session}", "screenshot"),
@@ -3391,7 +3422,13 @@ async def secretary_waha_qr(request: Request, _: bool = Depends(auth.require_adm
         errors.append(f"{source}: HTTP {result.get('status') or '-'} {result.get('message') or result.get('text') or ''}"[:260])
     return JSONResponse({
         "ok": False,
-        "message": "Kein QR-Bild von WAHA erhalten. Session starten und Base URL/API-Key pruefen.",
+        "retryable": status.get("state") in {"STARTING", "SCAN_QR_CODE", ""},
+        "state": status.get("state") or "",
+        "message": (
+            "WhatsApp bereitet den QR-Code vor…"
+            if status.get("state") in {"STARTING", "SCAN_QR_CODE", ""}
+            else "Kein QR-Bild von WAHA erhalten. Session neu starten und erneut versuchen."
+        ),
         "errors": errors,
     })
 

@@ -533,8 +533,7 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
 
 /* secretary */
 .secretary-grid { display: grid; grid-template-columns: minmax(0,1.2fr) minmax(320px,.8fr); gap: 16px; }
-.secretary-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
-@media (max-width: 720px) { .secretary-cards { grid-template-columns: 1fr; } }
+.secretary-cards { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
 .secretary-card { display: grid; gap: 12px; padding: 16px; background: var(--surface);
   border: 1px solid var(--border); border-radius: var(--r-lg); }
 .secretary-card.active { border-color: rgba(170,180,214,.34); box-shadow: inset 0 1px 0 rgba(255,255,255,.04), 0 18px 42px rgba(0,0,0,.28); }
@@ -545,6 +544,7 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
 .install-head span:first-child { color: var(--text-faint); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
 .install-actions { display: flex; gap: 9px; align-items: center; flex-wrap: wrap; }
 .install-config { display: grid; gap: 10px; border-top: 1px solid var(--border-soft); padding-top: 12px; }
+.install-config[hidden] { display: none; }
 .install-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 9px; }
 .setup-field { display: grid; gap: 5px; }
 .setup-field input, .setup-field select { padding: 9px 10px; font-size: 12.5px; }
@@ -618,7 +618,21 @@ main:has(.chat-shell) { max-width: 1740px; padding: 16px 18px 38px; }
 .pairing-panel.primary { background: var(--surface-2); border: 1px solid var(--border-soft);
   border-radius: var(--r); padding: 15px; display: grid; gap: 12px; margin: 4px 0 2px; }
 .pairing-panel.primary span { color: var(--text-dim); font-size: 12.5px; line-height: 1.5; }
+.pairing-progress { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--border-soft);
+  border-radius: 12px; background: rgba(255,255,255,.025); }
+.pairing-progress[hidden] { display: none; }
+.pairing-progress-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.pairing-progress-head span, .pairing-progress-head b { font-size: 11.5px; }
+.pairing-progress-head b { color: var(--text); font-variant-numeric: tabular-nums; }
+.pairing-progress-track { height: 6px; overflow: hidden; border-radius: 99px; background: rgba(255,255,255,.08); }
+.pairing-progress-track i { display: block; width: 0; height: 100%; border-radius: inherit;
+  background: linear-gradient(90deg, #aab4d6, #eef1ff); box-shadow: 0 0 16px rgba(202,211,246,.28);
+  transition: width .35s ease; }
+.pairing-steps { display: flex; justify-content: space-between; gap: 8px; }
+.pairing-steps span { color: var(--text-faint) !important; font-size: 10px !important; }
+.pairing-steps span.active { color: var(--text) !important; }
 .qr-box { display: grid; place-items: center; gap: 6px; min-height: 8px; }
+.qr-box[hidden] { display: none; }
 .qr-box img { width: 232px; height: 232px; border-radius: 12px; background: #fff; padding: 8px; }
 .qr-box small { color: var(--text-faint); font-size: 11px; }
 details.adv { margin-top: 12px; border-top: 1px solid var(--hair); padding-top: 10px; }

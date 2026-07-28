@@ -387,12 +387,15 @@ def test_secretary_shows_channel_threads_and_chat_import(memdb, monkeypatch):
     assert "sec_email_0_imap_host" in r.text
     assert "sec_signal_base_url" in r.text
     assert "sec_slack_bot_token" in r.text  # Slack is a Secretary channel now
-    assert "QR anzeigen" in r.text
+    assert "WhatsApp verbinden" in r.text
+    assert "data-waha-progress" in r.text
+    assert "data-waha-start" not in r.text
+    assert "data-waha-qr" not in r.text
     assert "WhatsApp-Nachricht" in r.text
     assert "Telegram-Nachricht" not in r.text
     assert "sec_telegram_mode" not in r.text
     assert "sec_telegram_enabled" not in r.text
-    assert "setup-chatbox" in r.text
+    assert "data-setup-channel" not in r.text
 
     chat_id = web_admin._channel_chat_id("telegram:123")
     r = c.get(f"/admin/chat?chat={chat_id}")
@@ -445,6 +448,15 @@ def test_secretary_waha_qr_endpoint_returns_image(memdb, monkeypatch):
     async def fake_waha_request(base_url, path, *, api_key="", method="GET"):
         assert base_url == "http://waha:3000"
         assert api_key == "secret"
+        if path == "/api/sessions/default":
+            return {
+                "ok": True,
+                "status": 200,
+                "content_type": "application/json",
+                "content": b"",
+                "text": '{"status":"SCAN_QR_CODE"}',
+                "url": f"{base_url}{path}",
+            }
         return {
             "ok": True,
             "status": 200,
@@ -469,6 +481,56 @@ def test_secretary_waha_qr_endpoint_returns_image(memdb, monkeypatch):
 
     assert r.status_code == 200
     assert r.json()["image"].startswith("data:image/png;base64,")
+
+
+def test_secretary_waha_start_is_success_when_session_is_already_starting(memdb, monkeypatch):
+    _prime_manager()
+    calls = []
+
+    async def fake_waha_request(base_url, path, *, api_key="", method="GET", json_body=None):
+        calls.append((path, method))
+        return {"ok": True, "status": 200, "text": '{"status":"STARTING"}'}
+
+    monkeypatch.setattr(web_admin, "_waha_request", fake_waha_request)
+    c = TestClient(_app())
+    c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+
+    r = c.post("/admin/secretary/waha/start", json={
+        "waha_base_url": "http://waha:3000",
+        "waha_session": "default",
+        "waha_api_key": "secret",
+    })
+
+    assert r.json()["ok"] is True
+    assert calls == [("/api/sessions/default", "GET")]
+
+
+def test_secretary_waha_qr_marks_starting_session_retryable(memdb, monkeypatch):
+    _prime_manager()
+
+    async def fake_waha_request(base_url, path, *, api_key="", method="GET", json_body=None):
+        if path == "/api/sessions/default":
+            return {"ok": True, "status": 200, "text": '{"status":"STARTING"}'}
+        return {"ok": False, "status": 422, "text": '{"message":"QR is not ready"}'}
+
+    monkeypatch.setattr(web_admin, "_waha_request", fake_waha_request)
+    c = TestClient(_app())
+    c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+
+    r = c.post("/admin/secretary/waha/qr", json={
+        "waha_base_url": "http://waha:3000",
+        "waha_session": "default",
+        "waha_api_key": "secret",
+    })
+
+    assert r.json()["retryable"] is True
+    assert r.json()["state"] == "STARTING"
 
 
 def test_secretary_waha_recouple_logs_out_existing_session_before_restart(memdb, monkeypatch):
