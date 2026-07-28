@@ -471,6 +471,67 @@ def test_secretary_waha_qr_endpoint_returns_image(memdb, monkeypatch):
     assert r.json()["image"].startswith("data:image/png;base64,")
 
 
+def test_secretary_waha_recouple_logs_out_existing_session_before_restart(memdb, monkeypatch):
+    _prime_manager()
+    calls = []
+
+    async def fake_waha_request(base_url, path, *, api_key="", method="GET", json_body=None):
+        calls.append((path, method, json_body))
+        return {"ok": True, "status": 200, "text": "{}"}
+
+    monkeypatch.setattr(web_admin, "_waha_request", fake_waha_request)
+    c = TestClient(_app())
+    c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+
+    r = c.post("/admin/secretary/waha/recouple", json={
+        "waha_base_url": "http://waha:3000",
+        "waha_session": "default",
+        "waha_api_key": "secret",
+    })
+
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+    assert calls == [
+        ("/api/sessions/default", "GET", None),
+        ("/api/sessions/default/logout", "POST", None),
+        ("/api/sessions/default/start", "POST", None),
+    ]
+
+
+def test_secretary_waha_start_creates_missing_session(memdb, monkeypatch):
+    _prime_manager()
+    calls = []
+
+    async def fake_waha_request(base_url, path, *, api_key="", method="GET", json_body=None):
+        calls.append((path, method, json_body))
+        if path == "/api/sessions/default":
+            return {"ok": False, "status": 404, "text": "not found"}
+        return {"ok": True, "status": 201, "text": "{}"}
+
+    monkeypatch.setattr(web_admin, "_waha_request", fake_waha_request)
+    c = TestClient(_app())
+    c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+
+    r = c.post("/admin/secretary/waha/start", json={
+        "waha_base_url": "http://waha:3000",
+        "waha_session": "default",
+        "waha_api_key": "secret",
+    })
+
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+    assert calls == [
+        ("/api/sessions/default", "GET", None),
+        ("/api/sessions", "POST", {"name": "default", "start": True}),
+    ]
+
+
 def test_secretary_saves_multiple_email_accounts(memdb, monkeypatch):
     _prime_manager()
 

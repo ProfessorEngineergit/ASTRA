@@ -2531,8 +2531,26 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
       const qrBtn = document.querySelector('[data-waha-qr]');
       if (qrBtn) qrBtn.onclick = loadWahaQr;
       const recoupleBtn = document.querySelector('[data-waha-recouple]');
-      if (recoupleBtn) recoupleBtn.onclick = () => {{
+      if (recoupleBtn) recoupleBtn.onclick = async () => {{
         if (!confirm('WhatsApp wirklich neu koppeln? Die aktuelle Verbindung wird dabei getrennt, bis du den neuen QR-Code gescannt hast.')) return;
+        const box = document.querySelector('[data-qr-box]');
+        if (box) box.textContent = 'Alte Verbindung wird entfernt…';
+        recoupleBtn.disabled = true;
+        try {{
+          const r = await fetch('/admin/secretary/waha/recouple', {{
+            method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(formContext('waha'))
+          }});
+          const d = await r.json();
+          if (!d.ok) {{
+            if (box) box.textContent = d.message || 'Neu koppeln fehlgeschlagen.';
+            return;
+          }}
+        }} catch (e) {{
+          if (box) box.textContent = 'Neu koppeln konnte nicht gestartet werden.';
+          return;
+        }} finally {{
+          recoupleBtn.disabled = false;
+        }}
         loadWahaQr();
       }};
       const testBtn = document.querySelector('[data-waha-test]');
@@ -3007,10 +3025,64 @@ async def secretary_waha_start(request: Request, _: bool = Depends(auth.require_
     base_url = str(data.get("waha_base_url") or data.get("base_url") or "")
     session = str(data.get("waha_session") or data.get("session") or "default")
     api_key = str(data.get("waha_api_key") or data.get("api_key") or "")
-    result = await _waha_request(base_url, f"/api/sessions/{session}/start", api_key=api_key, method="POST")
-    if result["ok"]:
+    status = await _waha_request(base_url, f"/api/sessions/{session}", api_key=api_key)
+    if status.get("ok"):
+        result = await _waha_request(
+            base_url, f"/api/sessions/{session}/start", api_key=api_key, method="POST",
+        )
+    elif status.get("status") == 404:
+        result = await _waha_request(
+            base_url, "/api/sessions", api_key=api_key, method="POST",
+            json_body={"name": session, "start": True},
+        )
+    else:
+        result = status
+    if result.get("ok"):
         return JSONResponse({"ok": True, "message": f"WAHA-Session {session} wurde gestartet."})
     return JSONResponse({"ok": False, "message": result.get("text") or result.get("message") or "Start fehlgeschlagen."})
+
+
+@router.post("/admin/secretary/waha/recouple")
+async def secretary_waha_recouple(request: Request, _: bool = Depends(auth.require_admin)):
+    """Forget only the WhatsApp login and reuse the existing WAHA configuration."""
+    data = await request.json()
+    base_url = str(data.get("waha_base_url") or data.get("base_url") or "")
+    session = str(data.get("waha_session") or data.get("session") or "default")
+    api_key = str(data.get("waha_api_key") or data.get("api_key") or "")
+
+    status = await _waha_request(base_url, f"/api/sessions/{session}", api_key=api_key)
+    if status.get("ok"):
+        logout = await _waha_request(
+            base_url, f"/api/sessions/{session}/logout", api_key=api_key, method="POST",
+        )
+        if not logout.get("ok"):
+            return JSONResponse({
+                "ok": False,
+                "message": logout.get("text") or logout.get("message") or
+                           "Die bestehende WhatsApp-Verbindung konnte nicht getrennt werden.",
+            })
+        start = await _waha_request(
+            base_url, f"/api/sessions/{session}/start", api_key=api_key, method="POST",
+        )
+    elif status.get("status") == 404:
+        start = await _waha_request(
+            base_url, "/api/sessions", api_key=api_key, method="POST",
+            json_body={"name": session, "start": True},
+        )
+    else:
+        start = status
+
+    if not start.get("ok"):
+        return JSONResponse({
+            "ok": False,
+            "message": start.get("text") or start.get("message") or
+                       "Die WhatsApp-Session konnte nicht neu gestartet werden.",
+        })
+    await db.audit("secretary_waha_recouple", actor="owner", detail={"session": session})
+    return JSONResponse({
+        "ok": True,
+        "message": "Die alte WhatsApp-Anmeldung wurde entfernt. Neuer QR-Code wird geladen.",
+    })
 
 
 @router.post("/admin/secretary/waha/status")
