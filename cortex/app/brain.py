@@ -678,5 +678,7 @@ async def resume_outbound_send(approval: dict, decision: str) -> None:
         await get_channels().send_telegram(
             s.telegram_owner_chat_id,
             f"✅ Gesendet an {to} ({label})." if ok
-            else f"⚠️ Senden an {to} ({label}) ist fehlgeschlagen.",
+            else (f"⚠️ Senden an {to} ({label}) ist fehlgeschlagen"
+                  + (f": {get_channels().last_error(channel)}"
+                     if get_channels().last_error(channel) else ".")),
         )

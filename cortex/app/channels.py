@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+from . import db
 from .config import get_settings
 
 log = logging.getLogger("astra.channels")
@@ -39,12 +40,14 @@ class Channels:
     def __init__(self) -> None:
         self.s = get_settings()
         self._http = httpx.AsyncClient(timeout=20)
+        self._last_errors: dict[str, str] = {}
 
     async def aclose(self) -> None:
         await self._http.aclose()
 
     # ── Public API ─────────────────────────────────────────────────────────────
     async def send(self, channel: str, to: str, text: str) -> bool:
+        self._last_errors.pop(channel, None)
         if self.s.astra_dry_run:
             log.info("[DRY_RUN] → %s/%s: %s", channel, to, text)
             return True
@@ -60,8 +63,14 @@ class Channels:
             log.warning("Unknown channel %s", channel)
             return False
         except Exception as e:  # noqa: BLE001
-            log.error("send failed (%s → %s): %s", channel, to, e)
+            message = str(e)[:500] or type(e).__name__
+            self._last_errors[channel] = message
+            log.error("send failed (%s): %s", channel, message)
             return False
+
+    def last_error(self, channel: str) -> str:
+        """Last safe transport error for a user-facing failure explanation."""
+        return self._last_errors.get(channel, "")
 
     # ── Telegram (control + approvals) ───────────────────────────────────────────
     async def send_telegram(
@@ -107,17 +116,85 @@ class Channels:
         Existing JIDs (…@c.us / …@g.us) and group ids pass through untouched."""
         to = (to or "").strip()
         if "@" in to:
-            return to
+            # WAHA documents @c.us for outbound messages even when some engines
+            # expose the same contact as @s.whatsapp.net.
+            return to.replace("@s.whatsapp.net", "@c.us")
         digits = "".join(ch for ch in to if ch.isdigit())
         return f"{digits}@c.us" if digits else to
 
+    async def _waha_runtime_config(self) -> tuple[str, str, str]:
+        """Prefer the Secretary UI installation; fall back to environment values."""
+        installation: dict[str, Any] = {}
+        try:
+            appset = await db.get_setting("app_settings", {}) or {}
+            secretary = appset.get("secretary") if isinstance(appset, dict) else {}
+            installs = secretary.get("installations") if isinstance(secretary, dict) else {}
+            candidate = installs.get("waha") if isinstance(installs, dict) else {}
+            if isinstance(candidate, dict):
+                installation = candidate
+        except Exception:  # noqa: BLE001
+            log.debug("Could not load Secretary WAHA installation.", exc_info=True)
+        base_url = str(installation.get("base_url") or self.s.waha_base_url or "").rstrip("/")
+        session = str(installation.get("session") or self.s.waha_session or "default")
+        api_key = str(installation.get("api_key") or self.s.waha_api_key or "")
+        return base_url, session, api_key
+
+    @staticmethod
+    def _waha_http_error(response: httpx.Response, *, session: str) -> str:
+        status = response.status_code
+        if status in {401, 403}:
+            return f"WAHA lehnt den API-Key ab (HTTP {status})."
+        if status == 404:
+            return f"WAHA-Session '{session}' wurde nicht gefunden (HTTP 404)."
+        if status == 422:
+            detail = ""
+            try:
+                data = response.json()
+                raw = data.get("message") or data.get("error") if isinstance(data, dict) else ""
+                if isinstance(raw, (str, int, float)):
+                    detail = " " + " ".join(str(raw).split())[:240]
+            except (ValueError, TypeError):
+                pass
+            return f"WAHA lehnt die Nachricht ab (HTTP 422).{detail}"
+        return f"WAHA antwortet mit HTTP {status}."
+
     async def _waha(self, chat_id: str, text: str) -> bool:
+        base_url, session, api_key = await self._waha_runtime_config()
+        if not base_url:
+            raise RuntimeError("WAHA Base URL fehlt.")
+        if not api_key:
+            raise RuntimeError("WAHA API-Key fehlt.")
+        headers = {"X-Api-Key": api_key}
+
+        target = self._waha_chat_id(chat_id)
+        if not target or "@" not in target:
+            raise RuntimeError(
+                f"Für '{chat_id}' ist keine gültige WhatsApp-Nummer hinterlegt.")
         r = await self._http.post(
-            f"{self.s.waha_base_url}/api/sendText",
-            headers={"X-Api-Key": self.s.waha_api_key},
-            json={"session": self.s.waha_session, "chatId": self._waha_chat_id(chat_id), "text": text},
+            f"{base_url}/api/sendText",
+            headers=headers,
+            json={"session": session, "chatId": target, "text": text},
         )
-        r.raise_for_status()
+        if not r.is_success:
+            message = self._waha_http_error(r, session=session)
+            # Scoped WAHA keys may allow sending but not reading session data.
+            # Query the state only after a failed send and treat it as optional.
+            if r.status_code in {404, 409, 422}:
+                try:
+                    status_response = await self._http.get(
+                        f"{base_url}/api/sessions/{session}", headers=headers)
+                    if status_response.is_success:
+                        status_data = status_response.json()
+                        state = str(
+                            status_data.get("status") or status_data.get("state") or ""
+                        ).upper()
+                        if state and state not in {"WORKING", "CONNECTED", "AUTHENTICATED"}:
+                            message = (
+                                f"WAHA-Session '{session}' ist {state} "
+                                f"(HTTP {r.status_code}).")
+                except Exception:  # noqa: BLE001
+                    pass
+            raise RuntimeError(message)
         return True
 
     async def _signal(self, recipient: str, text: str) -> bool:

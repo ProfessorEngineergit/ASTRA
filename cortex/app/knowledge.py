@@ -362,6 +362,26 @@ def person_file_for(channel: str, handle: str) -> dict | None:
     return None
 
 
+def person_handle_for(channel: str, name: str) -> str | None:
+    """Resolve an exact person/profile name to a usable outbound channel handle."""
+    target = _person_slug(name)
+    if not target:
+        return None
+    keys = _CHANNEL_KEYS.get(channel, (channel,))
+    for entry in list_files():
+        if entry["tag"] != "person":
+            continue
+        rel_slug = Path(entry["rel"]).stem
+        if target not in {_person_slug(entry["title"]), _person_slug(rel_slug)}:
+            continue
+        handles = parse_person_handles(read_file(entry["rel"]))
+        for key in keys:
+            values = handles.get(key) or []
+            if values and str(values[0]).strip():
+                return str(values[0]).strip()
+    return None
+
+
 def _set_header_line(text: str, label: str, value: str) -> str:
     """Insert/replace a `- **Label:** value` bullet near the top of a person file."""
     pat = re.compile(rf"^(\s*[-*]\s*\*{{0,2}}{re.escape(label)}\*{{0,2}}\s*:).*$",

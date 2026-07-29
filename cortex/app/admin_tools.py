@@ -841,6 +841,19 @@ async def _send_message(args: dict, ctx: ToolContext) -> str:
                            summary="'to' (Telefonnummer/Handle) und 'text' sind erforderlich.")
 
     label = _SEND_LABELS.get(channel, channel)
+    display_to = to
+    if channel in {"waha", "signal"} and "@" not in to and not any(ch.isdigit() for ch in to):
+        resolved = knowledge.person_handle_for(channel, to)
+        if not resolved:
+            return tool_result(
+                ok=False, source="core",
+                summary=f"Für {to} ist keine {label}-Nummer im Personenprofil hinterlegt.")
+        to = resolved
+
+    def failure_summary() -> str:
+        reason = get_channels().last_error(channel)
+        suffix = f": {reason}" if reason else "."
+        return f"Senden an {display_to} ({label}) ist fehlgeschlagen{suffix}"
 
     # Web origin: already confirmed via the AstraChat card → send now.
     if ctx.channel == "web":
@@ -848,8 +861,7 @@ async def _send_message(args: dict, ctx: ToolContext) -> str:
         await db.audit("outbound_web", channel=channel, detail={"to": to, "ok": ok})
         return tool_result(
             ok=ok, source="core",
-            summary=(f"Gesendet an {to} ({label})." if ok
-                     else f"Senden an {to} ({label}) ist fehlgeschlagen."),
+            summary=(f"Gesendet an {display_to} ({label})." if ok else failure_summary()),
         )
 
     # Send to Bahrian himself (incl. self-test) → straight through, no gate.
@@ -859,7 +871,7 @@ async def _send_message(args: dict, ctx: ToolContext) -> str:
         return tool_result(
             ok=ok, source="core",
             summary=(f"An dich selbst auf {label} gesendet." if ok
-                     else f"Senden an dich auf {label} ist fehlgeschlagen."),
+                     else failure_summary()),
         )
 
     # Third party → require an explicit Telegram confirmation before anything leaves.

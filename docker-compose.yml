@@ -155,6 +155,9 @@ services:
     image: devlikeapro/waha:latest
     <<: *restart
     environment:
+      # Current WAHA releases use WAHA_API_KEY. Keep the legacy variable during
+      # migration so existing installations continue to start.
+      WAHA_API_KEY: ${WAHA_API_KEY}
       WHATSAPP_API_KEY: ${WAHA_API_KEY}
       WAHA_DASHBOARD_USERNAME: ${WAHA_DASHBOARD_USERNAME}
       WAHA_DASHBOARD_PASSWORD: ${WAHA_DASHBOARD_PASSWORD}

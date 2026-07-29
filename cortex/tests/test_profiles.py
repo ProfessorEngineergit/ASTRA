@@ -35,6 +35,13 @@ def test_inbound_matches_profile_across_phone_channels(brain):
     assert brain.person_file_for("waha", "490000000000") is None
 
 
+def test_outbound_resolves_exact_person_name_to_phone_handle(brain):
+    brain.upsert_person_profile("Lorenzo", {"phone": "+49 178 3201644"})
+    assert brain.person_handle_for("waha", "Lorenzo") == "+49 178 3201644"
+    assert brain.person_handle_for("signal", "lorenzo") == "+49 178 3201644"
+    assert brain.person_handle_for("waha", "andere Person") is None
+
+
 def test_email_matches_only_email_channel(brain):
     brain.upsert_person_profile("Frau Schmidt", {"email": "schmidt@schule.de", "tone": "formell"})
     assert brain.person_file_for("email", "schmidt@schule.de")["tone"] == "formell"
