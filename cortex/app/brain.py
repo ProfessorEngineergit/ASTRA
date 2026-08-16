@@ -23,7 +23,8 @@ from .persona import TRIAGE_INSTRUCTIONS, Register
 from .policy import Mode, Sensitivity, TrustTier, reconcile
 from .secretary import (
     CHANNEL_LABELS, SECRETARY_CHANNELS, channel_enabled, contact_rule_for, is_group_context,
-    plan_for, shadow_enabled, tone_instruction, unknown_sender_action, with_secretary_header,
+    plan_for, resolve_service_status, shadow_enabled, tone_instruction, unknown_sender_action,
+    with_secretary_header,
 )
 from .security import check_inbound, check_outbound
 from .state import Act, Signal, ThreadState, next_state
@@ -303,6 +304,27 @@ async def handle_inbound(
                                    contact, max_sensitivity="none")
         return
 
+    # The global Secretary state is resolved before contact-specific automation.
+    # In Auto mode, EduPage is authoritative; Calendar/static school time are
+    # fallbacks. This also prevents a `direct` contact from receiving a reply
+    # after Bahrian's actual school day has ended.
+    service_status = await resolve_service_status(appset_pre, s.astra_timezone)
+    if not service_status.active:
+        await db.audit(
+            "secretary_inactive",
+            channel=channel,
+            thread_id=thread_id,
+            contact_id=contact["id"],
+            detail={"reason": service_status.reason, "source": service_status.source},
+        )
+        log.info(
+            "Secretary inactive on %s (%s/%s) — recorded without replying.",
+            thread_id,
+            service_status.source,
+            service_status.reason,
+        )
+        return
+
     if contact_rule is None:
         # Unknown sender — apply the configured default action
         action = unknown_sender_action(appset_pre)
@@ -427,7 +449,7 @@ async def handle_inbound(
 
     # Autonomy override: a confident/full owner lets ASTRA skip waiting/asking.
     mode = decision.mode
-    appset = await _app_settings()
+    appset = appset_pre
     secretary_plan = plan_for(
         channel=channel,
         mode=mode,
@@ -435,6 +457,8 @@ async def handle_inbound(
         app_settings=appset,
         timezone=s.astra_timezone,
         is_group=bool((thread.get("meta") or {}).get("is_group")),
+        service_active=service_status.active,
+        service_reason=service_status.reason,
     )
     # A 'silent' window (e.g. night quiet) → don't respond at all, just log.
     if secretary_plan.silent:

@@ -23,7 +23,7 @@ from ..config_store import SECRET_SENTINEL, get_config_store
 from ..google_oauth import authorization_url, exchange_code, token_patch, user_email
 from ..plugins.base import CATEGORY_LABELS, FieldType
 from ..plugins.registry import get_manager
-from ..secretary import CHANNEL_LABELS, secretary_settings
+from ..secretary import CHANNEL_LABELS, resolve_service_status, secretary_settings
 from . import auth
 from ..models import (
     ROLES,
@@ -2179,6 +2179,7 @@ async def inbox_legacy(_: bool = Depends(auth.require_admin), thread: str = ""):
 async def secretary_page(request: Request, _: bool = Depends(auth.require_admin), thread: str = ""):
     appset = await _app_settings()
     settings = secretary_settings(appset)
+    service_status = await resolve_service_status(appset, get_settings().astra_timezone)
     all_threads = await db.list_threads(80)
     threads = [t for t in all_threads if t.get("channel") in SECRETARY_SETUP_CHANNELS]
     selected = next((t for t in threads if t.get("thread_id") == thread), threads[0] if threads else None)
@@ -2246,16 +2247,21 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
           <div>
             <h2 style="margin:0 0 5px;font-size:17px">Secretary</h2>
             <p class="note" data-secretary-master-copy style="margin:0">
-              {"Aktiv – ASTRA darf auf freigegebenen Kanälen stellvertretend antworten."
-               if settings.get("enabled", True)
-               else "Aus – Nachrichten werden erfasst, aber ASTRA antwortet niemandem stellvertretend."}
+              {"Gerade aktiv" if service_status.active else "Gerade inaktiv"} ·
+              {"EduPage" if service_status.source == "edupage" else
+               "Google Kalender" if service_status.source == "google_calendar" else
+               "manuell" if service_status.source == "manual" else "statischer Ersatzplan"}.
             </p>
           </div>
-          <label class="secretary-switch" style="font-size:15px;padding:10px 14px">
-            <input type="checkbox" role="switch" name="sec_enabled" data-secretary-master
-                   {_checked(settings.get("enabled", True))}>
-            <span data-secretary-master-label>{"Eingeschaltet" if settings.get("enabled", True) else "Ausgeschaltet"}</span>
-          </label>
+          <input type="hidden" name="sec_activation_mode" data-secretary-mode-input
+                 value="{esc(settings.get('activation_mode', 'auto'))}">
+          <div role="group" aria-label="Secretary-Modus" style="display:flex;gap:7px;flex-wrap:wrap">
+            {''.join(
+                f'<button class="btn sm {"" if settings.get("activation_mode") == value else "ghost"}" '
+                f'type="button" data-secretary-mode="{value}">{label}</button>'
+                for value, label in (("auto", "Automatisch"), ("on", "Immer an"), ("off", "Aus"))
+            )}
+          </div>
         </div>
       </section>
       <section class="panel">
@@ -2339,30 +2345,34 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
     <script>
       const activeSetup = {{channel: 'waha'}};
       const labels = {{waha:'WhatsApp / WAHA', signal:'Signal', slack:'Slack', email:'Mail'}};
-      const secretaryMaster = document.querySelector('[data-secretary-master]');
-      if (secretaryMaster) secretaryMaster.addEventListener('change', async () => {{
-        const enabled = secretaryMaster.checked;
-        const label = document.querySelector('[data-secretary-master-label]');
+      const secretaryModeInput = document.querySelector('[data-secretary-mode-input]');
+      const secretaryModeButtons = [...document.querySelectorAll('[data-secretary-mode]')];
+      secretaryModeButtons.forEach(button => button.addEventListener('click', async () => {{
+        const previous = secretaryModeInput.value;
+        const mode = button.dataset.secretaryMode;
         const copy = document.querySelector('[data-secretary-master-copy]');
-        secretaryMaster.disabled = true;
+        secretaryModeButtons.forEach(item => item.disabled = true);
         const data = new FormData();
         data.append('csrf', document.querySelector('input[name="csrf"]').value);
-        data.append('enabled', enabled ? 'true' : 'false');
+        data.append('mode', mode);
         try {{
           const r = await fetch('/admin/secretary/toggle', {{method:'POST', body:data}});
           const d = await r.json();
           if (!r.ok || !d.ok) throw new Error(d.error || 'Speichern fehlgeschlagen');
-          if (label) label.textContent = enabled ? 'Eingeschaltet' : 'Ausgeschaltet';
-          if (copy) copy.textContent = enabled
-            ? 'Aktiv – ASTRA darf auf freigegebenen Kanälen stellvertretend antworten.'
-            : 'Aus – Nachrichten werden erfasst, aber ASTRA antwortet niemandem stellvertretend.';
+          secretaryModeInput.value = mode;
+          secretaryModeButtons.forEach(item => item.classList.toggle('ghost', item.dataset.secretaryMode !== mode));
+          if (copy) copy.textContent = mode === 'off'
+            ? 'Aus – Nachrichten werden erfasst, aber ASTRA antwortet niemandem stellvertretend.'
+            : mode === 'on'
+              ? 'Immer an – ASTRA antwortet auf freigegebenen Kanälen.'
+              : 'Automatisch – EduPage bestimmt den echten Schultag; Kalender und Ersatzplan springen nur bei Ausfall ein.';
         }} catch (e) {{
-          secretaryMaster.checked = !enabled;
+          secretaryModeInput.value = previous;
           alert('Secretary konnte nicht umgeschaltet werden.');
         }} finally {{
-          secretaryMaster.disabled = false;
+          secretaryModeButtons.forEach(item => item.disabled = false);
         }}
-      }});
+      }}));
       function formContext(channel) {{
         const card = document.querySelector(`[data-install="${{channel}}"]`);
         const out = {{}};
@@ -2716,14 +2726,19 @@ async def secretary_toggle(request: Request, _: bool = Depends(auth.require_admi
     form = await request.form()
     if not await _check_csrf(request, form):
         return JSONResponse({"ok": False, "error": "Ungültige Sitzung."}, status_code=403)
-    enabled = str(form.get("enabled") or "").lower() in {"1", "true", "yes", "on"}
+    mode = str(form.get("mode") or "").strip().lower()
+    if mode not in {"auto", "on", "off"}:
+        enabled = str(form.get("enabled") or "").lower() in {"1", "true", "yes", "on"}
+        mode = "auto" if enabled else "off"
+    enabled = mode != "off"
     appset = await _app_settings()
     secretary = appset.get("secretary") if isinstance(appset.get("secretary"), dict) else {}
     secretary["enabled"] = enabled
+    secretary["activation_mode"] = mode
     appset["secretary"] = secretary
     await db.set_setting("app_settings", appset)
-    await db.audit("secretary_toggled", actor="owner", detail={"enabled": enabled})
-    return JSONResponse({"ok": True, "enabled": enabled})
+    await db.audit("secretary_toggled", actor="owner", detail={"enabled": enabled, "mode": mode})
+    return JSONResponse({"ok": True, "enabled": enabled, "mode": mode})
 
 
 @router.post("/admin/secretary")
@@ -2732,6 +2747,7 @@ async def secretary_save(request: Request, _: bool = Depends(auth.require_admin)
     if not await _check_csrf(request, form):
         return RedirectResponse("/admin/secretary", status_code=303)
     appset = await _app_settings()
+    raw_secretary = (appset or {}).get("secretary", {}) or {}
     current = secretary_settings(appset)
 
     def intval(name: str, fallback: int) -> int:
@@ -2815,8 +2831,13 @@ async def secretary_save(request: Request, _: bool = Depends(auth.require_admin)
             })
         i += 1
 
+    activation_mode = str(form.get("sec_activation_mode") or current["activation_mode"]).lower()
+    if activation_mode not in {"auto", "on", "off"}:
+        activation_mode = "auto"
     appset["secretary"] = {
-        "enabled": form.get("sec_enabled") == "on",
+        **raw_secretary,
+        "enabled": activation_mode != "off",
+        "activation_mode": activation_mode,
         "tone": str(form.get("sec_tone") or "warm"),
         "default_tone": str(form.get("sec_default_tone") or "").strip(),
         "jailbreak_tone": str(form.get("sec_jailbreak_tone") or "firm"),
@@ -2837,7 +2858,8 @@ async def secretary_save(request: Request, _: bool = Depends(auth.require_admin)
     }
     await db.set_setting("app_settings", appset)
     await db.audit("secretary_settings_saved", actor="owner",
-                   detail={"channels": list(channels), "email_accounts": len(email_accounts)})
+                   detail={"channels": list(channels), "email_accounts": len(email_accounts),
+                           "activation_mode": activation_mode})
     try:
         await _mirror_secretary_to_plugins(installations, channels, email_accounts)
     except Exception:  # noqa: BLE001

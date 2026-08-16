@@ -335,6 +335,124 @@ def test_google_calendar_native_today_uses_calendar_api(monkeypatch):
     assert "www.googleapis.com/calendar/v3/calendars/primary/events" in calls[0][1]
 
 
+def test_google_calendar_native_update_and_delete(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def json(self):
+            return {"id": "event-1", "summary": "Klavier"}
+
+    async def fake_google_api(plugin, method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setattr("app.plugins.builtin.google_calendar.google_api", fake_google_api)
+    plugin = GoogleCalendarPlugin({
+        "__enabled": True,
+        "backend": "native",
+        "client_id": "cid",
+        "client_secret": "sec",
+        "refresh_token": "ref",
+        "calendar_id": "primary",
+    })
+
+    updated = asyncio.run(plugin.update_event("event-1", {"title": "Klavier", "location": "Studio"}))
+    deleted = asyncio.run(plugin.delete_event("event-1"))
+
+    assert updated["summary"] == "Klavier"
+    assert deleted == {"id": "event-1", "deleted": True}
+    assert calls[0][0] == "PATCH"
+    assert calls[0][2]["json"] == {"summary": "Klavier", "location": "Studio"}
+    assert calls[1][0] == "DELETE"
+
+
+def test_google_calendar_freebusy_uses_edupage_over_school_baseline(monkeypatch):
+    class FakeResponse:
+        def json(self):
+            return {"items": [
+                {
+                    "id": "baseline",
+                    "summary": "Schule · Mathe",
+                    "description": "ASTRA_SCHOOL_BASELINE",
+                    "start": {"dateTime": "2026-08-20T10:00:00+02:00"},
+                    "end": {"dateTime": "2026-08-20T11:00:00+02:00"},
+                },
+                {
+                    "id": "personal",
+                    "summary": "Klavier",
+                    "start": {"dateTime": "2026-08-20T18:00:00+02:00"},
+                    "end": {"dateTime": "2026-08-20T18:45:00+02:00"},
+                },
+            ]}
+
+    async def fake_google_api(plugin, method, url, **kwargs):
+        return FakeResponse()
+
+    edupage = EduPagePlugin({
+        "__enabled": True, "subdomain": "school", "username": "u", "password": "p", "preferred_group": "B",
+    })
+
+    async def fake_timetable(day):
+        return {"ok": True, "lessons": [{
+            "subject": "Deutsch", "groups": ["B"], "start": "08:00", "end": "09:40", "cancelled": False,
+        }]}
+
+    class FakeManager:
+        def get(self, slug):
+            return edupage if slug == "edupage" else None
+
+    monkeypatch.setattr(edupage, "timetable_result", fake_timetable)
+    monkeypatch.setattr("app.plugins.registry.get_manager", lambda: FakeManager())
+    monkeypatch.setattr("app.plugins.builtin.google_calendar.google_api", fake_google_api)
+    plugin = GoogleCalendarPlugin({
+        "__enabled": True,
+        "backend": "native",
+        "client_id": "cid",
+        "client_secret": "sec",
+        "refresh_token": "ref",
+        "calendar_id": "primary",
+    })
+    tool = next(t for t in plugin.tools() if t.name == "calendar_freebusy")
+    ctx = ToolContext(
+        thread_id="waha:contact", channel="waha", contact={"id": "contact"},
+        max_sensitivity="details", is_owner=False,
+    )
+
+    payload = _payload(asyncio.run(tool.handler({
+        "start": "2026-08-20T07:00:00+02:00",
+        "end": "2026-08-20T20:00:00+02:00",
+    }, ctx)))
+
+    assert payload["ok"] is True
+    assert "Deutsch" in payload["summary"]
+    assert "Klavier" in payload["summary"]
+    assert "Mathe" not in payload["summary"]
+
+
+def test_google_calendar_freebusy_respects_third_party_ceiling():
+    plugin = GoogleCalendarPlugin({
+        "__enabled": True,
+        "backend": "native",
+        "client_id": "cid",
+        "client_secret": "sec",
+        "refresh_token": "ref",
+        "calendar_id": "primary",
+    })
+    tool = next(t for t in plugin.tools() if t.name == "calendar_freebusy")
+    ctx = ToolContext(
+        thread_id="waha:contact", channel="waha", contact={"id": "contact"},
+        max_sensitivity="none", is_owner=False,
+    )
+
+    payload = _payload(asyncio.run(tool.handler({
+        "start": "2026-08-20T07:00:00+02:00",
+        "end": "2026-08-20T20:00:00+02:00",
+    }, ctx)))
+
+    assert payload["ok"] is False
+    assert payload["data"] is None
+
+
 def test_edupage_auto_scans_for_next_lesson(monkeypatch):
     plugin = EduPagePlugin({"__enabled": True, "subdomain": "school", "username": "u", "password": "p"})
     calls = []

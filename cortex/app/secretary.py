@@ -1,6 +1,7 @@
 """Secretary policy for third-party channels."""
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
@@ -8,6 +9,7 @@ from zoneinfo import ZoneInfo
 from .policy import Mode, Sensitivity
 
 SECRETARY_CHANNELS = {"waha", "signal", "slack", "email"}
+ACTIVATION_MODES = ("auto", "on", "off")
 
 # Contact rule values
 CONTACT_RULES = ("block", "allow", "ask", "direct")
@@ -49,9 +51,24 @@ class SecretaryPlan:
     silent: bool = False   # a 'silent' window (e.g. night): don't respond at all
 
 
+@dataclass(frozen=True)
+class SecretaryServiceStatus:
+    active: bool
+    source: str
+    reason: str
+    starts_at: datetime | None = None
+    ends_at: datetime | None = None
+
+
+_SERVICE_CACHE: dict[tuple[str, str], tuple[datetime, SecretaryServiceStatus]] = {}
+
+
 def secretary_settings(app_settings: dict | None) -> dict:
     raw = (app_settings or {}).get("secretary", {}) or {}
     channels = raw.get("channels") or {}
+    activation_mode = str(raw.get("activation_mode") or "").strip().lower()
+    if activation_mode not in ACTIVATION_MODES:
+        activation_mode = "auto" if bool(raw.get("enabled", True)) else "off"
 
     def as_int(key: str, fallback: int) -> int:
         try:
@@ -68,7 +85,10 @@ def secretary_settings(app_settings: dict | None) -> dict:
         }
 
     return {
-        "enabled": bool(raw.get("enabled", True)),
+        # ``enabled`` stays as a compatibility view for older callers/configs.
+        # The three-state activation_mode is authoritative once present.
+        "enabled": activation_mode != "off",
+        "activation_mode": activation_mode,
         "tone": raw.get("tone", "warm"),
         "default_tone": (raw.get("default_tone") or "").strip(),
         "jailbreak_tone": raw.get("jailbreak_tone", "firm"),
@@ -102,6 +122,14 @@ def _parse_hhmm(value: str, fallback: time) -> time:
         return fallback
 
 
+def _parse_optional_hhmm(value: str) -> time | None:
+    try:
+        h, m = str(value).split(":", 1)
+        return time(int(h), int(m[:2]))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def in_school_window(now: datetime, settings: dict) -> bool:
     try:
         workdays = {int(day) for day in (settings.get("workdays") or [])}
@@ -117,6 +145,147 @@ def in_school_window(now: datetime, settings: dict) -> bool:
 def channel_enabled(app_settings: dict | None, channel: str) -> bool:
     settings = secretary_settings(app_settings)
     return bool(settings["enabled"] and settings["channels"].get(channel, {}).get("enabled", True))
+
+
+def _school_span(
+    lessons: list[dict],
+    day,
+    tz: ZoneInfo,
+    *,
+    parse_time,
+) -> tuple[datetime, datetime] | None:
+    intervals: list[tuple[datetime, datetime]] = []
+    for lesson in lessons:
+        if lesson.get("cancelled"):
+            continue
+        start_t = parse_time(lesson.get("start", ""))
+        end_t = parse_time(lesson.get("end", ""))
+        if start_t and end_t:
+            intervals.append((
+                datetime.combine(day, start_t, tzinfo=tz),
+                datetime.combine(day, end_t, tzinfo=tz),
+            ))
+    if not intervals:
+        return None
+    return min(start for start, _ in intervals), max(end for _, end in intervals)
+
+
+async def resolve_service_status(
+    app_settings: dict | None,
+    timezone: str,
+    *,
+    now: datetime | None = None,
+    refresh: bool = False,
+) -> SecretaryServiceStatus:
+    """Resolve whether Secretary should currently be on.
+
+    In automatic mode a successful EduPage day is authoritative. Cancelled
+    lessons are ignored, so an omitted/cancelled last period shortens the day.
+    The imported Google Calendar baseline is the next fallback, followed by the
+    legacy static school window. Results are cached briefly to keep incoming
+    messages fast without hiding timetable changes for long.
+    """
+    settings = secretary_settings(app_settings)
+    activation_mode = settings["activation_mode"]
+    try:
+        tz = ZoneInfo(timezone)
+        if now is None:
+            local_now = datetime.now(tz)
+        elif now.tzinfo:
+            local_now = now.astimezone(tz)
+        else:
+            local_now = now.replace(tzinfo=tz)
+    except Exception:  # noqa: BLE001
+        tz = ZoneInfo("Europe/Berlin")
+        if now is None:
+            local_now = datetime.now(tz)
+        elif now.tzinfo:
+            local_now = now.astimezone(tz)
+        else:
+            local_now = now.replace(tzinfo=tz)
+
+    if activation_mode == "off":
+        return SecretaryServiceStatus(False, "manual", "manual-off")
+    if activation_mode == "on":
+        return SecretaryServiceStatus(True, "manual", "manual-on")
+
+    cache_key = (timezone, local_now.date().isoformat())
+    cached = _SERVICE_CACHE.get(cache_key)
+    if not refresh and cached and (local_now - cached[0]).total_seconds() < 60:
+        return cached[1]
+
+    def remember(status: SecretaryServiceStatus) -> SecretaryServiceStatus:
+        _SERVICE_CACHE[cache_key] = (local_now, status)
+        return status
+
+    try:
+        from .plugins.registry import get_manager
+        manager = get_manager()
+    except Exception:  # noqa: BLE001
+        manager = None
+
+    try:
+        edupage = manager.get("edupage") if manager else None
+        if edupage is not None and edupage.enabled and hasattr(edupage, "timetable_result"):
+            result = await asyncio.wait_for(edupage.timetable_result(local_now.date()), timeout=8)
+            if result.get("ok"):
+                lessons = result.get("lessons") or []
+                group = edupage._default_group() if hasattr(edupage, "_default_group") else "B"
+                if hasattr(edupage, "_filter_lessons"):
+                    lessons = edupage._filter_lessons(lessons, group)
+                parser = edupage._parse_hhmm if hasattr(edupage, "_parse_hhmm") else _parse_optional_hhmm
+                span = _school_span(lessons, local_now.date(), tz, parse_time=parser)
+                if span:
+                    start, end = span
+                    active = start <= local_now <= end
+                    return remember(SecretaryServiceStatus(
+                        active, "edupage",
+                        "edupage-school-day" if active else "edupage-outside-school-day",
+                        start, end,
+                    ))
+                return remember(SecretaryServiceStatus(
+                    False, "edupage", "edupage-no-active-lessons",
+                ))
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        calendar = manager.get("google_calendar") if manager else None
+        if calendar is not None and calendar.enabled and hasattr(calendar, "events"):
+            from .plugins.builtin.google_calendar import SCHOOL_BASELINE_MARKER
+
+            day_start = datetime.combine(local_now.date(), time.min, tzinfo=tz)
+            day_end = datetime.combine(local_now.date(), time.max, tzinfo=tz)
+            events = await asyncio.wait_for(
+                calendar.events(day_start.isoformat(), day_end.isoformat(), max_results=100),
+                timeout=8,
+            )
+            intervals = []
+            for event in events:
+                if SCHOOL_BASELINE_MARKER not in str(event.get("description") or ""):
+                    continue
+                interval = calendar._event_interval(event, tz)
+                if interval:
+                    intervals.append(interval)
+            if intervals:
+                start = min(item[0] for item in intervals)
+                end = max(item[1] for item in intervals)
+                active = start <= local_now <= end
+                return remember(SecretaryServiceStatus(
+                    active, "google_calendar",
+                    "calendar-school-day" if active else "calendar-outside-school-day",
+                    start, end,
+                ))
+    except Exception:  # noqa: BLE001
+        # A remote source must never stop Secretary from reaching the configured
+        # local fallback. Connection details are logged by the plugins themselves.
+        pass
+
+    active = in_school_window(local_now, settings)
+    return remember(SecretaryServiceStatus(
+        active, "static",
+        "static-school-window" if active else "static-outside-school-window",
+    ))
 
 
 def is_group_context(channel: str, handle: str, meta: dict | None = None) -> bool:
@@ -162,6 +331,8 @@ def plan_for(
     timezone: str,
     now: datetime | None = None,
     is_group: bool = False,
+    service_active: bool | None = None,
+    service_reason: str = "",
 ) -> SecretaryPlan:
     settings = secretary_settings(app_settings)
     if channel not in SECRETARY_CHANNELS or not settings["enabled"]:
@@ -173,7 +344,20 @@ def plan_for(
         local_now = now or datetime.now(ZoneInfo(timezone))
     except Exception:  # noqa: BLE001
         local_now = now or datetime.now()
-    in_window = in_school_window(local_now, settings)
+    activation_mode = settings["activation_mode"]
+    if activation_mode == "on":
+        in_window = True
+    elif service_active is not None:
+        in_window = bool(service_active)
+    else:
+        in_window = in_school_window(local_now, settings)
+    if activation_mode == "auto" and not in_window:
+        return SecretaryPlan(
+            mode,
+            service_reason or "auto-outside-service-window",
+            False,
+            silent=True,
+        )
     if is_group and settings.get("group_actions") != "auto":
         return SecretaryPlan(Mode.ASK, "group-action-requires-owner-grant", in_window, True)
 
@@ -188,7 +372,7 @@ def plan_for(
         return SecretaryPlan(Mode.ASK, "email-requires-owner-confirmation", in_window, True)
 
     if behavior == "auto":
-        return SecretaryPlan(Mode.AUTO, "window-auto", in_window)
+        return SecretaryPlan(Mode.AUTO, service_reason or "window-auto", in_window)
     if behavior == "hold":
         return SecretaryPlan(Mode.DEFER, "window-hold", in_window, True)
     if behavior == "notify":
@@ -197,8 +381,14 @@ def plan_for(
         return SecretaryPlan(Mode.AUTO, f"{channel}-direct", in_window)
     if channel_mode == "wait":
         return SecretaryPlan(Mode.DEFER, f"{channel}-wait", in_window, True)
-    if in_window and settings["school_direct"] and mode == Mode.DEFER:
-        return SecretaryPlan(Mode.AUTO, "school-window-direct-secretary", True)
+    if activation_mode == "on":
+        return SecretaryPlan(Mode.AUTO, "manual-on", True)
+    if in_window and settings["school_direct"] and mode in (Mode.DEFER, Mode.ASK):
+        return SecretaryPlan(
+            Mode.AUTO,
+            service_reason or "school-window-direct-secretary",
+            True,
+        )
     if mode == Mode.DEFER:
         return SecretaryPlan(mode, "owner-likely-personal-reply", in_window, True)
     return SecretaryPlan(mode, "policy-kept", in_window, mode == Mode.ASK)

@@ -3,6 +3,9 @@ invoke personal-assistant tools (core remember_fact + every plugin tool)."""
 from __future__ import annotations
 
 import asyncio
+import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from app.plugins.registry import _discover_classes
 from app.tools import (
@@ -10,7 +13,7 @@ from app.tools import (
     openai_tools, register,
 )
 
-CORE_ALWAYS = {"recall_memory", "request_owner_approval"}
+CORE_ALWAYS = {"recall_memory", "request_owner_approval", "check_availability"}
 
 
 def test_core_tools_registered():
@@ -38,6 +41,46 @@ def test_third_party_never_sees_owner_tools():
         assert "get_departures" in owner
     finally:
         clear_source("rmv")
+
+
+def test_check_availability_hides_titles_at_freebusy_ceiling(monkeypatch):
+    class Calendar:
+        enabled = True
+
+        @staticmethod
+        def _parse_datetime(value, tz):
+            return datetime.fromisoformat(value).astimezone(tz)
+
+        async def effective_busy(self, start, end):
+            tz = ZoneInfo("Europe/Berlin")
+            return [{
+                "start": datetime(2026, 8, 20, 18, 0, tzinfo=tz),
+                "end": datetime(2026, 8, 20, 18, 45, tzinfo=tz),
+                "title": "Klavier",
+                "source": "google_calendar",
+                "event_id": "private-id",
+            }]
+
+    class Manager:
+        def get(self, slug):
+            return Calendar() if slug == "google_calendar" else None
+
+    monkeypatch.setattr("app.plugins.registry.get_manager", lambda: Manager())
+    ctx = ToolContext(
+        thread_id="waha:x", channel="waha", contact={"id": "x"},
+        max_sensitivity="freebusy", is_owner=False,
+    )
+
+    raw = asyncio.run(REGISTRY["check_availability"].handler({
+        "start": "2026-08-20T17:00:00+02:00",
+        "end": "2026-08-20T20:00:00+02:00",
+    }, ctx))
+    payload = json.loads(raw)
+
+    assert payload["ok"] is True
+    assert payload["data"]["busy"] is True
+    assert "Klavier" not in raw
+    assert "private-id" not in raw
 
 
 def test_dispatch_blocks_owner_tool_for_third_party():
@@ -87,8 +130,10 @@ def test_update_settings_can_toggle_secretary_via_json(memdb):
 
     result = asyncio.run(_update_settings({"secretary_enabled": False}, ctx))
 
-    assert "Secretary=False" in result
-    assert memdb["app_settings"]["secretary"] == {"enabled": False, "tone": "warm"}
+    assert "Secretary=off" in result
+    assert memdb["app_settings"]["secretary"] == {
+        "enabled": False, "activation_mode": "off", "tone": "warm",
+    }
 
 
 def test_send_message_resolves_owner_name_to_live_waha_self(monkeypatch, memdb):

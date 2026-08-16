@@ -179,7 +179,13 @@ class EduPagePlugin(Plugin):
             import edupage_api  # type: ignore  # noqa: F401
         except Exception:  # noqa: BLE001
             return HealthStatus.error("edupage-api Lib fehlt (im Image best-effort installiert).")
-        return HealthStatus.ok("Zugangsdaten gesetzt (Login wird bei Abruf geprüft).")
+        try:
+            await asyncio.wait_for(asyncio.to_thread(self._login_sync), timeout=15)
+        except TimeoutError:
+            return HealthStatus.error("EduPage-Login hat nach 15 Sekunden nicht geantwortet.")
+        except Exception as e:  # noqa: BLE001
+            return HealthStatus.error(f"EduPage-Login fehlgeschlagen: {e}")
+        return HealthStatus.ok(f"EduPage-Login bestaetigt · Standardgruppe {self._default_group()}.")
 
     def _default_group(self) -> str:
         return str(self.get("preferred_group") or "B").strip().upper()

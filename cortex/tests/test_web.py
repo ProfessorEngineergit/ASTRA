@@ -663,7 +663,7 @@ def test_secretary_saves_multiple_email_accounts(memdb, monkeypatch):
     csrf = c.cookies.get(auth.CSRF_COOKIE)
     r = c.post("/admin/secretary", data={
         "csrf": csrf,
-        "sec_enabled": "on",
+        "sec_activation_mode": "auto",
         "sec_email_enabled": "on",
         "sec_email_count": "2",
         "sec_email_0_from": "privat@example.com",
@@ -703,13 +703,15 @@ def test_secretary_master_toggle_applies_immediately_and_preserves_config(memdb,
 
     r = c.post("/admin/secretary/toggle", data={"csrf": csrf, "enabled": "false"})
 
-    assert r.status_code == 200 and r.json() == {"ok": True, "enabled": False}
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "enabled": False, "mode": "off"}
     assert memdb["app_settings"]["secretary"]["enabled"] is False
+    assert memdb["app_settings"]["secretary"]["activation_mode"] == "off"
     assert memdb["app_settings"]["secretary"]["tone"] == "crisp"
     assert memdb["app_settings"]["secretary"]["installations"]["waha"]["session"] == "mine"
     page = c.get("/admin/secretary")
-    assert "data-secretary-master" in page.text
-    assert "Ausgeschaltet" in page.text
+    assert "data-secretary-mode" in page.text
+    assert "Gerade inaktiv" in page.text
 
 
 def test_legacy_raw_tool_result_is_rendered_as_summary():

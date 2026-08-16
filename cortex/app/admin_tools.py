@@ -243,11 +243,15 @@ async def _test_capability(args: dict, ctx: ToolContext) -> str:
 async def _get_settings(args: dict, ctx: ToolContext) -> str:
     s = await _settings()
     loc = s.get("location", {}) or {}
+    secretary = s.get("secretary") or {}
+    secretary_mode = secretary.get("activation_mode") or (
+        "auto" if secretary.get("enabled", True) else "off"
+    )
     return (
         f"Modell: {s.get('ai_model') or '(Standard aus .env)'}\n"
         f"Autonomie: {s.get('autonomy', 'ask')}\n"
         f"Sparmodus: {bool(s.get('economy_mode'))}\n"
-        f"Secretary: {bool((s.get('secretary') or {}).get('enabled', True))}\n"
+        f"Secretary: {secretary_mode}\n"
         f"Selbst-Konfig erlaubt: {s.get('allow_self_config', True)}\n"
         f"Schriftart: {s.get('font', 'inter')}\n"
         f"Name: {s.get('owner_name', 'Bahrian')} · TZ: {s.get('timezone', 'Europe/Berlin')}\n"
@@ -279,15 +283,22 @@ async def _update_settings(args: dict, ctx: ToolContext) -> str:
     if "secretary_enabled" in args and args["secretary_enabled"] is not None:
         secretary = s.get("secretary") if isinstance(s.get("secretary"), dict) else {}
         secretary["enabled"] = bool(args["secretary_enabled"])
+        secretary["activation_mode"] = "auto" if secretary["enabled"] else "off"
         s["secretary"] = secretary
-        changed.append(f"Secretary={secretary['enabled']}")
+        changed.append(f"Secretary={secretary['activation_mode']}")
+    if args.get("secretary_mode") in {"auto", "on", "off"}:
+        secretary = s.get("secretary") if isinstance(s.get("secretary"), dict) else {}
+        secretary["activation_mode"] = args["secretary_mode"]
+        secretary["enabled"] = args["secretary_mode"] != "off"
+        s["secretary"] = secretary
+        changed.append(f"Secretary={secretary['activation_mode']}")
     if "font" in args and args["font"]:
         s["font"] = str(args["font"])
         set_font(s["font"])
         changed.append(f"Font={s['font']}")
     if not changed:
         return ("Nichts geändert. Felder: model, autonomy(ask|confident|full), economy, "
-                "font, allow_self_config, secretary_enabled.")
+                "font, allow_self_config, secretary_mode(auto|on|off), secretary_enabled.")
     await db.set_setting("app_settings", s)
     await db.audit("self_settings", actor="astra", detail={"changed": changed})
     return "Aktualisiert: " + ", ".join(changed)
@@ -579,10 +590,13 @@ async def _secretary_simulate(args: dict, ctx: ToolContext) -> str:
     except ValueError:
         mode = Mode.DEFER
     win = secretary.active_window(appset, now)
+    service = await secretary.resolve_service_status(appset, tz, now=now, refresh=True)
     plan = secretary.plan_for(
         channel=channel, mode=mode, max_sensitivity=Sensitivity.FREEBUSY,
         app_settings=appset, timezone=tz, now=now,
         is_group=bool(args.get("is_group")),
+        service_active=service.active,
+        service_reason=service.reason,
     )
     shadow = secretary.shadow_enabled(appset, channel)
     outcome = ("STILL (keine Antwort)" if plan.silent else
@@ -591,6 +605,7 @@ async def _secretary_simulate(args: dict, ctx: ToolContext) -> str:
                 "ask": "ASK (fragt dich)"}.get(plan.mode.value, plan.mode.value))
     return (f"Simulation {channel} · {now:%a %H:%M} · Triage={mode.value}\n"
             f"Fenster: {win.get('name') if win else '—'} ({win.get('behavior') if win else '—'})\n"
+            f"Aktivierung: {service.source} · {service.reason}\n"
             f"Plan: {plan.mode.value} · Grund: {plan.reason}\n"
             f"Schattenmodus: {'an' if shadow else 'aus'}\n"
             f"→ Ergebnis: {outcome}")
@@ -992,13 +1007,15 @@ def register_admin_tools() -> None:
          {"type": "object", "properties": {}}, _get_settings),
         ("astra_update_settings",
          "Ändere ASTRAs Einstellungen: model, autonomy(ask|confident|full), economy, font, "
-         "allow_self_config und Secretary global ein/aus.",
+         "allow_self_config und Secretary automatisch/immer an/aus.",
          {"type": "object", "properties": {
              "model": {"type": "string"}, "autonomy": {"type": "string"},
              "economy": {"type": "boolean"}, "font": {"type": "string"},
              "allow_self_config": {"type": "boolean"},
+             "secretary_mode": {"type": "string", "enum": ["auto", "on", "off"],
+                                "description": "Secretary: automatisch nach Unterricht, immer an oder aus"},
              "secretary_enabled": {"type": "boolean",
-                                     "description": "Secretary global ein- oder ausschalten"}}},
+                                     "description": "Legacy-Schalter: true=auto, false=aus"}}},
          _update_settings),
         ("astra_system_status", "Container-Leistung (RAM/CPU/Disk/Uptime) + Empfehlungen.",
          {"type": "object", "properties": {}}, _system_status),

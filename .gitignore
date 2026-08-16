@@ -2,6 +2,9 @@
 .env
 *.env
 !.env.example
+client_secret*.json
+credentials*.json
+.secrets/
 
 # ─── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
@@ -24,6 +27,10 @@ waha_data/
 signal_data/
 caddy_data/
 caddy_config/
+brain_data/
+
+# ─── Local working/import artifacts (may contain personal data) ──────────────
+tmp/
 
 # ─── OS / editor ──────────────────────────────────────────────────────────────
 .DS_Store

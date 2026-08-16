@@ -1,7 +1,9 @@
 """Google Calendar — native Google OAuth, with n8n as a legacy fallback."""
 from __future__ import annotations
 
+import asyncio
 import logging
+from datetime import date as date_cls
 from datetime import datetime, time, timedelta
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -16,6 +18,7 @@ from ..base import ConfigField, FieldType, HealthStatus, Plugin, PluginCategory
 log = logging.getLogger("astra.plugin.google_calendar")
 
 CAL_API = "https://www.googleapis.com/calendar/v3"
+SCHOOL_BASELINE_MARKER = "ASTRA_SCHOOL_BASELINE"
 
 
 class GoogleCalendarPlugin(Plugin):
@@ -71,23 +74,33 @@ class GoogleCalendarPlugin(Plugin):
         end = datetime.combine(today + timedelta(days=1), time.min, tzinfo=tz).isoformat()
         return start, end
 
-    async def events(self, start: str, end: str, *, max_results: int = 20) -> list[dict]:
+    async def events(
+        self,
+        start: str,
+        end: str,
+        *,
+        max_results: int = 20,
+        query: str = "",
+    ) -> list[dict]:
         if self._backend() == "n8n":
             data = await self._webhook("calendar_conflicts", {
                 "calendar_id": self.get("calendar_id", "primary"), "start": start, "end": end,
             })
             return data if isinstance(data, list) else data.get("conflicts", [])
+        params = {
+            "timeMin": start,
+            "timeMax": end,
+            "singleEvents": "true",
+            "orderBy": "startTime",
+            "maxResults": max(1, min(max_results, 250)),
+        }
+        if query.strip():
+            params["q"] = query.strip()
         r = await google_api(
             self,
             "GET",
             f"{CAL_API}/calendars/{self._calendar_id()}/events",
-            params={
-                "timeMin": start,
-                "timeMax": end,
-                "singleEvents": "true",
-                "orderBy": "startTime",
-                "maxResults": max(1, min(max_results, 100)),
-            },
+            params=params,
         )
         return r.json().get("items", [])
 
@@ -99,7 +112,15 @@ class GoogleCalendarPlugin(Plugin):
         start, end = self._day_bounds()
         return await self.events(start, end, max_results=20)
 
-    async def add_event(self, title: str, start: str, end: str, description: str = "") -> dict:
+    async def add_event(
+        self,
+        title: str,
+        start: str,
+        end: str,
+        description: str = "",
+        *,
+        location: str = "",
+    ) -> dict:
         if self._backend() == "n8n":
             return await self._webhook("calendar_add_event", {
                 "calendar_id": self.get("calendar_id", "primary"),
@@ -112,6 +133,8 @@ class GoogleCalendarPlugin(Plugin):
         }
         if description:
             body["description"] = description
+        if location:
+            body["location"] = location
         r = await google_api(
             self,
             "POST",
@@ -119,6 +142,137 @@ class GoogleCalendarPlugin(Plugin):
             json=body,
         )
         return r.json()
+
+    async def update_event(self, event_id: str, changes: dict) -> dict:
+        body: dict = {}
+        aliases = {"title": "summary", "description": "description", "location": "location"}
+        for source, target in aliases.items():
+            if source in changes:
+                body[target] = str(changes[source] or "")
+        if changes.get("start"):
+            body["start"] = {"dateTime": str(changes["start"])}
+        if changes.get("end"):
+            body["end"] = {"dateTime": str(changes["end"])}
+        if not body:
+            raise ValueError("Keine Aenderung angegeben.")
+        r = await google_api(
+            self,
+            "PATCH",
+            f"{CAL_API}/calendars/{self._calendar_id()}/events/{quote(event_id, safe='')}",
+            json=body,
+        )
+        return r.json()
+
+    async def delete_event(self, event_id: str) -> dict:
+        await google_api(
+            self,
+            "DELETE",
+            f"{CAL_API}/calendars/{self._calendar_id()}/events/{quote(event_id, safe='')}",
+        )
+        return {"id": event_id, "deleted": True}
+
+    @staticmethod
+    def _parse_datetime(value: str, tz: ZoneInfo) -> datetime:
+        raw = str(value or "").strip().replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=tz)
+        return parsed.astimezone(tz)
+
+    @classmethod
+    def _event_interval(cls, event: dict, tz: ZoneInfo) -> tuple[datetime, datetime] | None:
+        start_data, end_data = event.get("start") or {}, event.get("end") or {}
+        start_raw, end_raw = start_data.get("dateTime"), end_data.get("dateTime")
+        if start_raw and end_raw:
+            return cls._parse_datetime(start_raw, tz), cls._parse_datetime(end_raw, tz)
+        if start_data.get("date") and end_data.get("date"):
+            start_day = date_cls.fromisoformat(start_data["date"])
+            end_day = date_cls.fromisoformat(end_data["date"])
+            return (
+                datetime.combine(start_day, time.min, tzinfo=tz),
+                datetime.combine(end_day, time.min, tzinfo=tz),
+            )
+        return None
+
+    async def _live_school_intervals(
+        self,
+        start: datetime,
+        end: datetime,
+    ) -> tuple[set[date_cls], list[dict]]:
+        """Return EduPage-backed school intervals for the requested days.
+
+        A day is only included in ``live_days`` after a successful API response.
+        Callers may then replace imported baseline events for exactly that day.
+        """
+        try:
+            from ..registry import get_manager
+
+            plugin = get_manager().get("edupage")
+        except Exception:  # noqa: BLE001
+            return set(), []
+        if plugin is None or not plugin.enabled or not hasattr(plugin, "timetable_result"):
+            return set(), []
+        live_days: set[date_cls] = set()
+        intervals: list[dict] = []
+        day = start.date()
+        last_day = min(end.date(), day + timedelta(days=14))
+        group = plugin._default_group() if hasattr(plugin, "_default_group") else "B"
+        while day <= last_day:
+            result = await plugin.timetable_result(day)
+            if result.get("ok"):
+                live_days.add(day)
+                lessons = result.get("lessons") or []
+                if hasattr(plugin, "_filter_lessons"):
+                    lessons = plugin._filter_lessons(lessons, group)
+                for lesson in lessons:
+                    if lesson.get("cancelled"):
+                        continue
+                    start_t = plugin._parse_hhmm(lesson.get("start", ""))
+                    end_t = plugin._parse_hhmm(lesson.get("end", ""))
+                    if start_t and end_t:
+                        intervals.append({
+                            "start": datetime.combine(day, start_t, tzinfo=start.tzinfo),
+                            "end": datetime.combine(day, end_t, tzinfo=start.tzinfo),
+                            "title": str(lesson.get("subject") or "Schule"),
+                            "source": "edupage",
+                        })
+            day += timedelta(days=1)
+        return live_days, intervals
+
+    async def effective_busy(self, start: str, end: str) -> list[dict]:
+        tz = ZoneInfo(get_settings().astra_timezone)
+        start_dt, end_dt = self._parse_datetime(start, tz), self._parse_datetime(end, tz)
+        if end_dt <= start_dt:
+            raise ValueError("end muss nach start liegen.")
+        events = await self.events(start_dt.isoformat(), end_dt.isoformat(), max_results=250)
+        try:
+            live_days, school_intervals = await asyncio.wait_for(
+                self._live_school_intervals(start_dt, end_dt), timeout=12,
+            )
+        except Exception:  # noqa: BLE001
+            log.warning("EduPage calendar overlay timed out; using imported baseline.")
+            live_days, school_intervals = set(), []
+        busy = []
+        for event in events:
+            interval = self._event_interval(event, tz)
+            if not interval:
+                continue
+            event_start, event_end = interval
+            if SCHOOL_BASELINE_MARKER in str(event.get("description") or "") and event_start.date() in live_days:
+                continue
+            if event_end > start_dt and event_start < end_dt:
+                busy.append({
+                    "start": event_start,
+                    "end": event_end,
+                    "title": str(event.get("summary") or "Termin"),
+                    "source": "google_calendar",
+                    "event_id": str(event.get("id") or ""),
+                })
+        busy.extend(
+            item for item in school_intervals
+            if item["end"] > start_dt and item["start"] < end_dt
+        )
+        return sorted(busy, key=lambda item: item["start"])
 
     async def health_check(self) -> HealthStatus:
         if not self.is_toggled_on:
@@ -175,7 +329,9 @@ class GoogleCalendarPlugin(Plugin):
             end = args.get("end", "")
             if not title or not start or not end:
                 return tool_result(ok=False, summary="title, start und end sind erforderlich.", source=self.slug)
-            data = await self.add_event(title, start, end, args.get("description", ""))
+            data = await self.add_event(
+                title, start, end, args.get("description", ""), location=args.get("location", "")
+            )
             link = data.get("htmlLink", "") if isinstance(data, dict) else ""
             return tool_result(
                 ok=True,
@@ -183,6 +339,79 @@ class GoogleCalendarPlugin(Plugin):
                 data=data,
                 source=self.slug,
             )
+
+        async def _search(args: dict, ctx: ToolContext) -> str:
+            tz = ZoneInfo(get_settings().astra_timezone)
+            now = datetime.now(tz)
+            start = str(args.get("start") or now.isoformat())
+            end = str(args.get("end") or (now + timedelta(days=90)).isoformat())
+            events = await self.events(start, end, max_results=100, query=str(args.get("query") or ""))
+            if not events:
+                return tool_result(ok=True, summary="Keine passenden Termine gefunden.", data=[], source=self.slug)
+            return tool_result(
+                ok=True,
+                summary="Gefundene Termine:\n" + "\n".join(self._event_line(e) for e in events[:30]),
+                data=events,
+                source=self.slug,
+            )
+
+        async def _update(args: dict, ctx: ToolContext) -> str:
+            event_id = str(args.get("event_id") or "").strip()
+            if not event_id:
+                return tool_result(ok=False, summary="event_id ist erforderlich.", source=self.slug)
+            data = await self.update_event(event_id, args)
+            return tool_result(ok=True, summary="Kalendertermin aktualisiert.", data=data, source=self.slug)
+
+        async def _delete(args: dict, ctx: ToolContext) -> str:
+            event_id = str(args.get("event_id") or "").strip()
+            if not event_id:
+                return tool_result(ok=False, summary="event_id ist erforderlich.", source=self.slug)
+            data = await self.delete_event(event_id)
+            return tool_result(ok=True, summary="Kalendertermin geloescht.", data=data, source=self.slug)
+
+        async def _freebusy(args: dict, ctx: ToolContext) -> str:
+            start, end = str(args.get("start") or ""), str(args.get("end") or "")
+            if not start or not end:
+                return tool_result(ok=False, summary="start und end sind erforderlich.", source=self.slug)
+            tz = ZoneInfo(get_settings().astra_timezone)
+            start_dt, end_dt = self._parse_datetime(start, tz), self._parse_datetime(end, tz)
+            if not ctx.is_owner and end_dt - start_dt > timedelta(days=14):
+                return tool_result(
+                    ok=False,
+                    summary="Free/Busy-Abfragen fuer Dritte sind auf 14 Tage begrenzt.",
+                    source=self.slug,
+                )
+            if not ctx.is_owner and ctx.max_sensitivity not in {"freebusy", "details"}:
+                return tool_result(
+                    ok=False,
+                    summary="Fuer diese Person ist keine Kalenderauskunft freigegeben.",
+                    source=self.slug,
+                )
+            blocked = await self.effective_busy(start, end)
+            if not blocked:
+                return tool_result(
+                    ok=True,
+                    summary="Bahrian ist in diesem Zeitraum frei.",
+                    data={"busy": False, "start": start, "end": end},
+                    source=self.slug,
+                )
+            if ctx.is_owner or ctx.max_sensitivity == "details":
+                lines = [
+                    f"- {item['start'].strftime('%d.%m. %H:%M')}-{item['end'].strftime('%H:%M')}: {item['title']}"
+                    for item in blocked
+                ]
+                summary = "Bahrian ist in diesem Zeitraum beschaeftigt:\n" + "\n".join(lines)
+                data = [{**item, "start": item["start"].isoformat(), "end": item["end"].isoformat()} for item in blocked]
+            else:
+                summary = "Bahrian ist in diesem Zeitraum beschaeftigt."
+                data = {
+                    "busy": True,
+                    "blocked": [
+                        {"start": item["start"].isoformat(), "end": item["end"].isoformat()}
+                        for item in blocked
+                    ],
+                }
+            return tool_result(ok=True, summary=summary, data=data, source=self.slug)
 
         async def _conflicts(args: dict, ctx: ToolContext) -> str:
             start = args.get("start", "")
@@ -215,6 +444,7 @@ class GoogleCalendarPlugin(Plugin):
                     "start": {"type": "string", "description": "ISO-8601 Datetime"},
                     "end": {"type": "string", "description": "ISO-8601 Datetime"},
                     "description": {"type": "string"},
+                    "location": {"type": "string"},
                 }, "required": ["title", "start", "end"]},
                 handler=_add_event, owner_only=True, source=self.slug,
                 safety="mutation", intents=["create"],
@@ -228,5 +458,54 @@ class GoogleCalendarPlugin(Plugin):
                 }, "required": ["start", "end"]},
                 handler=_conflicts, owner_only=True, source=self.slug,
                 safety="private_read", intents=["search", "status"],
+            ),
+            Tool(
+                name="google_calendar_search",
+                description="Google-Kalendertermine nach Text und Zeitraum suchen; liefert event_id fuer Aenderungen.",
+                parameters={"type": "object", "properties": {
+                    "query": {"type": "string"},
+                    "start": {"type": "string", "description": "ISO-8601 Datetime"},
+                    "end": {"type": "string", "description": "ISO-8601 Datetime"},
+                }},
+                handler=_search, owner_only=True, source=self.slug,
+                safety="private_read", intents=["search", "list"],
+            ),
+            Tool(
+                name="google_calendar_update_event",
+                description="Google-Kalendertermin per event_id aendern.",
+                parameters={"type": "object", "properties": {
+                    "event_id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "start": {"type": "string"},
+                    "end": {"type": "string"},
+                    "description": {"type": "string"},
+                    "location": {"type": "string"},
+                }, "required": ["event_id"]},
+                handler=_update, owner_only=True, source=self.slug,
+                safety="mutation", intents=["update"],
+            ),
+            Tool(
+                name="google_calendar_delete_event",
+                description="Google-Kalendertermin per event_id loeschen.",
+                parameters={"type": "object", "properties": {
+                    "event_id": {"type": "string"},
+                }, "required": ["event_id"]},
+                handler=_delete, owner_only=True, source=self.slug,
+                safety="destructive", intents=["delete"],
+            ),
+            Tool(
+                name="calendar_freebusy",
+                description=(
+                    "Pruefe, ob Bahrian in einem Zeitraum frei ist. Fuer Dritte wird hart nur Free/Busy "
+                    "ausgegeben; Details nur bei entsprechendem Freigabe-Ceiling. EduPage ersetzt dabei "
+                    "den statischen Schulplan fuer Tage mit erfolgreichem Live-Abruf."
+                ),
+                parameters={"type": "object", "properties": {
+                    "start": {"type": "string", "description": "ISO-8601 Datetime"},
+                    "end": {"type": "string", "description": "ISO-8601 Datetime"},
+                }, "required": ["start", "end"]},
+                handler=_freebusy, owner_only=True, source=self.slug,
+                safety="private_read", intents=["search", "status"],
+                examples=["Ist Bahrian morgen um 16 Uhr frei?"],
             ),
         ]

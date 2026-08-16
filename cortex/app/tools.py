@@ -13,8 +13,9 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from . import db, knowledge
 from .channels import get_channels  # noqa: F401  (kept for parity / future tools)
@@ -135,6 +136,100 @@ async def _request_owner_approval(args: dict, ctx: ToolContext) -> str:
     return (
         "Freigabe bei Bahrian angefragt. Sag dem Gegenüber freundlich, dass du kurz "
         "Rücksprache hältst und dich gleich meldest."
+    )
+
+
+async def _check_availability(args: dict, ctx: ToolContext) -> str:
+    """Privacy boundary for Secretary calendar access.
+
+    The calendar plugin remains owner-only. This adapter exposes only the
+    disclosure level already granted to the current contact and never returns
+    raw event objects at the free/busy ceiling.
+    """
+    start, end = str(args.get("start") or "").strip(), str(args.get("end") or "").strip()
+    if not start or not end:
+        return tool_result(ok=False, summary="start und end sind erforderlich.", source="core")
+    if not ctx.is_owner and ctx.max_sensitivity not in {"freebusy", "details"}:
+        return tool_result(
+            ok=False,
+            summary="Fuer diese Person ist keine Kalenderauskunft freigegeben.",
+            source="core",
+        )
+    try:
+        from .plugins.registry import get_manager
+
+        plugin = get_manager().get("google_calendar")
+        if plugin is None or not plugin.enabled or not hasattr(plugin, "effective_busy"):
+            return tool_result(
+                ok=False,
+                summary="Google Kalender ist in ASTRA noch nicht verbunden.",
+                source="core",
+            )
+        tz = ZoneInfo(get_settings().astra_timezone)
+        start_dt = plugin._parse_datetime(start, tz)
+        end_dt = plugin._parse_datetime(end, tz)
+        if end_dt <= start_dt:
+            return tool_result(ok=False, summary="end muss nach start liegen.", source="core")
+        if not ctx.is_owner and end_dt - start_dt > timedelta(days=14):
+            return tool_result(
+                ok=False,
+                summary="Free/Busy-Abfragen fuer Dritte sind auf 14 Tage begrenzt.",
+                source="core",
+            )
+        blocked = await plugin.effective_busy(start, end)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Secretary free/busy failed: %s", e)
+        return tool_result(
+            ok=False,
+            summary=f"Kalender-Verfuegbarkeit konnte nicht geprueft werden: {e}",
+            source="core",
+            error={"type": type(e).__name__, "message": str(e)},
+        )
+    if not blocked:
+        return tool_result(
+            ok=True,
+            summary="Bahrian ist in diesem Zeitraum frei.",
+            data={"busy": False, "start": start, "end": end},
+            source="core",
+        )
+    if ctx.is_owner or ctx.max_sensitivity == "details":
+        lines = [
+            f"- {item['start'].strftime('%d.%m. %H:%M')}-{item['end'].strftime('%H:%M')}: {item['title']}"
+            for item in blocked
+        ]
+        if ctx.is_owner:
+            data = [
+                {**item, "start": item["start"].isoformat(), "end": item["end"].isoformat()}
+                for item in blocked
+            ]
+        else:
+            # Even a trusted third party never needs provider names or internal
+            # Google event IDs; the disclosure ceiling only grants event details.
+            data = [
+                {
+                    "start": item["start"].isoformat(),
+                    "end": item["end"].isoformat(),
+                    "title": item["title"],
+                }
+                for item in blocked
+            ]
+        return tool_result(
+            ok=True,
+            summary="Bahrian ist in diesem Zeitraum beschaeftigt:\n" + "\n".join(lines),
+            data=data,
+            source="core",
+        )
+    return tool_result(
+        ok=True,
+        summary="Bahrian ist in diesem Zeitraum beschaeftigt.",
+        data={
+            "busy": True,
+            "blocked": [
+                {"start": item["start"].isoformat(), "end": item["end"].isoformat()}
+                for item in blocked
+            ],
+        },
+        source="core",
     )
 
 
@@ -292,6 +387,28 @@ register(Tool(
     },
     handler=_request_owner_approval,
     requires_approval=True,
+))
+
+register(Tool(
+    name="check_availability",
+    description=(
+        "Pruefe Bahrians Verfuegbarkeit in einem Zeitraum. Nutze dieses Werkzeug fuer "
+        "Terminfragen. Es erzwingt die Freigabe-Stufe des Kontakts: standardmaessig nur "
+        "frei/beschaeftigt, Details nur bei explizitem Details-Ceiling. EduPage kann den "
+        "statischen Schulplan fuer erfolgreich geladene Tage ersetzen."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "start": {"type": "string", "description": "ISO-8601 Datetime"},
+            "end": {"type": "string", "description": "ISO-8601 Datetime"},
+        },
+        "required": ["start", "end"],
+    },
+    handler=_check_availability,
+    safety="private_read",
+    intents=["search", "status"],
+    examples=["Ist Bahrian morgen um 16 Uhr frei?"],
 ))
 
 register(Tool(

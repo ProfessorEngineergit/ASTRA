@@ -5,7 +5,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from app.policy import Mode, Sensitivity
-from app.secretary import plan_for, tone_instruction, with_secretary_header
+from app.secretary import plan_for, resolve_service_status, tone_instruction, with_secretary_header
 
 
 def test_secretary_auto_replies_during_school_window_for_waha_defer():
@@ -20,6 +20,96 @@ def test_secretary_auto_replies_during_school_window_for_waha_defer():
 
     assert plan.mode == Mode.AUTO
     assert plan.in_service_window is True
+
+
+def test_secretary_auto_replies_during_live_school_for_waha_ask():
+    plan = plan_for(
+        channel="waha",
+        mode=Mode.ASK,
+        max_sensitivity=Sensitivity.FREEBUSY,
+        app_settings={"secretary": {"enabled": True, "activation_mode": "auto"}},
+        timezone="Europe/Berlin",
+        now=datetime(2026, 6, 8, 10, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+        service_active=True,
+        service_reason="edupage-school-day",
+    )
+
+    assert plan.mode == Mode.AUTO
+    assert plan.reason == "edupage-school-day"
+
+
+def test_secretary_auto_is_silent_outside_live_school():
+    plan = plan_for(
+        channel="waha",
+        mode=Mode.AUTO,
+        max_sensitivity=Sensitivity.FREEBUSY,
+        app_settings={"secretary": {"activation_mode": "auto"}},
+        timezone="Europe/Berlin",
+        now=datetime(2026, 6, 8, 17, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+        service_active=False,
+        service_reason="edupage-outside-school-day",
+    )
+
+    assert plan.silent is True
+    assert plan.reason == "edupage-outside-school-day"
+
+
+def test_secretary_manual_on_ignores_school_window():
+    plan = plan_for(
+        channel="waha",
+        mode=Mode.ASK,
+        max_sensitivity=Sensitivity.FREEBUSY,
+        app_settings={"secretary": {"activation_mode": "on"}},
+        timezone="Europe/Berlin",
+        now=datetime(2026, 6, 8, 20, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+    )
+
+    assert plan.mode == Mode.AUTO
+    assert plan.reason == "manual-on"
+
+
+def test_edupage_cancelled_last_lesson_shortens_secretary_day(monkeypatch):
+    from app.plugins import registry
+
+    class FakeEduPage:
+        enabled = True
+
+        async def timetable_result(self, _day):
+            return {"ok": True, "lessons": [
+                {"groups": ["B"], "start": "08:00", "end": "09:40", "cancelled": False},
+                {"groups": ["B"], "start": "14:15", "end": "15:45", "cancelled": True},
+            ]}
+
+        @staticmethod
+        def _default_group():
+            return "B"
+
+        @staticmethod
+        def _filter_lessons(lessons, _group):
+            return lessons
+
+        @staticmethod
+        def _parse_hhmm(value):
+            hour, minute = value.split(":")
+            return datetime.strptime(f"{hour}:{minute}", "%H:%M").time()
+
+    class FakeManager:
+        @staticmethod
+        def get(slug):
+            return FakeEduPage() if slug == "edupage" else None
+
+    monkeypatch.setattr(registry, "get_manager", lambda: FakeManager())
+    status = asyncio.run(resolve_service_status(
+        {"secretary": {"activation_mode": "auto"}},
+        "Europe/Berlin",
+        now=datetime(2026, 6, 8, 14, 30, tzinfo=ZoneInfo("Europe/Berlin")),
+        refresh=True,
+    ))
+
+    assert status.source == "edupage"
+    assert status.active is False
+    assert status.ends_at.hour == 9
+    assert status.ends_at.minute == 40
 
 
 def test_secretary_email_requires_owner_confirmation():
