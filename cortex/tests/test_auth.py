@@ -40,6 +40,21 @@ def test_csrf_sign_and_verify(memdb):
     assert asyncio.run(auth.valid_csrf("nope")) is False
 
 
+def test_oauth_state_sign_and_verify(memdb):
+    payload = {
+        "provider": "google",
+        "slug": "google_calendar",
+        "installation_id": "default",
+    }
+
+    token = asyncio.run(auth.issue_oauth_state(payload))
+
+    assert token.startswith("v1.")
+    assert asyncio.run(auth.read_oauth_state(token)) == payload
+    assert asyncio.run(auth.read_oauth_state(f"{token}tampered")) is None
+    assert asyncio.run(auth.read_oauth_state("legacy-state")) is None
+
+
 def test_rate_limit(memdb):
     ip = "1.2.3.4"
     for _ in range(auth._MAX_ATTEMPTS):

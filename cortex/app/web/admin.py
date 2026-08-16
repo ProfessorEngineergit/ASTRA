@@ -7,7 +7,6 @@ import hashlib
 import json
 import logging
 import os
-import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from shutil import which
@@ -772,7 +771,7 @@ def _field_input(f, value, is_set: bool) -> str:
 
 @router.get("/admin/plugin/{slug}", response_class=HTMLResponse)
 async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.require_admin),
-                      saved: str = "", installation: str = "default"):
+                      saved: str = "", installation: str = "default", oauth: str = ""):
     mgr = get_manager()
     cls = mgr.plugin_class(slug)
     inst = mgr.get(slug)
@@ -784,6 +783,9 @@ async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.requir
     meta = await store.installation_meta(cls, active_inst.installation_id)
     token = await auth.issue_csrf()
     flash = '<div class="flash ok">Gespeichert.</div>' if saved else ""
+    if oauth == "missing_client":
+        flash = ('<div class="flash err">Client-ID und Client-Secret fehlen. '
+                 'Trage sie ein; „Mit Google verbinden“ speichert das Formular automatisch.</div>')
 
     fields_html = ""
     for f in cls.config_fields:
@@ -819,11 +821,9 @@ async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.requir
           <div class="row" style="justify-content:space-between;align-items:center">
             <div><h2 style="margin:0;font-size:16px">Google OAuth</h2>
               <div class="note">Status: {esc(connected)} · Redirect: {esc(str(request.url_for("oauth_google_callback")))}</div></div>
-            <form method="post" action="/admin/plugin/{esc(slug)}/oauth/google/start" style="margin:0">
-              <input type="hidden" name="csrf" value="{esc(token)}">
-              <input type="hidden" name="installation_id" value="{esc(active_inst.installation_id)}">
-              <button class="btn sm" type="submit">Mit Google verbinden</button>
-            </form>
+            <button class="btn sm" type="submit" form="plugin-config-form"
+                    formaction="/admin/plugin/{esc(slug)}/oauth/google/start" formmethod="post"
+                    name="oauth_connect" value="1">Mit Google verbinden</button>
           </div>
         </div>"""
     test_btn = ('' if soon else
@@ -1018,6 +1018,18 @@ async def plugin_google_oauth_start(slug: str, request: Request, _: bool = Depen
         return RedirectResponse(f"/admin/plugin/{slug}", status_code=303)
     install_id = str(form.get("installation_id") or "default")
     store = get_config_store()
+    # The OAuth button is associated with the complete plugin form. Persist it
+    # first so a freshly entered client secret and the instance toggle survive
+    # the round-trip to Google. Older pages posted only csrf/installation_id;
+    # those requests keep using the already stored configuration.
+    if str(form.get("oauth_connect") or "") == "1":
+        values = _values_from_form(cls, form)
+        enabled = "__instance_enabled" in form
+        name = str(form.get("__installation_name") or "").strip()
+        install_id = await store.save_installation(
+            cls, install_id, values, enabled, name=name,
+        )
+        await mgr.rebuild()
     cfg = next(
         (i for i in await store.load_installations(cls) if i.get("__installation_id") == install_id),
         await store.load(cls),
@@ -1026,14 +1038,14 @@ async def plugin_google_oauth_start(slug: str, request: Request, _: bool = Depen
     client_secret = str(cfg.get("client_secret") or "").strip()
     if not client_id or not client_secret:
         return RedirectResponse(f"/admin/plugin/{slug}?installation={install_id}&oauth=missing_client", status_code=303)
-    state = secrets.token_urlsafe(24)
-    await db.set_setting(f"oauth_state:{state}", {
+    state_data = {
         "provider": "google",
         "slug": slug,
         "installation_id": install_id,
         "redirect_uri": str(request.url_for("oauth_google_callback")),
         "ts": _now_iso(),
-    })
+    }
+    state = await auth.issue_oauth_state(state_data)
     url = authorization_url(
         client_id=client_id,
         redirect_uri=str(request.url_for("oauth_google_callback")),
@@ -1047,7 +1059,12 @@ async def plugin_google_oauth_start(slug: str, request: Request, _: bool = Depen
 async def oauth_google_callback(request: Request, code: str = "", state: str = "", error: str = ""):
     if error:
         return HTMLResponse(page("OAuth", f'<div class="flash err">Google OAuth: {esc(error)}</div>'), 400)
-    state_data = await db.get_setting(f"oauth_state:{state}", None)
+    if state.startswith("v1."):
+        state_data = await auth.read_oauth_state(state)
+    else:
+        # Existing OAuth attempts created before 0.15.13 used a random state
+        # stored in Postgres. Keep them valid during the rolling update.
+        state_data = await db.get_setting(f"oauth_state:{state}", None)
     if not state_data or state_data.get("provider") != "google":
         return HTMLResponse(page("OAuth", '<div class="flash err">OAuth-State ungueltig oder abgelaufen.</div>'), 400)
     mgr = get_manager()

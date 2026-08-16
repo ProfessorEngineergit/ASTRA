@@ -5,11 +5,15 @@ fixture, and a manager pre-populated without touching Postgres.
 """
 from __future__ import annotations
 
+import asyncio
 from io import BytesIO
+from urllib.parse import parse_qs, urlparse
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app.config_store import get_config_store
+from app.plugins.builtin.google_calendar import GoogleCalendarPlugin
 from app.plugins.registry import _discover_classes, get_manager
 from app.web import admin as web_admin
 from app.web import auth
@@ -87,6 +91,85 @@ def test_google_plugin_page_shows_oauth_connect(memdb):
     assert "Google OAuth" in r.text
     assert "Mit Google verbinden" in r.text
     assert "/admin/plugin/google_tasks/oauth/google/start" in r.text
+    assert 'form="plugin-config-form"' in r.text
+
+
+def test_google_oauth_saves_form_and_keeps_plugin_enabled(memdb, monkeypatch):
+    _prime_manager()
+    c = TestClient(_app())
+    r = c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    r = c.post(
+        "/admin/plugin/google_calendar/oauth/google/start",
+        data={
+            "csrf": csrf,
+            "installation_id": "default",
+            "oauth_connect": "1",
+            "__instance_enabled": "on",
+            "__installation_name": "Standard",
+            "backend": "native",
+            "client_id": "google-client-id",
+            "client_secret": "google-client-secret",
+            "refresh_token": "",
+            "access_token": "",
+            "expires_at": "",
+            "account_email": "",
+            "calendar_id": "primary",
+            "n8n_url": "http://n8n:5678",
+            "shared_secret": "",
+        },
+        follow_redirects=False,
+    )
+
+    assert r.status_code == 303
+    redirect = urlparse(r.headers["location"])
+    assert f"{redirect.scheme}://{redirect.netloc}{redirect.path}" == (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+    )
+    state = parse_qs(redirect.query)["state"][0]
+    state_data = asyncio.run(auth.read_oauth_state(state))
+    assert state_data["slug"] == "google_calendar"
+    assert state_data["installation_id"] == "default"
+
+    saved = asyncio.run(get_config_store().load(GoogleCalendarPlugin))
+    assert saved["__enabled"] is True
+    assert saved["client_id"] == "google-client-id"
+    assert saved["client_secret"] == "google-client-secret"
+
+    async def fake_exchange_code(**kwargs):
+        assert kwargs["client_id"] == "google-client-id"
+        assert kwargs["client_secret"] == "google-client-secret"
+        assert kwargs["code"] == "oauth-code"
+        return {
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "expires_in": 3600,
+        }
+
+    async def fake_user_email(access_token):
+        assert access_token == "access-token"
+        return "owner@example.com"
+
+    monkeypatch.setattr(web_admin, "exchange_code", fake_exchange_code)
+    monkeypatch.setattr(web_admin, "user_email", fake_user_email)
+    r = c.get(
+        "/admin/oauth/google/callback",
+        params={"code": "oauth-code", "state": state},
+        follow_redirects=False,
+    )
+
+    assert r.status_code == 303
+    assert r.headers["location"] == (
+        "/admin/plugin/google_calendar?installation=default&saved=1"
+    )
+    connected = asyncio.run(get_config_store().load(GoogleCalendarPlugin))
+    assert connected["__enabled"] is True
+    assert connected["refresh_token"] == "refresh-token"
+    assert connected["account_email"] == "owner@example.com"
 
 
 def test_settings_labs_and_region_save(memdb):

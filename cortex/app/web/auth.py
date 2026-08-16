@@ -23,6 +23,7 @@ log = logging.getLogger("astra.web.auth")
 COOKIE_NAME = "astra_session"
 CSRF_COOKIE = "astra_csrf"
 SESSION_TTL = 7 * 24 * 3600  # 7 days
+OAUTH_STATE_TTL = 20 * 60
 
 _serializer: URLSafeTimedSerializer | None = None
 
@@ -117,6 +118,31 @@ async def valid_csrf(token: str | None) -> bool:
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+async def issue_oauth_state(payload: dict) -> str:
+    """Create a restart-safe, expiring OAuth state token.
+
+    Prefixing the token lets the callback distinguish this signed format from
+    legacy random states that were stored only in the settings table.
+    """
+    s = await _serializer_inst()
+    token = s.dumps({"oauth": payload, "nonce": secrets.token_hex(12)})
+    return f"v1.{token}"
+
+
+async def read_oauth_state(token: str | None) -> dict | None:
+    if not token or not token.startswith("v1."):
+        return None
+    try:
+        s = await _serializer_inst()
+        data = s.loads(token[3:], max_age=OAUTH_STATE_TTL)
+        payload = data.get("oauth") if isinstance(data, dict) else None
+        return payload if isinstance(payload, dict) else None
+    except (BadSignature, SignatureExpired):
+        return None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # ─── rate limiting ────────────────────────────────────────────────────────────
