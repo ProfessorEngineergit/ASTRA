@@ -684,6 +684,34 @@ def test_secretary_saves_multiple_email_accounts(memdb, monkeypatch):
     assert "sec_email_2_imap_host" in r.text
 
 
+def test_secretary_master_toggle_applies_immediately_and_preserves_config(memdb, monkeypatch):
+    _prime_manager()
+
+    async def _no_threads(*a, **k):
+        return []
+
+    from app import db
+    monkeypatch.setattr(db, "list_threads", _no_threads)
+    memdb["app_settings"] = {"secretary": {"enabled": True, "tone": "crisp",
+                                             "installations": {"waha": {"session": "mine"}}}}
+    c = TestClient(_app())
+    c.get("/admin/setup")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/setup", data={"csrf": csrf, "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+
+    r = c.post("/admin/secretary/toggle", data={"csrf": csrf, "enabled": "false"})
+
+    assert r.status_code == 200 and r.json() == {"ok": True, "enabled": False}
+    assert memdb["app_settings"]["secretary"]["enabled"] is False
+    assert memdb["app_settings"]["secretary"]["tone"] == "crisp"
+    assert memdb["app_settings"]["secretary"]["installations"]["waha"]["session"] == "mine"
+    page = c.get("/admin/secretary")
+    assert "data-secretary-master" in page.text
+    assert "Ausgeschaltet" in page.text
+
+
 def test_osint_tab_renders_and_run_endpoint_gates_tool(memdb):
     _prime_manager()
     c = TestClient(_app())

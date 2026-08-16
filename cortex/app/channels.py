@@ -54,10 +54,14 @@ class Channels:
         try:
             if channel == "telegram":
                 return await self.send_telegram(to, text)
-            if self.s.astra_send_backend == "n8n":
-                return await self._via_n8n(channel, to, text)
+            # WhatsApp's UI setup and self-test use the native WAHA transport.
+            # Keep real sends on that exact same path as well: an old global
+            # ASTRA_SEND_BACKEND=n8n must not bypass the Secretary installation
+            # stored in app_settings.
             if channel == "waha":
                 return await self._waha(to, text)
+            if self.s.astra_send_backend == "n8n":
+                return await self._via_n8n(channel, to, text)
             if channel == "signal":
                 return await self._signal(to, text)
             log.warning("Unknown channel %s", channel)

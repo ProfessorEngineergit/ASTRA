@@ -247,6 +247,7 @@ async def _get_settings(args: dict, ctx: ToolContext) -> str:
         f"Modell: {s.get('ai_model') or '(Standard aus .env)'}\n"
         f"Autonomie: {s.get('autonomy', 'ask')}\n"
         f"Sparmodus: {bool(s.get('economy_mode'))}\n"
+        f"Secretary: {bool((s.get('secretary') or {}).get('enabled', True))}\n"
         f"Selbst-Konfig erlaubt: {s.get('allow_self_config', True)}\n"
         f"Schriftart: {s.get('font', 'inter')}\n"
         f"Name: {s.get('owner_name', 'Bahrian')} · TZ: {s.get('timezone', 'Europe/Berlin')}\n"
@@ -275,12 +276,18 @@ async def _update_settings(args: dict, ctx: ToolContext) -> str:
     if "allow_self_config" in args and args["allow_self_config"] is not None:
         s["allow_self_config"] = bool(args["allow_self_config"])
         changed.append(f"Selbst-Konfig={s['allow_self_config']}")
+    if "secretary_enabled" in args and args["secretary_enabled"] is not None:
+        secretary = s.get("secretary") if isinstance(s.get("secretary"), dict) else {}
+        secretary["enabled"] = bool(args["secretary_enabled"])
+        s["secretary"] = secretary
+        changed.append(f"Secretary={secretary['enabled']}")
     if "font" in args and args["font"]:
         s["font"] = str(args["font"])
         set_font(s["font"])
         changed.append(f"Font={s['font']}")
     if not changed:
-        return "Nichts geändert. Felder: model, autonomy(ask|confident|full), economy, font, allow_self_config."
+        return ("Nichts geändert. Felder: model, autonomy(ask|confident|full), economy, "
+                "font, allow_self_config, secretary_enabled.")
     await db.set_setting("app_settings", s)
     await db.audit("self_settings", actor="astra", detail={"changed": changed})
     return "Aktualisiert: " + ", ".join(changed)
@@ -951,11 +958,15 @@ def register_admin_tools() -> None:
         ("astra_get_settings", "Zeige ASTRAs aktuelle Einstellungen (Modell, Autonomie, Standort …).",
          {"type": "object", "properties": {}}, _get_settings),
         ("astra_update_settings",
-         "Ändere ASTRAs Einstellungen: model, autonomy(ask|confident|full), economy, font, allow_self_config.",
+         "Ändere ASTRAs Einstellungen: model, autonomy(ask|confident|full), economy, font, "
+         "allow_self_config und Secretary global ein/aus.",
          {"type": "object", "properties": {
              "model": {"type": "string"}, "autonomy": {"type": "string"},
              "economy": {"type": "boolean"}, "font": {"type": "string"},
-             "allow_self_config": {"type": "boolean"}}}, _update_settings),
+             "allow_self_config": {"type": "boolean"},
+             "secretary_enabled": {"type": "boolean",
+                                     "description": "Secretary global ein- oder ausschalten"}}},
+         _update_settings),
         ("astra_system_status", "Container-Leistung (RAM/CPU/Disk/Uptime) + Empfehlungen.",
          {"type": "object", "properties": {}}, _system_status),
         ("astra_brain_list", "Liste alle Brain-/Wissens-Dateien (über mich + pro Person).",
@@ -1164,8 +1175,8 @@ def register_admin_tools() -> None:
         name="astra_send_message",
         description=(
             "Sende eine WhatsApp-/Signal-/Telegram-Nachricht. An dich selbst (Bahrian) geht "
-            "sie sofort raus; an jede andere Person erst nach deiner Telegram-Bestätigung "
-            "(„ja“ oder ✅). channel=telegram|waha(WhatsApp)|signal, to=Telefonnummer/Handle "
+            "sie sofort raus; an jede andere Person erst nach deiner Bestätigung im "
+            "Ursprungs-Chat. channel=telegram|waha(WhatsApp)|signal, to=Telefonnummer/Handle "
             "(WhatsApp: Nummer), text=Inhalt. Für Mail nutze send_email, für Slack slack_send."
         ),
         parameters={"type": "object", "properties": {

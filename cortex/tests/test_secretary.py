@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -81,3 +82,46 @@ def test_security_watch_beats_default_tone():
         {"security_watch": True},
     )
     assert "distanziert" in text  # firm wins over the freeform default
+
+
+def test_disabled_secretary_records_inbound_but_never_replies(memdb, monkeypatch):
+    from app import brain, db
+
+    memdb["app_settings"] = {"secretary": {"enabled": False}}
+    contact = {"id": "contact-1", "handle": "49123@c.us", "trust_tier": 3,
+               "is_owner": False, "relationship": None}
+    thread = {"thread_id": "waha:49123@c.us", "state": "idle", "meta": {}, "summary": ""}
+    recorded = []
+
+    async def false(*args, **kwargs):
+        return False
+
+    async def resolve(*args, **kwargs):
+        return contact
+
+    async def ensure(*args, **kwargs):
+        return thread
+
+    async def noop(*args, **kwargs):
+        return None
+
+    async def add_message(*args, **kwargs):
+        recorded.append(args)
+
+    async def should_not_run(*args, **kwargs):
+        raise AssertionError("Disabled Secretary attempted to generate or send a reply")
+
+    monkeypatch.setattr(db, "is_owner_handle", false)
+    monkeypatch.setattr(db, "resolve_contact", resolve)
+    monkeypatch.setattr(db, "ensure_thread", ensure)
+    monkeypatch.setattr(db, "merge_thread_meta", noop)
+    monkeypatch.setattr(db, "add_message", add_message)
+    monkeypatch.setattr(brain, "record_interaction", noop)
+    monkeypatch.setattr(brain, "generate_reply", should_not_run)
+    monkeypatch.setattr(brain, "_send_and_record", should_not_run)
+
+    asyncio.run(brain.handle_inbound(
+        channel="waha", sender_handle="49123@c.us", text="Hallo",
+    ))
+
+    assert recorded and recorded[0][1] == "user"

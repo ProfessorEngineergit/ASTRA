@@ -86,6 +86,22 @@ def test_waha_send_uses_secretary_ui_installation(memdb):
     }
 
 
+def test_waha_send_does_not_bypass_ui_installation_when_n8n_is_global_backend(memdb):
+    memdb["app_settings"] = {
+        "secretary": {"installations": {"waha": {
+            "base_url": "http://waha-ui:3000", "session": "default", "api_key": "ui-secret",
+        }}}
+    }
+    http = _Http()
+    channels = _channels_with_http(http)
+    object.__setattr__(channels.s, "astra_send_backend", "n8n")
+
+    ok = asyncio.run(channels.send("waha", "+49 170 1234567", "Bestätigt"))
+
+    assert ok is True
+    assert http.calls[0][1] == "http://waha-ui:3000/api/sendText"
+
+
 def test_waha_send_exposes_actionable_http_error(memdb):
     memdb["app_settings"] = {
         "secretary": {

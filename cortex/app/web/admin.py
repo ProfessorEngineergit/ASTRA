@@ -2241,6 +2241,23 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
     </div>
     <form method="post" action="/admin/secretary">
       <input type="hidden" name="csrf" value="{esc(token)}">
+      <section class="panel" data-secretary-master-card style="margin-bottom:16px">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:18px;flex-wrap:wrap">
+          <div>
+            <h2 style="margin:0 0 5px;font-size:17px">Secretary</h2>
+            <p class="note" data-secretary-master-copy style="margin:0">
+              {"Aktiv – ASTRA darf auf freigegebenen Kanälen stellvertretend antworten."
+               if settings.get("enabled", True)
+               else "Aus – Nachrichten werden erfasst, aber ASTRA antwortet niemandem stellvertretend."}
+            </p>
+          </div>
+          <label class="secretary-switch" style="font-size:15px;padding:10px 14px">
+            <input type="checkbox" role="switch" name="sec_enabled" data-secretary-master
+                   {_checked(settings.get("enabled", True))}>
+            <span data-secretary-master-label>{"Eingeschaltet" if settings.get("enabled", True) else "Ausgeschaltet"}</span>
+          </label>
+        </div>
+      </section>
       <section class="panel">
         <h2 style="margin:0 0 6px;font-size:17px">Kanäle</h2>
         <p class="note" style="margin:0 0 14px">Server, Keys und Sessions sind – wo möglich –
@@ -2271,7 +2288,6 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
           </p>
         </div>
         <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:13px">
-          <label class="secretary-switch"><input type="checkbox" name="sec_enabled"{_checked(settings.get("enabled", True))}> Secretary aktiv</label>
           <label class="secretary-switch"><input type="checkbox" name="sec_school_direct"{_checked(settings.get("school_direct", True))}> In Schulzeit direkt antworten</label>
           {weekday_checks}
         </div>
@@ -2323,6 +2339,30 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
     <script>
       const activeSetup = {{channel: 'waha'}};
       const labels = {{waha:'WhatsApp / WAHA', signal:'Signal', slack:'Slack', email:'Mail'}};
+      const secretaryMaster = document.querySelector('[data-secretary-master]');
+      if (secretaryMaster) secretaryMaster.addEventListener('change', async () => {{
+        const enabled = secretaryMaster.checked;
+        const label = document.querySelector('[data-secretary-master-label]');
+        const copy = document.querySelector('[data-secretary-master-copy]');
+        secretaryMaster.disabled = true;
+        const data = new FormData();
+        data.append('csrf', document.querySelector('input[name="csrf"]').value);
+        data.append('enabled', enabled ? 'true' : 'false');
+        try {{
+          const r = await fetch('/admin/secretary/toggle', {{method:'POST', body:data}});
+          const d = await r.json();
+          if (!r.ok || !d.ok) throw new Error(d.error || 'Speichern fehlgeschlagen');
+          if (label) label.textContent = enabled ? 'Eingeschaltet' : 'Ausgeschaltet';
+          if (copy) copy.textContent = enabled
+            ? 'Aktiv – ASTRA darf auf freigegebenen Kanälen stellvertretend antworten.'
+            : 'Aus – Nachrichten werden erfasst, aber ASTRA antwortet niemandem stellvertretend.';
+        }} catch (e) {{
+          secretaryMaster.checked = !enabled;
+          alert('Secretary konnte nicht umgeschaltet werden.');
+        }} finally {{
+          secretaryMaster.disabled = false;
+        }}
+      }});
       function formContext(channel) {{
         const card = document.querySelector(`[data-install="${{channel}}"]`);
         const out = {{}};
@@ -2669,6 +2709,21 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
       }}
     </script>"""
     return _html_with_csrf(page("Secretary", body, active="secretary"), token)
+
+
+@router.post("/admin/secretary/toggle")
+async def secretary_toggle(request: Request, _: bool = Depends(auth.require_admin)):
+    form = await request.form()
+    if not await _check_csrf(request, form):
+        return JSONResponse({"ok": False, "error": "Ungültige Sitzung."}, status_code=403)
+    enabled = str(form.get("enabled") or "").lower() in {"1", "true", "yes", "on"}
+    appset = await _app_settings()
+    secretary = appset.get("secretary") if isinstance(appset.get("secretary"), dict) else {}
+    secretary["enabled"] = enabled
+    appset["secretary"] = secretary
+    await db.set_setting("app_settings", appset)
+    await db.audit("secretary_toggled", actor="owner", detail={"enabled": enabled})
+    return JSONResponse({"ok": True, "enabled": enabled})
 
 
 @router.post("/admin/secretary")

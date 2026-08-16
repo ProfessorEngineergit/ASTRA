@@ -164,7 +164,7 @@ services:
       WHATSAPP_HOOK_URL: http://cortex:8000/ingress/waha
       WHATSAPP_HOOK_EVENTS: message
       # Forward the shared secret so cortex can authenticate the webhook
-      WHATSAPP_HOOK_HEADERS: X-Astra-Secret:${CORTEX_SHARED_SECRET}
+      WHATSAPP_HOOK_CUSTOM_HEADERS: X-Astra-Secret:${CORTEX_SHARED_SECRET}
     volumes:
       - waha_data:/app/.sessions
     ports:

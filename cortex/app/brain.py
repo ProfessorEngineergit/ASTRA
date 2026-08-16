@@ -22,7 +22,7 @@ from .models import get_gateway
 from .persona import TRIAGE_INSTRUCTIONS, Register
 from .policy import Mode, Sensitivity, TrustTier, reconcile
 from .secretary import (
-    CHANNEL_LABELS, SECRETARY_CHANNELS, contact_rule_for, is_group_context,
+    CHANNEL_LABELS, SECRETARY_CHANNELS, channel_enabled, contact_rule_for, is_group_context,
     plan_for, shadow_enabled, tone_instruction, unknown_sender_action, with_secretary_header,
 )
 from .security import check_inbound, check_outbound
@@ -268,6 +268,11 @@ async def handle_inbound(
 
     # ── Third party → contact rules ────────────────────────────────────────────
     appset_pre = await _app_settings()
+    if not channel_enabled(appset_pre, channel):
+        await db.audit("secretary_disabled", channel=channel, thread_id=thread_id,
+                       contact_id=contact["id"])
+        log.info("Secretary disabled for %s — recorded inbound message without replying.", channel)
+        return
     contact_rule = contact_rule_for(appset_pre, channel, sender_handle)
 
     # Explicit block rule → silent, cheapest possible path.
@@ -557,6 +562,12 @@ async def step_in(thread_id: str) -> None:
         return
     if next_state(ThreadState(thread["state"]), Signal.DEFER_ELAPSED).act != Act.STEP_IN:
         return  # owner already stood it down / it was answered
+    appset = await _app_settings()
+    if not channel_enabled(appset, thread["channel"]):
+        await db.set_thread_state(thread_id, ThreadState.STANDDOWN.value)
+        await db.audit("secretary_disabled", channel=thread["channel"], thread_id=thread_id,
+                       contact_id=thread.get("contact_id"), detail={"phase": "deferred_step_in"})
+        return
     contact = await db.get_contact(thread["contact_id"]) if thread.get("contact_id") else {}
     ceiling = (thread.get("meta") or {}).get("max_sensitivity", "freebusy")
     history = await db.recent_messages(thread_id)
@@ -568,7 +579,7 @@ async def step_in(thread_id: str) -> None:
             + _secretary_system(
                 thread["channel"],
                 "defer-elapsed",
-                app_settings=await _app_settings(),
+                app_settings=appset,
                 thread_meta=thread.get("meta") or {},
                 handle=_peer(thread_id),
             )
@@ -599,6 +610,12 @@ async def resume_after_approval(approval: dict, decision: str) -> None:
     thread = await db.get_thread(thread_id)
     if not thread or thread["state"] != ThreadState.AWAITING_APPROVAL.value:
         return
+    appset = await _app_settings()
+    if not channel_enabled(appset, thread["channel"]):
+        await db.set_thread_state(thread_id, ThreadState.STANDDOWN.value)
+        await db.audit("secretary_disabled", channel=thread["channel"], thread_id=thread_id,
+                       contact_id=thread.get("contact_id"), detail={"phase": "approval_resume"})
+        return
     contact = await db.get_contact(thread["contact_id"]) if thread.get("contact_id") else {}
     ceiling, instruction = _RESUME.get(decision, _RESUME["no"])
     history = await db.recent_messages(thread_id)
@@ -608,7 +625,7 @@ async def resume_after_approval(approval: dict, decision: str) -> None:
         extra_system=instruction + " " + _secretary_system(
             thread["channel"],
             "owner-approved",
-            app_settings=await _app_settings(),
+            app_settings=appset,
             thread_meta=thread.get("meta") or {},
             handle=_peer(thread_id),
         ),

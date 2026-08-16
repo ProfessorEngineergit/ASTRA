@@ -78,6 +78,19 @@ def test_send_message_is_external_send_and_confirms():
     assert needs_confirmation("astra_configure_integration") is True
 
 
+def test_update_settings_can_toggle_secretary_via_json(memdb):
+    from app.admin_tools import _update_settings
+
+    memdb["app_settings"] = {"secretary": {"enabled": True, "tone": "warm"}}
+    ctx = ToolContext(thread_id="web-owner:test", channel="web", contact={"id": "owner"},
+                      is_owner=True, permission_mode="bypass")
+
+    result = asyncio.run(_update_settings({"secretary_enabled": False}, ctx))
+
+    assert "Secretary=False" in result
+    assert memdb["app_settings"]["secretary"] == {"enabled": False, "tone": "warm"}
+
+
 def test_safety_controls_confirmation_and_manifest_visibility():
     register(Tool(name="_t_read", description="read", parameters={"type": "object", "properties": {}},
                   handler=lambda a, c: _async("ok"), owner_only=True, source="test",
