@@ -1,3 +1,3 @@
 """ASTRA cortex — the brain."""
 
-__version__ = "0.15.10"
+__version__ = "0.15.11"

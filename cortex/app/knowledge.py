@@ -382,6 +382,37 @@ def person_handle_for(channel: str, name: str) -> str | None:
     return None
 
 
+def person_profiles_for_name(name: str) -> list[dict]:
+    """Find person profiles by full or partial name, exact matches first."""
+    target = _person_slug(name)
+    if not target:
+        return []
+    matches: list[tuple[int, dict]] = []
+    for entry in list_files():
+        if entry["tag"] != "person":
+            continue
+        title_slug = _person_slug(entry["title"])
+        rel_slug = _person_slug(Path(entry["rel"]).stem)
+        candidates = {title_slug, rel_slug}
+        if target in candidates:
+            score = 0
+        elif any(candidate.startswith(target) for candidate in candidates):
+            score = 1
+        elif any(target in candidate for candidate in candidates):
+            score = 2
+        else:
+            continue
+        text = read_file(entry["rel"])
+        matches.append((score, {
+            "name": entry["title"],
+            "file": entry["rel"],
+            "handles": parse_person_handles(text),
+            "tone": person_tone(text),
+        }))
+    matches.sort(key=lambda item: (item[0], item[1]["name"].lower()))
+    return [profile for _, profile in matches]
+
+
 def _set_header_line(text: str, label: str, value: str) -> str:
     """Insert/replace a `- **Label:** value` bullet near the top of a person file."""
     pat = re.compile(rf"^(\s*[-*]\s*\*{{0,2}}{re.escape(label)}\*{{0,2}}\s*:).*$",

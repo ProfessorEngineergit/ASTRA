@@ -326,6 +326,28 @@ async def _brain_read(args: dict, ctx: ToolContext) -> str:
     return f"# {rel}\n{text}"
 
 
+async def _person_lookup(args: dict, ctx: ToolContext) -> str:
+    query = str(args.get("name") or "").strip()
+    profiles = knowledge.person_profiles_for_name(query)
+    if not profiles:
+        return tool_result(ok=False, source="brain",
+                           summary=f"Keine Personen-Datei für '{query}' gefunden.")
+    rows = []
+    for profile in profiles[:8]:
+        handles = profile.get("handles") or {}
+        parts = []
+        for key, label in (("phone", "Telefon"), ("waha", "WhatsApp"),
+                           ("signal", "Signal"), ("telegram", "Telegram"),
+                           ("email", "E-Mail")):
+            values = handles.get(key) or []
+            if values:
+                parts.append(f"{label}: {', '.join(values)}")
+        rows.append(f"{profile['name']}: " + (" · ".join(parts) if parts else
+                                                "keine Kontaktdaten hinterlegt"))
+    return tool_result(ok=True, source="brain", summary="\n".join(rows),
+                       data={"profiles": profiles[:8]})
+
+
 async def _brain_write(args: dict, ctx: ToolContext) -> str:
     if not await _writes_allowed(ctx):
         return "Schreiben in Brain-Dateien ist deaktiviert (allow_self_config)."
@@ -985,6 +1007,13 @@ def register_admin_tools() -> None:
         ("astra_brain_read", "Lies eine Brain-Datei (z. B. facts.md oder people/<slug>.md).",
          {"type": "object", "properties": {"file": {"type": "string"}}, "required": ["file"]},
          _brain_read),
+        ("astra_person_lookup",
+         "Suche automatisch in Personen-Dateien nach einem Namen und liefere Telefon-, "
+         "WhatsApp-, Signal-, Telegram- und Mail-Kontaktdaten. Bei Fragen wie 'Was ist die "
+         "Nummer von Penelope?' dieses Tool direkt verwenden, ohne vorher nachzufragen.",
+         {"type": "object", "properties": {
+             "name": {"type": "string", "description": "Vollständiger oder teilweiser Name"}},
+          "required": ["name"]}, _person_lookup),
         ("astra_brain_write", "Überschreibe eine Brain-Datei komplett mit neuem Markdown.",
          {"type": "object", "properties": {
              "file": {"type": "string"}, "content": {"type": "string"}},

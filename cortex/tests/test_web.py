@@ -712,6 +712,15 @@ def test_secretary_master_toggle_applies_immediately_and_preserves_config(memdb,
     assert "Ausgeschaltet" in page.text
 
 
+def test_legacy_raw_tool_result_is_rendered_as_summary():
+    from app.web.admin import _friendly_stored_tool_result
+
+    content = ('Ausgeführt: astra_send_message\n\n'
+               '{"ok":false,"summary":"Senden über WhatsApp ist fehlgeschlagen."}')
+
+    assert _friendly_stored_tool_result(content) == "Senden über WhatsApp ist fehlgeschlagen."
+
+
 def test_osint_tab_renders_and_run_endpoint_gates_tool(memdb):
     _prime_manager()
     c = TestClient(_app())

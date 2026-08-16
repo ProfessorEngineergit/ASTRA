@@ -3722,7 +3722,7 @@ def _chat_messages_for_agent(chat: dict) -> list[dict]:
     for m in chat.get("messages", []):
         if m.get("role") not in ("user", "assistant"):
             continue
-        content = m.get("content", "")
+        content = _friendly_stored_tool_result(m.get("content", ""))
         if m.get("attachments"):
             refs = [
                 f"- {a.get('name')} ({a.get('content_type')}, {a.get('path')})"
@@ -3731,6 +3731,22 @@ def _chat_messages_for_agent(chat: dict) -> list[dict]:
             content = f"{content}\n\nAnhänge:\n" + "\n".join(refs)
         messages.append({"role": m["role"], "content": content})
     return messages[-40:]
+
+
+def _friendly_stored_tool_result(content: str) -> str:
+    """Collapse legacy raw tool-result messages already persisted in chat history."""
+    text = str(content or "")
+    candidates = [text]
+    if text.startswith("Ausgeführt:") and "\n\n" in text:
+        candidates.insert(0, text.split("\n\n", 1)[1].strip())
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(payload, dict) and payload.get("summary"):
+            return str(payload["summary"])
+    return text
 
 
 async def _refresh_agent_tools() -> None:
@@ -3848,9 +3864,10 @@ def _render_messages(chat: dict) -> str:
                     f'<b>{esc(kind or "file")}</b><span>{esc(a.get("name", "Anhang"))}</span></a>'
                 )
             attachments = '<div class="attachments">' + "".join(items) + '</div>'
+        content = _friendly_stored_tool_result(m.get("content", ""))
         msgs.append(
             f'<div class="msg-row {cls}" data-mid="{esc(m["id"])}">'
-            f'<div class="msg {cls}"><span class="msg-content">{esc(m.get("content", ""))}</span>{attachments}{tool_cards}{pending}</div>'
+            f'<div class="msg {cls}"><span class="msg-content">{esc(content)}</span>{attachments}{tool_cards}{pending}</div>'
             f'<div class="msg-actions">{actions}</div></div>'
         )
     if not msgs:

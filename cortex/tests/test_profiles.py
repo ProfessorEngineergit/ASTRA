@@ -42,6 +42,18 @@ def test_outbound_resolves_exact_person_name_to_phone_handle(brain):
     assert brain.person_handle_for("waha", "andere Person") is None
 
 
+def test_person_lookup_finds_partial_name_and_contact_data(brain):
+    brain.upsert_person_profile("Penelope Minton Novotny", {
+        "phone": "+49 173 3620260", "email": "penelope@example.test",
+    })
+
+    matches = brain.person_profiles_for_name("Penelope")
+
+    assert len(matches) == 1
+    assert matches[0]["name"] == "Penelope Minton Novotny"
+    assert matches[0]["handles"]["phone"] == ["+49 173 3620260"]
+
+
 def test_email_matches_only_email_channel(brain):
     brain.upsert_person_profile("Frau Schmidt", {"email": "schmidt@schule.de", "tone": "formell"})
     assert brain.person_file_for("email", "schmidt@schule.de")["tone"] == "formell"

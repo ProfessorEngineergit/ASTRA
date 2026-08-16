@@ -138,6 +138,24 @@ def test_send_message_keeps_transport_error_for_chat_result(monkeypatch, memdb):
     assert "WAHA-Session 'default' ist STARTING" in result
 
 
+def test_person_lookup_reads_profile_without_confirmation(monkeypatch, memdb):
+    from app import admin_tools
+
+    monkeypatch.setattr(admin_tools.knowledge, "person_profiles_for_name", lambda name: [{
+        "name": "Penelope Minton Novotny", "file": "people/penelope.md",
+        "handles": {"phone": ["+49 173 3620260"]}, "tone": "",
+    }])
+    ctx = ToolContext(thread_id="web-owner:test", channel="web", contact={"id": "owner"},
+                      is_owner=True)
+
+    result = asyncio.run(admin_tools._person_lookup({"name": "Penelope"}, ctx))
+
+    assert "+49 173 3620260" in result
+    admin_tools.register_admin_tools()
+    assert REGISTRY["astra_person_lookup"].safety == "private_read"
+    assert needs_confirmation("astra_person_lookup") is False
+
+
 def test_safety_controls_confirmation_and_manifest_visibility():
     register(Tool(name="_t_read", description="read", parameters={"type": "object", "properties": {}},
                   handler=lambda a, c: _async("ok"), owner_only=True, source="test",
