@@ -79,9 +79,10 @@ def test_waha_send_uses_secretary_ui_installation(memdb):
     ok = asyncio.run(channels.send("waha", "+49 170 1234567", "Test"))
 
     assert ok is True
-    assert http.calls[0][1] == "http://waha-ui:3000/api/sendText"
-    assert http.calls[0][2]["headers"]["X-Api-Key"] == "ui-secret"
-    assert http.calls[0][2]["json"] == {
+    assert http.calls[0][1] == "http://waha-ui:3000/api/contacts/check-exists"
+    assert http.calls[1][1] == "http://waha-ui:3000/api/sendText"
+    assert http.calls[1][2]["headers"]["X-Api-Key"] == "ui-secret"
+    assert http.calls[1][2]["json"] == {
         "session": "secretary-session",
         "chatId": "491701234567@c.us",
         "text": "Test",
@@ -101,7 +102,7 @@ def test_waha_send_does_not_bypass_ui_installation_when_n8n_is_global_backend(me
     ok = asyncio.run(channels.send("waha", "+49 170 1234567", "Bestätigt"))
 
     assert ok is True
-    assert http.calls[0][1] == "http://waha-ui:3000/api/sendText"
+    assert http.calls[1][1] == "http://waha-ui:3000/api/sendText"
 
 
 def test_waha_self_send_uses_live_session_identity(memdb):
@@ -110,14 +111,30 @@ def test_waha_self_send_uses_live_session_identity(memdb):
             "base_url": "http://waha:3000", "session": "mine", "api_key": "secret",
         }}}
     }
-    http = _Http(get_data={"status": "WORKING", "me": {"id": "123456@lid"}})
+    http = _Http(get_data={"id": "123456@lid"})
     channels = _channels_with_http(http)
 
     ok = asyncio.run(channels.send("waha", "__self__", "Test"))
 
     assert ok is True
-    assert http.calls[0][0:2] == ("GET", "http://waha:3000/api/sessions/mine")
+    assert http.calls[0][0:2] == ("GET", "http://waha:3000/api/sessions/mine/me")
     assert http.calls[1][2]["json"]["chatId"] == "123456@lid"
+
+
+def test_waha_phone_send_uses_canonical_chat_id(memdb):
+    memdb["app_settings"] = {
+        "secretary": {"installations": {"waha": {
+            "base_url": "http://waha:3000", "session": "default", "api_key": "secret",
+        }}}
+    }
+    http = _Http(get_data={"numberExists": True, "chatId": "987654@lid"})
+    channels = _channels_with_http(http)
+
+    ok = asyncio.run(channels.send("waha", "+49 173 3620260", "Test"))
+
+    assert ok is True
+    assert http.calls[0][2]["params"] == {"phone": "491733620260", "session": "default"}
+    assert http.calls[1][2]["json"]["chatId"] == "987654@lid"
 
 
 def test_waha_send_exposes_actionable_http_error(memdb):

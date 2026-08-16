@@ -35,7 +35,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import brain, briefing, db, knowledge
+from . import __version__, brain, briefing, db, knowledge
 from .channels import get_channels
 from .config import get_settings
 from .integrations.transcription import get_transcriber
@@ -407,7 +407,7 @@ def _verify_secret(x_astra_secret: str | None) -> None:
 
 @app.get("/health", tags=["infra"])
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": __version__}
 
 
 # ─── Morning briefing (manual trigger) ──────────────────────────────────────────

@@ -172,17 +172,35 @@ class Channels:
 
         if chat_id == "__self__":
             status_response = await self._http.get(
-                f"{base_url}/api/sessions/{session}", headers=headers)
+                f"{base_url}/api/sessions/{session}/me", headers=headers)
             if not status_response.is_success:
                 raise RuntimeError(self._waha_http_error(status_response, session=session))
             status_data = status_response.json()
-            me = (status_data.get("me") or {}) if isinstance(status_data, dict) else {}
-            target = str(me.get("id") or "") if isinstance(me, dict) else ""
+            target = str(status_data.get("id") or "") if isinstance(status_data, dict) else ""
             if not target:
                 raise RuntimeError(
                     f"WAHA-Session '{session}' meldet keine eigene WhatsApp-ID.")
         else:
             target = self._waha_chat_id(chat_id)
+            # Ask WAHA for the canonical chat ID before sending to a raw number.
+            # Depending on the account this can be @c.us or @lid.
+            if "@" not in chat_id and any(ch.isdigit() for ch in chat_id):
+                digits = "".join(ch for ch in chat_id if ch.isdigit())
+                check = await self._http.get(
+                    f"{base_url}/api/contacts/check-exists",
+                    headers=headers,
+                    params={"phone": digits, "session": session},
+                )
+                if check.is_success:
+                    check_data = check.json()
+                    if isinstance(check_data, dict) and check_data.get("numberExists") is False:
+                        raise RuntimeError(
+                            f"Die Nummer +{digits} ist laut WAHA nicht bei WhatsApp registriert.")
+                    canonical = check_data.get("chatId") if isinstance(check_data, dict) else ""
+                    if canonical:
+                        target = str(canonical)
+                elif check.status_code in {401, 403}:
+                    raise RuntimeError(self._waha_http_error(check, session=session))
         if not target or "@" not in target:
             raise RuntimeError(
                 f"Für '{chat_id}' ist keine gültige WhatsApp-Nummer hinterlegt.")
