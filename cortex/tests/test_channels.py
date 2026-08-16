@@ -35,14 +35,16 @@ class _Response:
 
 
 class _Http:
-    def __init__(self, *, send_status: int = 200, send_data: dict | None = None):
+    def __init__(self, *, send_status: int = 200, send_data: dict | None = None,
+                 get_data: dict | None = None):
         self.calls = []
         self.send_status = send_status
         self.send_data = send_data
+        self.get_data = get_data or {"status": "WORKING"}
 
     async def get(self, url, **kwargs):
         self.calls.append(("GET", url, kwargs))
-        return _Response(200, {"status": "WORKING"})
+        return _Response(200, self.get_data)
 
     async def post(self, url, **kwargs):
         self.calls.append(("POST", url, kwargs))
@@ -100,6 +102,22 @@ def test_waha_send_does_not_bypass_ui_installation_when_n8n_is_global_backend(me
 
     assert ok is True
     assert http.calls[0][1] == "http://waha-ui:3000/api/sendText"
+
+
+def test_waha_self_send_uses_live_session_identity(memdb):
+    memdb["app_settings"] = {
+        "secretary": {"installations": {"waha": {
+            "base_url": "http://waha:3000", "session": "mine", "api_key": "secret",
+        }}}
+    }
+    http = _Http(get_data={"status": "WORKING", "me": {"id": "123456@lid"}})
+    channels = _channels_with_http(http)
+
+    ok = asyncio.run(channels.send("waha", "__self__", "Test"))
+
+    assert ok is True
+    assert http.calls[0][0:2] == ("GET", "http://waha:3000/api/sessions/mine")
+    assert http.calls[1][2]["json"]["chatId"] == "123456@lid"
 
 
 def test_waha_send_exposes_actionable_http_error(memdb):

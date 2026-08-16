@@ -170,7 +170,19 @@ class Channels:
             raise RuntimeError("WAHA API-Key fehlt.")
         headers = {"X-Api-Key": api_key}
 
-        target = self._waha_chat_id(chat_id)
+        if chat_id == "__self__":
+            status_response = await self._http.get(
+                f"{base_url}/api/sessions/{session}", headers=headers)
+            if not status_response.is_success:
+                raise RuntimeError(self._waha_http_error(status_response, session=session))
+            status_data = status_response.json()
+            me = (status_data.get("me") or {}) if isinstance(status_data, dict) else {}
+            target = str(me.get("id") or "") if isinstance(me, dict) else ""
+            if not target:
+                raise RuntimeError(
+                    f"WAHA-Session '{session}' meldet keine eigene WhatsApp-ID.")
+        else:
+            target = self._waha_chat_id(chat_id)
         if not target or "@" not in target:
             raise RuntimeError(
                 f"Für '{chat_id}' ist keine gültige WhatsApp-Nummer hinterlegt.")

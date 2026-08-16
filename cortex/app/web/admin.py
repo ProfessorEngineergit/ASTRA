@@ -4207,9 +4207,16 @@ async def chat_action(request: Request, _: bool = Depends(auth.require_admin)):
     )
     await _refresh_agent_tools()
     result = await dispatch(pending["tool"], pending.get("args") or {}, ctx)
+    display_result = result
+    try:
+        parsed_result = json.loads(result)
+        if isinstance(parsed_result, dict) and parsed_result.get("summary"):
+            display_result = str(parsed_result["summary"])
+    except (json.JSONDecodeError, TypeError):
+        pass
     target.pop("pending_action", None)
     chat["pending_action"] = None
-    chat["messages"].append(_msg("assistant", f"Ausgeführt: {pending['tool']}\n\n{result}"))
+    chat["messages"].append(_msg("assistant", display_result))
     chat["updated_at"] = _now_iso()
     await _save_chat_store(store)
     return JSONResponse({"ok": True})

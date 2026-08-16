@@ -91,6 +91,53 @@ def test_update_settings_can_toggle_secretary_via_json(memdb):
     assert memdb["app_settings"]["secretary"] == {"enabled": False, "tone": "warm"}
 
 
+def test_send_message_resolves_owner_name_to_live_waha_self(monkeypatch, memdb):
+    from app import admin_tools
+
+    seen = []
+
+    class Transport:
+        async def send(self, channel, to, text):
+            seen.append((channel, to, text))
+            return True
+
+        def last_error(self, channel):
+            return ""
+
+    monkeypatch.setattr(admin_tools, "get_channels", lambda: Transport())
+    ctx = ToolContext(thread_id="web-owner:test", channel="web", contact={"id": "owner"},
+                      is_owner=True, permission_mode="bypass")
+
+    result = asyncio.run(admin_tools._send_message(
+        {"channel": "waha", "to": "Bahrian", "text": "Test"}, ctx,
+    ))
+
+    assert seen == [("waha", "__self__", "Test")]
+    assert '"ok": true' in result
+
+
+def test_send_message_keeps_transport_error_for_chat_result(monkeypatch, memdb):
+    from app import admin_tools
+
+    class Transport:
+        async def send(self, channel, to, text):
+            return False
+
+        def last_error(self, channel):
+            return "WAHA-Session 'default' ist STARTING."
+
+    transport = Transport()
+    monkeypatch.setattr(admin_tools, "get_channels", lambda: transport)
+    ctx = ToolContext(thread_id="web-owner:test", channel="web", contact={"id": "owner"},
+                      is_owner=True, permission_mode="bypass")
+
+    result = asyncio.run(admin_tools._send_message(
+        {"channel": "waha", "to": "Bahrian", "text": "Test"}, ctx,
+    ))
+
+    assert "WAHA-Session 'default' ist STARTING" in result
+
+
 def test_safety_controls_confirmation_and_manifest_visibility():
     register(Tool(name="_t_read", description="read", parameters={"type": "object", "properties": {}},
                   handler=lambda a, c: _async("ok"), owner_only=True, source="test",

@@ -813,6 +813,8 @@ async def _person_profiles_save(args: dict, ctx: ToolContext) -> str:
 
 async def _is_owner_target(channel: str, to: str) -> bool:
     """True if `to` is Bahrian himself on this channel → no confirmation needed."""
+    if channel == "waha" and to == "__self__":
+        return True
     s = get_settings()
     norm = to.replace(" ", "").lower()
     if channel == "telegram" and str(to) == str(s.telegram_owner_chat_id):
@@ -849,7 +851,13 @@ async def _send_message(args: dict, ctx: ToolContext) -> str:
 
     label = _SEND_LABELS.get(channel, channel)
     display_to = to
-    if channel in {"waha", "signal"} and "@" not in to and not any(ch.isdigit() for ch in to):
+    owner_aliases = {"ich", "mich", "mir", "me", "self", "owner",
+                     get_settings().astra_owner_name.strip().lower()}
+    if channel == "waha" and to.strip().lower() in owner_aliases:
+        # WAHA's live me.id is authoritative for the self-chat. It may be a LID
+        # instead of the phone-number JID stored in a person profile.
+        to = "__self__"
+    elif channel in {"waha", "signal"} and "@" not in to and not any(ch.isdigit() for ch in to):
         resolved = knowledge.person_handle_for(channel, to)
         if not resolved:
             return tool_result(
@@ -857,28 +865,31 @@ async def _send_message(args: dict, ctx: ToolContext) -> str:
                 summary=f"Für {to} ist keine {label}-Nummer im Personenprofil hinterlegt.")
         to = resolved
 
-    def failure_summary() -> str:
-        reason = get_channels().last_error(channel)
+    def failure_summary(reason: str = "") -> str:
         suffix = f": {reason}" if reason else "."
         return f"Senden an {display_to} ({label}) ist fehlgeschlagen{suffix}"
 
     # Web origin: already confirmed via the AstraChat card → send now.
     if ctx.channel == "web":
-        ok = await get_channels().send(channel, to, text)
+        transport = get_channels()
+        ok = await transport.send(channel, to, text)
+        reason = transport.last_error(channel)
         await db.audit("outbound_web", channel=channel, detail={"to": to, "ok": ok})
         return tool_result(
             ok=ok, source="core",
-            summary=(f"Gesendet an {display_to} ({label})." if ok else failure_summary()),
+            summary=(f"Gesendet an {display_to} ({label})." if ok else failure_summary(reason)),
         )
 
     # Send to Bahrian himself (incl. self-test) → straight through, no gate.
     if await _is_owner_target(channel, to):
-        ok = await get_channels().send(channel, to, text)
+        transport = get_channels()
+        ok = await transport.send(channel, to, text)
+        reason = transport.last_error(channel)
         await db.audit("outbound_self", channel=channel, detail={"to": to, "ok": ok})
         return tool_result(
             ok=ok, source="core",
             summary=(f"An dich selbst auf {label} gesendet." if ok
-                     else failure_summary()),
+                     else failure_summary(reason)),
         )
 
     # Third party → require an explicit Telegram confirmation before anything leaves.
@@ -1177,7 +1188,8 @@ def register_admin_tools() -> None:
             "Sende eine WhatsApp-/Signal-/Telegram-Nachricht. An dich selbst (Bahrian) geht "
             "sie sofort raus; an jede andere Person erst nach deiner Bestätigung im "
             "Ursprungs-Chat. channel=telegram|waha(WhatsApp)|signal, to=Telefonnummer/Handle "
-            "(WhatsApp: Nummer), text=Inhalt. Für Mail nutze send_email, für Slack slack_send."
+            "(WhatsApp: Nummer; für dich selbst 'Bahrian' oder 'mich'), text=Inhalt. "
+            "Für Mail nutze send_email, für Slack slack_send."
         ),
         parameters={"type": "object", "properties": {
             "channel": {"type": "string", "enum": sorted(_SEND_CHANNELS)},
