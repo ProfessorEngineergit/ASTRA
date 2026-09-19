@@ -102,6 +102,11 @@ async def _recall_memory(args: dict, ctx: ToolContext) -> str:
     return "Erinnerungen:\n- " + "\n- ".join(facts[:8])
 
 
+def _topic_for(text: str) -> str:
+    from .cards import topic_for
+    return topic_for(text)
+
+
 async def _request_owner_approval(args: dict, ctx: ToolContext) -> str:
     s = get_settings()
     question = args.get("question", "Freigabe nötig.")
@@ -111,7 +116,8 @@ async def _request_owner_approval(args: dict, ctx: ToolContext) -> str:
         contact_id=ctx.contact.get("id"),
         kind="disclosure",
         question=question,
-        payload={"channel": ctx.channel, "thread_id": ctx.thread_id},
+        payload={"channel": ctx.channel, "thread_id": ctx.thread_id,
+                 "topic": _topic_for(question + " " + owner_summary)},
     )
     await db.set_thread_state(ctx.thread_id, "awaiting_approval")
     await db.audit(
@@ -124,13 +130,17 @@ async def _request_owner_approval(args: dict, ctx: ToolContext) -> str:
     if s.telegram_enabled and s.telegram_owner_chat_id:
         name = ctx.contact.get("display_name") or ctx.contact.get("handle")
         buttons = [
-            {"text": "✅ Ja", "callback_data": f"apv:{approval_id}:yes"},
-            {"text": "🟡 Nur 'beschäftigt'", "callback_data": f"apv:{approval_id}:busy_only"},
-            {"text": "❌ Nein", "callback_data": f"apv:{approval_id}:no"},
+            [{"text": "✅ Ja", "callback_data": f"apv:{approval_id}:yes"},
+             {"text": "🟡 Nur 'beschäftigt'", "callback_data": f"apv:{approval_id}:busy_only"},
+             {"text": "❌ Nein", "callback_data": f"apv:{approval_id}:no"}],
+            [{"text": "♾ Immer ja", "callback_data": f"apv:{approval_id}:always_yes"},
+             {"text": "♾ Immer nur 'beschäftigt'", "callback_data": f"apv:{approval_id}:always_busy"},
+             {"text": "🚫 Nie", "callback_data": f"apv:{approval_id}:never"}],
         ]
         await get_channels().send_telegram(
             s.telegram_owner_chat_id,
-            f"🔔 {name} ({ctx.channel}) fragt:\n„{owner_summary}“\n\nDarf ASTRA antworten?",
+            f"🔔 {name} ({ctx.channel}) fragt:\n„{owner_summary}“\n\nDarf ASTRA antworten? "
+            "(„Immer/Nie“ merke ich mir für diese Person.)",
             buttons=buttons,
         )
     return (
@@ -231,6 +241,46 @@ async def _check_availability(args: dict, ctx: ToolContext) -> str:
         },
         source="core",
     )
+
+
+async def _suggest_times(args: dict, ctx: ToolContext) -> str:
+    """Freie Terminvorschläge — nur Zeiten, NIE Titel. Für Dritte nur mit Kalender-Freigabe
+    (freebusy/details laut Kontaktkarte), Bahrian selbst darf immer."""
+    from datetime import time as _time
+    from . import calendar_intel as ci
+    if not ctx.is_owner and ctx.max_sensitivity not in {"freebusy", "details"}:
+        return tool_result(ok=False, source="core",
+                           summary="Fuer diese Person ist keine Kalenderauskunft freigegeben.")
+
+    def _hhmm(v, default):
+        try:
+            h, m = str(v).split(":", 1)
+            return _time(int(h), int(m[:2]))
+        except Exception:  # noqa: BLE001
+            return default
+    duration = max(15, min(int(args.get("duration_min") or 60), 480))
+    days = max(1, min(int(args.get("days") or 7), 14))
+    try:
+        from .plugins.registry import get_manager
+        plugin = get_manager().get("google_calendar")
+        if plugin is None or not plugin.enabled or not hasattr(plugin, "effective_busy"):
+            return tool_result(ok=False, source="core",
+                               summary="Google Kalender ist in ASTRA noch nicht verbunden.")
+        tz = ZoneInfo(get_settings().astra_timezone)
+        now = datetime.now(tz)
+        end = now + timedelta(days=days)
+        busy = await plugin.effective_busy(now.isoformat(), end.isoformat())
+    except Exception as e:  # noqa: BLE001
+        log.warning("suggest_times failed: %s", e)
+        return tool_result(ok=False, source="core", summary=f"Kalender nicht lesbar: {e}")
+    slots = ci.propose_times(
+        busy, now=now, days=days, duration_min=duration,
+        earliest=_hhmm(args.get("earliest"), _time(9, 0)), latest=_hhmm(args.get("latest"), _time(20, 0)),
+        limit=int(args.get("limit") or 4))
+    return tool_result(
+        ok=True, source="core",
+        summary=("Freie Zeiten (" + str(duration) + " Min.):\n" + ci.describe_slots(slots)),
+        data={"slots": [{"start": s.start.isoformat(), "end": s.end.isoformat()} for s in slots]})
 
 
 async def _remember_fact(args: dict, ctx: ToolContext) -> str:
@@ -410,6 +460,23 @@ register(Tool(
     intents=["search", "status"],
     examples=["Ist Bahrian morgen um 16 Uhr frei?"],
 ))
+
+register(Tool(
+    name="suggest_meeting_times",
+    description=(
+        "Schlage konkrete freie Termine fuer ein Treffen vor (nur Zeiten, nie Termin-Titel). "
+        "duration_min=Dauer, days=Suchzeitraum (Standard 7), earliest/latest='HH:MM' Tagesgrenzen. "
+        "Fuer Dritte nur, wenn Bahrian die Kalenderauskunft freigegeben hat."
+    ),
+    parameters={"type": "object", "properties": {
+        "duration_min": {"type": "integer"}, "days": {"type": "integer"},
+        "earliest": {"type": "string"}, "latest": {"type": "string"}, "limit": {"type": "integer"}}},
+    handler=_suggest_times,
+    safety="private_read",
+    intents=["search", "status"],
+    examples=["Wann hat Bahrian diese Woche 90 Minuten Zeit?"],
+))
+
 
 register(Tool(
     name="remember_fact",
