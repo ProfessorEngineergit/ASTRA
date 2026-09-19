@@ -1087,6 +1087,12 @@ async def plugin_google_oauth_start(slug: str, request: Request, _: bool = Depen
 
 @router.get("/admin/oauth/google/callback", name="oauth_google_callback")
 async def oauth_google_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    if not code and not state and not error:
+        # Adresse wurde direkt im Browser geöffnet (z. B. zum Testen, ob sie erreichbar ist).
+        return HTMLResponse(page("OAuth", (
+            '<div class="flash ok">✅ Diese Adresse ist erreichbar — genau hierhin leitet Google nach der Zustimmung zurück.</div>'
+            '<p>Sie wird nicht von Hand aufgerufen. Starte die Anmeldung unter '
+            '<a href="/admin/google">Admin → Google</a>.</p>')))
     if error:
         pre = await auth.read_oauth_state(state) if state.startswith("v1.") else None
         if pre and pre.get("provider") == "google_hub":
@@ -1103,7 +1109,10 @@ async def oauth_google_callback(request: Request, code: str = "", state: str = "
         from .admin_google import finish
         return await finish(code, state, "", request)
     if not state_data or state_data.get("provider") != "google":
-        return HTMLResponse(page("OAuth", '<div class="flash err">OAuth-State ungueltig oder abgelaufen.</div>'), 400)
+        return HTMLResponse(page("OAuth", (
+            '<div class="flash err">Die Anmeldung ist ungültig oder abgelaufen (Zeitlimit 20 Minuten).</div>'
+            '<p>Starte sie neu unter <a href="/admin/google">Admin → Google</a> und schließe sie direkt ab. '
+            'Diese Adresse funktioniert nur als Rücksprung von Google, nicht wenn man sie von Hand öffnet.</p>')), 400)
     mgr = get_manager()
     cls = mgr.plugin_class(state_data.get("slug", ""))
     if not cls:

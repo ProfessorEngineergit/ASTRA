@@ -17,13 +17,20 @@ Unter Admin → Google → „Weiterleitung zurück zu ASTRA" wählst du:
   Adresse plus `/admin/oauth/google/callback` bei Google eintragen. Du kannst **lokal** gestartet haben: Google leitet über die Domain
   zurück, ASTRA schließt die Anmeldung dort ab (kein Login auf der Domain nötig) und schickt dich danach dorthin zurück, wo du
   angefangen hast. Ungültige Eingaben (LAN-IP, http, falscher Pfad) lehnt ASTRA ab, bevor Google es tut.
-- **Automatisch**: richtet sich nach der Adresse, unter der du gerade bist (localhost oder https-Domain → direkt; sonst manuell).
-  Hinter einem Proxy/Tunnel erkennt ASTRA https über `X-Forwarded-Proto`.
+- **Automatisch**: 1. bist du über eine https-Domain verbunden → diese; 2. sonst die **bekannte Domain** (`ASTRA_DOMAIN` aus der
+  `.env` oder die, über die du ASTRA zuletzt per https geöffnet hast) — auch wenn du gerade lokal oder per LAN-IP drin bist;
+  3. sonst localhost bzw. manuell. Hinter einem Proxy/Tunnel erkennt ASTRA https über `X-Forwarded-Proto`. Die tatsächlich gesendete
+  Adresse steht auf der Seite (zweimal: beim Client und beim Anmelden).
 - **Nur localhost (manuell)**: Google leitet auf `http://localhost:<Port>/admin/oauth/google/callback` zurück, die Seite lädt nicht
   (gewollt), du kopierst die **komplette Adresse aus der Browserleiste** und fügst sie unter „Anmeldung abschließen" ein. Der Knopf
   „Über localhost anmelden" nutzt diesen Weg auch dann, wenn eine Domain eingestellt ist.
 
-Trage am besten **beide** Adressen bei Google ein (Domain + localhost): die Seite zeigt sie mit Kopieren-Knopf.
+Trage die **erste** Adresse (die gesendete) bei Google ein — sonst kommt „Fehler 400: redirect_uri_mismatch“; sie muss zeichengenau
+übereinstimmen (Google zeigt sie unter „Fehlerdetails“). Die zweite (localhost) ist nur der Ausweichweg. „localhost“ meint **deinen
+Rechner**: dein Browser wird dorthin geschickt, nicht ein Google-Server — deshalb lädt die Seite nicht und du fügst die Adresse ein.
+
+Öffnest du `…/admin/oauth/google/callback` von Hand, meldet ASTRA nur „erreichbar“ bzw. „ungültig/abgelaufen“ — die Adresse ist
+ausschließlich der Rücksprung von Google.
 
 ## Berechtigungen (Scopes) und APIs
 | Produkt | Google-API aktivieren | Scope, den ASTRA erfragt | Wofür |

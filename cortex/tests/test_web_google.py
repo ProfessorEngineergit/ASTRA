@@ -28,13 +28,26 @@ def _client(base="http://10.60.0.190:8088") -> TestClient:
     return c
 
 
+def _login(base: str) -> TestClient:
+    """Zweiter Zugang (andere Adresse) zur bereits eingerichteten Instanz."""
+    app = FastAPI()
+    for r in (web_admin.router, admin_extra.router, admin_google.router):
+        app.include_router(r)
+    c = TestClient(app, base_url=base)
+    c.get("/admin/login")
+    c.post("/admin/login", data={"csrf": c.cookies.get(auth.CSRF_COOKIE), "password": "geheim123"},
+           follow_redirects=False)
+    return c
+
+
 def _csrf(c, path="/admin/google"):
     c.get(path)
     return c.cookies.get(auth.CSRF_COOKIE)
 
 
 @pytest.fixture
-def env(hub, memdb):
+def env(hub, memdb, monkeypatch):
+    monkeypatch.delenv("ASTRA_DOMAIN", raising=False)
     mgr = get_manager()
     mgr._classes = _discover_classes()
     mgr._instances = {cls.slug: cls({"__enabled": False}) for cls in mgr._classes}
@@ -343,3 +356,52 @@ def test_forwarded_headers_make_a_proxied_domain_count_as_https(env):
     r = c.post("/admin/google/connect", data={"csrf": csrf}, headers={"X-Forwarded-Proto": "https"},
                follow_redirects=False)
     assert "/admin/google?err=" in r.headers["location"]       # ohne Client noch kein Google-Aufruf
+
+
+# ─── Automatik mit bekannter Domain, sichtbare Sende-Adresse, freundliche Callback-Seiten ─────
+def test_auto_mode_uses_the_domain_from_env_even_when_connected_by_lan_ip(env, monkeypatch):
+    monkeypatch.setenv("ASTRA_DOMAIN", "astra.bahriannovotny.space")
+    c = _client("http://10.60.0.190:8088")
+    _save(c, "auto")
+    page = c.get("/admin/google").text
+    assert f'id="g-redirect-0" readonly value="{DOMAIN_CB}"' in page and "Diese Adresse sendet ASTRA beim Anmelden" in page
+    assert f"sendet ASTRA diese Rücksprung-Adresse: <b>{DOMAIN_CB}</b>" in page
+    assert "Aktuell würde localhost gesendet" not in page
+    _, q = _start(c)
+    assert q["redirect_uri"] == [DOMAIN_CB]                                           # genau das, was angezeigt wurde
+    assert "g-use-known" in page                                                       # Vorschlag „Diese Domain verwenden“
+
+
+def test_visiting_via_the_domain_teaches_astra_the_domain_for_later_local_use(env, monkeypatch):
+    monkeypatch.delenv("ASTRA_DOMAIN", raising=False)
+    via_domain = _client(DOMAIN)
+    via_domain.get("/admin/google")
+    assert gh.known_domain() == DOMAIN
+    local = _login("http://10.60.0.190:8088")
+    _save(local, "auto")
+    assert f'id="g-redirect-0" readonly value="{DOMAIN_CB}"' in local.get("/admin/google").text
+
+
+def test_without_any_known_domain_the_page_steers_to_domain_input_and_warns_about_localhost(env, monkeypatch):
+    monkeypatch.delenv("ASTRA_DOMAIN", raising=False)
+    c = _client("http://10.60.0.190:8088")
+    page = c.get("/admin/google").text
+    assert '<option value="domain" selected>' in page and "Aktuell würde localhost gesendet" in page
+    assert "Eigene Domain</b> eintragen" in page and "deinen Rechner" in page
+
+
+def test_bare_callback_url_says_it_is_reachable_and_bad_state_explains_itself(env):
+    c = TestClient(_app_for_callback(), base_url=DOMAIN)
+    bare = c.get("/admin/oauth/google/callback")
+    assert bare.status_code == 200 and "erreichbar" in bare.text and "/admin/google" in bare.text
+    bad = c.get("/admin/oauth/google/callback", params={"state": "v1.alt", "code": "x"})
+    assert bad.status_code == 400 and "20 Minuten" in bad.text and "von Hand" in bad.text
+
+
+def test_known_domain_beats_localhost_even_when_you_are_at_localhost(env, monkeypatch):
+    monkeypatch.setenv("ASTRA_DOMAIN", "astra.bahriannovotny.space")
+    c = _client("http://localhost:8088")
+    _save(c, "auto")
+    _, q = _start(c)
+    assert q["redirect_uri"] == [DOMAIN_CB]
+    assert asyncio.run(auth.read_oauth_state(q["state"][0]))["return_to"] == "http://localhost:8088/"

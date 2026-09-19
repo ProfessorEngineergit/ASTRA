@@ -154,7 +154,23 @@ def origin_of(url: str) -> str:
     return f"{u.scheme}://{u.netloc}".lower() if u.scheme and u.netloc else ""
 
 
-def pick_redirect(base_url: str, configured: str = "", *, force_manual: bool = False) -> dict:
+def public_origin(base_url: str) -> str:
+    """https://domain[:port] wenn die Adresse eine echte öffentliche Domain mit https ist, sonst ''."""
+    u = urlparse(base_url or "")
+    if u.scheme == "https" and _public_domain(u.hostname or ""):
+        return origin_of(base_url)
+    return ""
+
+
+def env_domain() -> str:
+    """Die in der .env als ASTRA_DOMAIN eingetragene Domain (Caddy), falls öffentlich nutzbar."""
+    import os
+    dom = (os.environ.get("ASTRA_DOMAIN") or "").strip()
+    return public_origin("https://" + dom) if dom else ""
+
+
+def pick_redirect(base_url: str, configured: str = "", *, force_manual: bool = False,
+                  known_domain: str = "") -> dict:
     """Weiterleitungsadresse wählen. → {uri, mode: direct|manual|configured, reason}.
 
     `base_url` ist die Adresse, unter der der Admin gerade offen ist (z. B. http://10.60.0.190:8088/).
@@ -173,14 +189,19 @@ def pick_redirect(base_url: str, configured: str = "", *, force_manual: bool = F
         if uri and not err:
             return {"uri": uri, "mode": "configured",
                     "reason": "Von dir festgelegte Weiterleitungsadresse (eigene Domain)."}
-    if host in ("localhost", "127.0.0.1", "::1"):
-        return {"uri": f"{scheme}://{host}{port}{CALLBACK_PATH}", "mode": "direct",
-                "reason": "Du bist über localhost verbunden — Google darf direkt zurückleiten."}
     if scheme == "https" and _public_domain(host):
         return {"uri": f"https://{host}{port}{CALLBACK_PATH}", "mode": "direct",
                 "reason": "Du bist über eine https-Domain verbunden — Google darf direkt zurückleiten."}
+    known = public_origin(known_domain)
+    if known:                                   # Domain schlägt localhost: sie ist überall bei Google eingetragen
+        return {"uri": f"{known}{CALLBACK_PATH}", "mode": "known",
+                "reason": (f"Automatisch erkannt: ASTRA ist unter {known} erreichbar — Google leitet dorthin zurück "
+                           "und du landest danach wieder hier (die Anmeldung kannst du von jeder Adresse aus starten).")}
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return {"uri": f"{scheme}://{host}{port}{CALLBACK_PATH}", "mode": "direct",
+                "reason": "Du bist über localhost verbunden — Google darf direkt zurückleiten."}
     manual["reason"] = ("Google erlaubt für Weiterleitungen keine LAN-Adresse (nur https-Domain oder localhost). "
-                        + manual["reason"] + " Oder trage unten deine Domain ein.")
+                        + manual["reason"] + " Einfacher: trage unten deine Domain ein.")
     return manual
 
 
@@ -298,13 +319,14 @@ def build_auth_url(*, client_id: str, redirect_uri: str, scopes: list[str], stat
 
 # ─── Zustand ──────────────────────────────────────────────────────────────────
 _STATE: dict = {"loaded": False, "client_id": "", "client_secret": "", "accounts": {}, "default": "",
-                "redirect_uri": ""}
+                "redirect_uri": "", "known_domain": ""}
 _TOKENS: dict[str, tuple[str, float]] = {}
 _LOCK = asyncio.Lock()
 
 
 def _reset_for_tests() -> None:
-    _STATE.update(loaded=False, client_id="", client_secret="", accounts={}, default="", redirect_uri="")
+    _STATE.update(loaded=False, client_id="", client_secret="", accounts={}, default="", redirect_uri="",
+                  known_domain="")
     _TOKENS.clear()
 
 
@@ -329,7 +351,7 @@ async def load(force: bool = False) -> dict:
         log.warning("Google-Konten nicht lesbar — Speicher wird ignoriert.")
     _STATE.update(loaded=True, client_id=val("client_id"), client_secret=val("client_secret", True),
                   accounts=accounts if isinstance(accounts, dict) else {}, default=val("default"),
-                  redirect_uri=val("redirect_uri"))
+                  redirect_uri=val("redirect_uri"), known_domain=val("known_domain"))
     return _STATE
 
 
@@ -342,6 +364,25 @@ async def _persist() -> None:
     await db.plugin_config_set(SLUG, "accounts", store.encrypt(json.dumps(_STATE["accounts"], ensure_ascii=False)), True)
     await db.plugin_config_set(SLUG, "default", _STATE["default"], False)
     await db.plugin_config_set(SLUG, "redirect_uri", _STATE["redirect_uri"], False)
+    await db.plugin_config_set(SLUG, "known_domain", _STATE["known_domain"], False)
+
+
+def known_domain() -> str:
+    """Öffentliche Adresse von ASTRA: zuletzt über https gesehen, sonst ASTRA_DOMAIN aus der .env."""
+    return public_origin(_STATE["known_domain"]) or env_domain()
+
+
+async def remember_origin(base_url: str) -> None:
+    """Wird ASTRA über eine https-Domain geöffnet, merken wir uns die — dann klappt die Anmeldung
+    später auch, wenn du lokal gestartet hast."""
+    origin = public_origin(base_url)
+    if origin and origin != _STATE["known_domain"]:
+        await load()
+        _STATE["known_domain"] = origin
+        try:
+            await _persist()
+        except Exception:  # noqa: BLE001
+            log.debug("could not persist known domain", exc_info=True)
 
 
 def has_client() -> bool:
@@ -372,7 +413,7 @@ def usable(acct: str | None = None) -> bool:
 def summary() -> dict:
     """Secret-freie Sicht für die UI."""
     return {"client_id": _STATE["client_id"], "has_secret": bool(_STATE["client_secret"]),
-            "redirect_uri": _STATE["redirect_uri"], "default": _STATE["default"],
+            "redirect_uri": _STATE["redirect_uri"], "default": _STATE["default"], "known_domain": known_domain(),
             "accounts": [{"id": a["id"], "email": a.get("email", ""), "name": a.get("name", ""),
                           "products": products_from_scopes(a.get("scopes")), "status": a.get("status", "ok"),
                           "note": a.get("note", ""), "added": a.get("added", ""),

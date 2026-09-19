@@ -304,3 +304,39 @@ def test_origin_of():
     assert gh.origin_of("https://Astra.Example.com/admin/x?y=1") == "https://astra.example.com"
     assert gh.origin_of("http://10.60.0.190:8088/") == "http://10.60.0.190:8088"
     assert gh.origin_of("müll") == "" and gh.origin_of("") == ""
+
+
+# ─── Bekannte Domain (Automatik) ──────────────────────────────────────────────
+def test_public_origin_and_known_domain_win_over_the_localhost_fallback():
+    assert gh.public_origin("https://astra.example.com/x") == "https://astra.example.com"
+    assert gh.public_origin("http://astra.example.com") == "" and gh.public_origin("https://10.0.0.1") == ""
+    lan = "http://10.60.0.190:8088/"
+    r = gh.pick_redirect(lan, known_domain="https://astra.bahriannovotny.space")
+    assert r["mode"] == "known" and r["uri"] == "https://astra.bahriannovotny.space/admin/oauth/google/callback"
+    assert gh.pick_redirect(lan, known_domain="https://astra.local")["mode"] == "manual"          # unbrauchbar → manuell
+    assert gh.pick_redirect(lan, "manual", known_domain="https://astra.example.com")["mode"] == "manual"
+    own = gh.pick_redirect(lan, "https://mine.example.org", known_domain="https://astra.example.com")
+    assert own["mode"] == "configured" and "mine.example.org" in own["uri"]                        # Eingabe gewinnt
+
+
+def test_env_domain_and_remembered_origin(hub, monkeypatch):
+    monkeypatch.setenv("ASTRA_DOMAIN", "localhost")
+    assert gh.env_domain() == "" and gh.known_domain() == ""
+    monkeypatch.setenv("ASTRA_DOMAIN", "astra.bahriannovotny.space")
+    assert gh.known_domain() == "https://astra.bahriannovotny.space"
+    monkeypatch.delenv("ASTRA_DOMAIN")
+    run(gh.remember_origin("http://10.60.0.190:8088/"))                       # LAN merkt sich nichts
+    assert gh.known_domain() == ""
+    run(gh.remember_origin("https://astra.bahriannovotny.space/admin/google"))
+    assert gh.known_domain() == "https://astra.bahriannovotny.space"
+    gh._reset_for_tests()
+    run(gh.load(force=True))
+    assert gh.summary()["known_domain"] == "https://astra.bahriannovotny.space"                # überlebt Neustart
+
+
+def test_known_domain_has_priority_over_direct_localhost_but_not_over_the_current_https_domain():
+    r = gh.pick_redirect("http://localhost:8088/", known_domain="https://astra.example.com")
+    assert r["mode"] == "known" and r["uri"].startswith("https://astra.example.com")
+    r = gh.pick_redirect("https://other.example.org/", known_domain="https://astra.example.com")
+    assert r["mode"] == "direct" and r["uri"].startswith("https://other.example.org")
+    assert gh.pick_redirect("http://localhost:8088/")["mode"] == "direct"          # ohne bekannte Domain wie bisher

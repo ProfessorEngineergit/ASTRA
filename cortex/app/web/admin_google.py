@@ -36,7 +36,8 @@ def request_base(request: Request) -> str:
 
 
 def _redirect_info(request: Request, configured: str, *, force_manual: bool = False) -> dict:
-    return google_hub.pick_redirect(request_base(request), configured, force_manual=force_manual)
+    return google_hub.pick_redirect(request_base(request), configured, force_manual=force_manual,
+                                    known_domain=google_hub.known_domain())
 
 
 def _mode_of(configured: str) -> str:
@@ -189,13 +190,21 @@ def _render(request: Request, summ: dict, rows: list[dict], token: str, flash: s
     configured = summ["redirect_uri"]
     mode = _mode_of(configured)
     domain_value = configured if mode == "domain" else ""
+    ui_mode = "domain" if (mode == "auto" and red["mode"] == "manual") else mode      # sonst bliebe nur localhost sichtbar
     other_origin = mode == "domain" and google_hub.origin_of(red["uri"]) != google_hub.origin_of(request_base(request))
     localhost_uri = google_hub.pick_redirect(request_base(request), "", force_manual=True)["uri"]
     uris = [red["uri"]] + ([localhost_uri] if localhost_uri != red["uri"] else [])
+    labels = ["Diese Adresse sendet ASTRA beim Anmelden", "Ausweichweg (optional, nur für „Über localhost anmelden“)"]
     uri_rows = "".join(
+        f'<div class="help" style="margin:8px 0 3px">{esc(labels[min(i, 1)])}</div>'
         f'<div class="x-form" style="align-items:center;margin-bottom:6px"><input type="text" id="g-redirect-{i}" readonly value="{esc(u)}" '
         f'style="min-width:380px" onclick="this.select()"><button class="btn secondary sm g-copy" type="button" '
         f'data-target="g-redirect-{i}">Kopieren</button></div>' for i, u in enumerate(uris))
+    known = summ.get("known_domain", "")
+    suggest = ""
+    if known and mode != "domain":
+        suggest = (f'<div class="flash ok" style="margin:10px 0">Erkannte Domain: <b>{esc(known)}</b> '
+                   f'<button class="btn sm" type="button" id="g-use-known" data-domain="{esc(known)}" style="margin-left:8px">Diese Domain verwenden</button></div>')
     steps = f"""
 <div class="panel">
   <div class="section-head"><h2>1 · Google-Client (einmalig)</h2></div>
@@ -215,21 +224,24 @@ def _render(request: Request, summ: dict, rows: list[dict], token: str, flash: s
     <div class="x-form" style="align-items:flex-end">
       <div class="field"><label>Modus</label>
         <select name="redirect_mode" id="g-mode">
-          <option value="auto"{" selected" if mode == "auto" else ""}>Automatisch (nach Adresse, unter der du gerade bist)</option>
-          <option value="domain"{" selected" if mode == "domain" else ""}>Eigene Domain</option>
-          <option value="manual"{" selected" if mode == "manual" else ""}>Nur localhost (Adresse manuell einfügen)</option>
+          <option value="auto"{" selected" if ui_mode == "auto" else ""}>Automatisch (nach Adresse, unter der du gerade bist)</option>
+          <option value="domain"{" selected" if ui_mode == "domain" else ""}>Eigene Domain</option>
+          <option value="manual"{" selected" if ui_mode == "manual" else ""}>Nur localhost (Adresse manuell einfügen)</option>
         </select></div>
       <div class="field" id="g-domain-field"><label>Deine Domain</label>
         <input type="text" name="redirect_domain" value="{esc(domain_value)}" placeholder="https://astra.example.com" style="min-width:320px"></div>
     </div>
-    <div class="help" style="margin-bottom:10px">{esc(red["reason"])}</div>
+    <div class="x-muted" style="margin:0 0 6px">{esc(red["reason"])}</div>{suggest}
     {"<div class='flash ok' style='margin-bottom:10px'>Du bist gerade über eine andere Adresse verbunden. Das ist okay: Google leitet über deine Domain zurück, ASTRA schließt die Anmeldung dort ab und schickt dich danach hierher zurück.</div>" if other_origin else ""}
-    <div class="field"><label>Bei Google unter „Autorisierte Weiterleitungs-URIs“ eintragen</label>{uri_rows}
-      <div class="help">Trage am besten <b>beide</b> ein — die Domain für den direkten Weg, localhost als Ausweichweg.</div></div>
+    <div class="field"><label>Bei Google unter „Autorisierte Weiterleitungs-URIs“ eintragen (zeichengenau)</label>{uri_rows}
+      <div class="help">Die erste Adresse ist Pflicht, sonst meldet Google „Fehler 400: redirect_uri_mismatch“. Die zweite ist nur der
+      Ausweichweg. „localhost“ meint dabei <b>deinen Rechner</b>, nicht einen Google-Server.</div></div>
     <button class="btn sm" type="submit">Speichern</button>
   </form>
   <script>(function(){{const m=document.getElementById('g-mode'),f=document.getElementById('g-domain-field');
-    const u=()=>f.style.display=m.value==='domain'?'':'none'; m.addEventListener('change',u); u();}})();</script>
+    const u=()=>f.style.display=m.value==='domain'?'':'none'; m.addEventListener('change',u); u();
+    const k=document.getElementById('g-use-known'); if(k) k.addEventListener('click',()=>{{
+      m.value='domain'; u(); f.querySelector('input').value=k.dataset.domain; f.querySelector('input').focus();}});}})();</script>
 </div>"""
     cards_html = "".join(_account_card(a, token) for a in summ["accounts"]) or (
         '<p class="x-muted">Noch kein Konto verbunden.</p>')
@@ -241,6 +253,10 @@ def _render(request: Request, summ: dict, rows: list[dict], token: str, flash: s
     <div>{_product_boxes({"calendar", "tasks", "gmail_read"})}</div>
     <p class="x-muted">Jedes Mal kannst du bei Google ein <b>anderes Konto</b> wählen (privat, Schule, …). Später lassen sich Produkte
     pro Konto erweitern.</p>
+    <p class="x-muted">Beim Anmelden sendet ASTRA diese Rücksprung-Adresse: <b>{esc(red["uri"])}</b><br>
+    Sie muss bei Google unter „Autorisierte Weiterleitungs-URIs“ stehen. Bei „Fehler 400: redirect_uri_mismatch“ zeigt Google unter
+    „Fehlerdetails“ die gesendete Adresse — sie muss zeichengenau übereinstimmen.</p>
+    {'<div class="flash err">Aktuell würde localhost gesendet. Das braucht das manuelle Einfügen der Adresse — einfacher: oben <b>Eigene Domain</b> eintragen und speichern.</div>' if manual else ""}
     <button class="btn" type="submit" {"" if has_client else "disabled"}>Mit Google anmelden</button>
     <button class="btn ghost" type="submit" name="redirect" value="manual" {"" if has_client else "disabled"}
       title="Google leitet auf localhost zurück; du fügst die Adresse danach hier ein">Über localhost anmelden (Adresse einfügen)</button>
@@ -278,6 +294,7 @@ _FLASH = {"client": "Client gespeichert.", "connected": "Konto verbunden.", "def
 async def google_page(request: Request, _: bool = Depends(auth.require_admin), saved: str = "", err: str = ""):
     token = await auth.issue_csrf()
     await google_hub.load()
+    await google_hub.remember_origin(request_base(request))          # über die Domain geöffnet → merken
     html = _render(request, google_hub.summary(), await _plugin_rows(), token, _FLASH.get(saved, ""), err[:400])
     return _html_with_csrf(html, token)
 
@@ -330,6 +347,7 @@ async def google_connect(request: Request, _: bool = Depends(auth.require_admin)
     if hint:
         acct = google_hub.resolve(google_hub.account_id(hint))
         existing = list(acct.get("scopes", [])) if acct else []
+    await google_hub.remember_origin(request_base(request))
     red = _redirect_info(request, google_hub.summary()["redirect_uri"],
                          force_manual=str(form.get("redirect") or "") == "manual")
     state = await auth.issue_oauth_state({"provider": "google_hub", "redirect_uri": red["uri"], "mode": red["mode"],
