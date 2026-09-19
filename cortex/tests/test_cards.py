@@ -418,3 +418,27 @@ def test_switching_on_again_keeps_a_configured_time_window():
     back = cards.set_secretary(off, True)
     assert off["active"]["mode"] == "never" and back["active"]["mode"] == "window"
     assert back["active"]["start"] == "08:00" and back["active"]["days"] == [0, 1]
+
+
+def test_row_cfg_mirrors_the_card_in_the_form_field_vocabulary():
+    card = cards.sanitize({"name": "Lena", "rule": "ask", "style": "arrogant", "trust_tier": 1, "instruction": "Duzen",
+                           "share": {"availability": "freebusy", "location": "no"}, "model": {"tier": "small"},
+                           "active": {"mode": "always"}})
+    cfg = cards.row_cfg(card)
+    assert cfg["rule"] == "ask" and cfg["style"] == "arrogant" and cfg["trust_tier"] == "1"
+    assert cfg["share_availability"] == "freebusy" and cfg["share_location"] == "no" and cfg["share_school"] == ""
+    assert cfg["model_tier"] == "small" and cfg["active_mode"] == "always" and cfg["instruction"] == "Duzen"
+    odd = cards.row_cfg(cards.sanitize({"name": "X", "rule": "block", "style": "wie ein Pirat",
+                                        "active": {"mode": "never"}, "model": {"provider": "openrouter", "model": "a/b"}}))
+    assert odd["rule"] == "" and odd["style"] == "" and odd["active_mode"] == "inherit" and odd["model_tier"] == ""
+
+
+def test_directory_rows_carry_cfg_including_the_known_tier_of_cardless_contacts():
+    rows = cards.directory([], [{"channel": "waha", "handle": "4915@c.us", "display_name": "Jonas", "trust_tier": 1}])
+    assert rows[0]["cfg"]["trust_tier"] == "1" and rows[0]["cfg"]["rule"] == ""
+
+
+def test_bulk_patch_instruction_needs_the_explicit_flag():
+    assert "instruction" not in cards.bulk_patch({"b_instruction": "x"}.get)
+    assert cards.bulk_patch({"b_instruction": "x", "b_instruction_set": "1"}.get)["instruction"] == "x"
+    assert cards.bulk_patch({"b_instruction_set": "1"}.get)["instruction"] == ""

@@ -5,6 +5,7 @@ gleiche CSRF-Regeln, gleiches Seiten-Grundgerüst — nur eigene Routen.
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 
@@ -339,44 +340,51 @@ _SCOPES = {"all": "Alle", "person": "Personen", "group": "Gruppen", "nocard": "O
 _KEEP = {"": "— nicht ändern —"}
 
 
-def _bulk_select(field: str, label: str, options: dict, *, clearable: bool = True) -> str:
+def _bulk_select(field: str, label: str, options: dict, *, clearable: bool = True, group_only: bool = False) -> str:
     opts = dict(_KEEP)
     if clearable:
         opts["__clear__"] = "Standard (zurücksetzen)"
     opts.update({k: v for k, v in options.items() if k != ""})
-    return f'<div class="field"><label>{esc(label)}</label>{_select("b_" + field, opts, "")}</div>'
+    return (f'<div class="field{" grp" if group_only else ""}"><label>{esc(label)}</label>'
+            f'{_select("b_" + field, opts, "", extra=f"data-field={chr(34)}{field}{chr(34)}")}</div>')
 
 
 def _bulk_panel() -> str:
+    """Einstellungen unter der Liste: für EINE Auswahl mit ihren aktuellen Werten, für mehrere als Sammeländerung."""
     style_opts = {k: f"{e} {l}".strip() for k, l, _s, e in styles.choices()}
     model_opts = {"small": "Klein", "medium": "Mittel", "heavy": "Schwer", "code": "Code"}
     fields = "".join([
-        _bulk_select("rule", "Regel", {k: v for k, v in RULE_LABELS.items() if k}),
+        _bulk_select("rule", "Vorgehen", {k: v for k, v in RULE_LABELS.items() if k and k != "block"}),
         _bulk_select("trust_tier", "Vertrauensstufe", {str(k): v for k, v in TIER_LABELS.items() if k}, clearable=False),
         _bulk_select("style", "Stil", style_opts),
         _bulk_select("share_availability", "Kalender / Verfügbarkeit", {k: v for k, v in SHARE_LEVEL_LABELS.items() if k}),
         *(_bulk_select(f"share_{t}", cards.TOPIC_LABELS[t], {k: v for k, v in YESNO_LABELS.items() if k})
           for t in cards.SHARE_TOPICS[1:]),
-        _bulk_select("active_mode", "Aktivzeiten", {k: v for k, v in ACTIVE_LABELS.items() if k != "window"}, clearable=False),
+        _bulk_select("active_mode", "Aktivzeiten", {k: v for k, v in ACTIVE_LABELS.items() if k not in ("window", "never")},
+                     clearable=False),
         _bulk_select("model_tier", "Modell", model_opts),
-        _bulk_select("group_trigger", "Gruppen: wann reagieren?", GROUP_TRIGGER_LABELS, clearable=False),
-        _bulk_select("group_role", "Gruppen: Rolle", GROUP_ROLE_LABELS, clearable=False),
+        _bulk_select("group_trigger", "Gruppe: wann reagieren?", GROUP_TRIGGER_LABELS, clearable=False, group_only=True),
+        _bulk_select("group_role", "Gruppe: Rolle", GROUP_ROLE_LABELS, clearable=False, group_only=True),
     ])
     return f"""
 <div class="panel" id="bulkpanel" style="margin-top:14px">
-  <div class="section-head"><h2>Regeln für die Auswahl</h2><span class="count" id="selcount">0 ausgewählt</span></div>
-  <p class="x-muted">Nur was du hier änderst, wird gesetzt — alles andere bleibt pro Person wie es ist.
-  Kontakte ohne Karte bekommen dabei automatisch eine. Gruppen-Felder wirken nur auf Gruppen.</p>
-  <div class="x-form" style="margin-bottom:14px">
-    <b>Secretary für die Auswahl:</b>
-    <button class="btn secondary sm" type="submit" name="do" value="sec_on" id="bulkon" disabled>✅ Einschalten</button>
-    <button class="btn secondary sm" type="submit" name="do" value="sec_off" id="bulkoff" disabled>🔕 Ausschalten</button>
-  </div>
-  <div class="x-grid2" style="grid-template-columns:repeat(auto-fit,minmax(210px,1fr))">{fields}</div>
-  <div class="x-form" style="margin-top:6px">
-    <button class="btn sm" type="submit" name="do" value="apply" id="bulkapply" disabled>Auf Auswahl anwenden</button>
-    <button class="btn ghost danger sm" type="submit" name="do" value="delete" id="bulkdelete" disabled
-      onclick="return confirm('Die Karten der ausgewählten Einträge löschen? (Nachrichten-Journale bleiben.)')">Karten löschen</button>
+  <div class="section-head"><h2 id="settitle">Secretary-Einstellungen</h2><span class="count" id="selcount">0 ausgewählt</span></div>
+  <p class="x-muted" id="sethint">Klicke oben auf einen Kontakt, um seine Secretary-Einstellungen zu sehen und zu ändern.
+  Mehrere Kontakte wählst du mit den Häkchen (oder Strg/Cmd-Klick); dann gilt eine Änderung für alle.</p>
+  <div id="setbody" hidden>
+    <p class="x-muted" id="setmulti" hidden>Nur was du hier änderst, wird gesetzt — alles andere bleibt pro Kontakt wie es ist.
+    Kontakte ohne Karte bekommen dabei automatisch eine.</p>
+    <div class="x-grid2" style="grid-template-columns:repeat(auto-fit,minmax(210px,1fr))">{fields}</div>
+    <div class="field" style="margin-top:6px"><label>Anweisung an den Secretary (verbindlich)</label>
+      <textarea name="b_instruction" id="b-instruction" rows="3" placeholder="z. B. „Duze sie immer, erwähne nie meinen Stundenplan.“"></textarea>
+      <label style="font-weight:500;margin-top:6px"><input type="checkbox" name="b_instruction_set" value="1" id="b-instruction-set">
+        Anweisung setzen <span class="x-muted" id="instr-note">(wird beim Tippen automatisch angehakt; leer = löschen)</span></label></div>
+    <div class="x-form" style="margin-top:10px">
+      <button class="btn sm" type="submit" name="do" value="apply" id="bulkapply" disabled>Speichern</button>
+      <a class="btn ghost sm" id="detaillink" href="#" hidden>Alle Details (Notizen, Zeiten, Kennungen, Verlauf) →</a>
+      <button class="btn ghost danger sm" type="submit" name="do" value="delete" id="bulkdelete" disabled
+        onclick="return confirm('Die Karten der Auswahl löschen? (Nachrichten-Journale bleiben.)')">Karte löschen</button>
+    </div>
   </div>
 </div>"""
 
@@ -392,17 +400,133 @@ def _sec_toggle(ref: str, on: bool, who: str) -> str:
 def _dir_row(r: dict) -> str:
     ref = cards.encode_ref(r)
     href = (f'/admin/contacts/{quote(r["key"])}' if r["has_card"] else f'/admin/contacts/open?ref={quote(ref)}')
-    name = (f'<a href="{href}" class="rowlink"><b>{esc(r["name"])}</b></a>'
-            + ('' if r["has_card"] else ' <span class="x-pill">ohne Karte</span>'))
+    name = f'<b>{esc(r["name"])}</b>' + ('' if r["has_card"] else ' <span class="x-pill">ohne Karte</span>')
     extra = f' <span class="x-pill x-warn">{r["proposals"]} Vorschlag</span>' if r["proposals"] else ""
     kind = "Gruppe" if r["kind"] == "group" else "Person"
     style = styles.label(r["style"]) if r["style"] else "—"
     rule = RULE_LABELS.get(r["rule"], r["rule"]).split(" (")[0] if r["rule"] else "—"
-    return (f'<tr><td style="width:34px"><input type="checkbox" name="sel" value="{esc(ref)}" class="rowsel" aria-label="{esc(r["name"])} auswählen"></td>'
+    cfg = json.dumps(r["cfg"], ensure_ascii=False)
+    return (f'<tr class="pick" data-name="{esc(r["name"])}" data-kind="{esc(r["kind"])}" data-card="{1 if r["has_card"] else 0}" '
+            f'data-detail="{esc(href)}" data-cfg="{esc(cfg)}">'
+            f'<td style="width:34px"><input type="checkbox" name="sel" value="{esc(ref)}" class="rowsel" aria-label="{esc(r["name"])} auswählen"></td>'
             f'<td>{name}{extra}<div class="x-muted">{kind} · {esc(", ".join(r["channels"]))}'
             f'{" · " + esc(r["relationship"]) if r["relationship"] else ""}</div></td>'
             f'<td>{_sec_toggle(ref, r["sec_on"], r["name"])}</td>'
             f'<td class="num">{r["tier"]}</td><td>{esc(rule)}</td><td>{esc(style)}</td></tr>')
+
+
+_LIST_JS = r"""
+<script>
+(function(){
+  const form=document.getElementById('bulkform'), all=document.getElementById('selall');
+  const rows=()=>[...form.querySelectorAll('.rowsel')];
+  const selRows=()=>rows().filter(r=>r.checked);
+  const trOf=r=>r.closest('tr');
+  const rowSwitch=r=>trOf(r).querySelector('.sec-toggle');
+  const bar=document.getElementById('selbar'), sw=document.getElementById('selbar-switch');
+  const $=id=>document.getElementById(id);
+  const selects=()=>[...form.querySelectorAll('#bulkpanel select[data-field]')];
+  let single=null;                                                     // aktuell vorbelegte Einzelperson
+
+  function fillSingle(tr){
+    const cfg=JSON.parse(tr.dataset.cfg||'{}');
+    selects().forEach(s=>{
+      const f=s.dataset.field, cur=cfg[f]??'';
+      const hasClear=[...s.options].some(o=>o.value==='__clear__');
+      s.value=cur===''?(hasClear?'__clear__':''):cur;
+      if(![...s.options].some(o=>o.value===s.value)) s.value='';
+      s.dataset.orig=s.value;
+    });
+    $('b-instruction').value=cfg.instruction||''; $('b-instruction').dataset.orig=cfg.instruction||'';
+    $('b-instruction-set').checked=false;
+  }
+  function resetMulti(){
+    selects().forEach(s=>{s.value=''; s.dataset.orig='';});
+    $('b-instruction').value=''; $('b-instruction').dataset.orig=''; $('b-instruction-set').checked=false;
+  }
+  function panelSync(){
+    const sel=selRows(), n=sel.length;
+    $('selcount').textContent=n+' ausgewählt';
+    $('sethint').hidden=n>0; $('setbody').hidden=n===0;
+    $('bulkapply').disabled=n===0; $('bulkdelete').disabled=n===0;
+    if(!n){ $('settitle').textContent='Secretary-Einstellungen'; single=null; return; }
+    const trs=sel.map(trOf), oneKind=new Set(trs.map(t=>t.dataset.kind));
+    form.querySelectorAll('#bulkpanel .grp').forEach(g=>g.hidden=!oneKind.has('group'));
+    if(n===1){
+      const tr=trs[0]; $('settitle').textContent='Secretary-Einstellungen für '+tr.dataset.name;
+      $('setmulti').hidden=true; $('bulkapply').textContent='Speichern';
+      $('detaillink').hidden=false; $('detaillink').href=tr.dataset.detail;
+      $('bulkdelete').hidden=tr.dataset.card!=='1';
+      if(single!==tr){ fillSingle(tr); single=tr; }
+    } else {
+      $('settitle').textContent='Secretary-Einstellungen für '+n+' Kontakte'; $('setmulti').hidden=false;
+      $('bulkapply').textContent='Auf '+n+' anwenden'; $('detaillink').hidden=true; $('bulkdelete').hidden=false;
+      if(single!==null){ resetMulti(); single=null; }
+    }
+  }
+  function barSync(){
+    const sel=selRows(); bar.hidden=sel.length===0;
+    $('selbar-n').textContent=sel.length+' ausgewählt';
+    const on=sel.filter(r=>rowSwitch(r).classList.contains('on')).length;
+    const state=on===sel.length?'on':(on===0?'off':'mixed');
+    sw.classList.toggle('on',state==='on'); sw.classList.toggle('mixed',state==='mixed');
+    sw.setAttribute('aria-checked',state==='on'?'true':(state==='mixed'?'mixed':'false'));
+    sw.querySelector('.lbl').textContent=state==='on'?'An':(state==='off'?'Aus':'Gemischt ('+on+' von '+sel.length+' an)');
+    sw.dataset.next=state==='on'?'sec_off':'sec_on';                    // gemischt → erst alle an
+  }
+  function sync(){
+    rows().forEach(r=>trOf(r).classList.toggle('sel',r.checked));
+    barSync(); panelSync();
+    const n=selRows().length; all.checked=n>0&&n===rows().length; all.indeterminate=n>0&&n<rows().length;
+  }
+  // Klick auf die Zeile wählt aus: normal = nur diese Zeile (nochmal klicken = abwählen), Strg/Cmd/Umschalt = dazu.
+  form.addEventListener('click',e=>{
+    const tr=e.target.closest('tr.pick'); if(!tr) return;
+    if(e.target.closest('input,button,a,label,select,textarea')) return;
+    const cb=tr.querySelector('.rowsel');
+    if(e.ctrlKey||e.metaKey||e.shiftKey){ cb.checked=!cb.checked; }
+    else { const only=selRows().length===1&&cb.checked; rows().forEach(r=>r.checked=false); cb.checked=!only; }
+    sync();
+    if(cb.checked&&selRows().length===1) $('bulkpanel').scrollIntoView({block:'nearest',behavior:'smooth'});
+  });
+  form.addEventListener('change',e=>{ if(e.target.classList.contains('rowsel')) sync(); });
+  all.addEventListener('change',()=>{ rows().forEach(r=>r.checked=all.checked); sync(); });
+  $('b-instruction').addEventListener('input',()=>{ $('b-instruction-set').checked=true; });
+  // Beim Speichern einer Einzelperson nur Geändertes senden (unveränderte Felder = „nicht ändern“).
+  form.addEventListener('submit',e=>{
+    const btn=e.submitter; if(!btn||btn.value!=='apply'||single===null) return;
+    selects().forEach(s=>{ if(s.value===s.dataset.orig) s.value=''; });
+    if($('b-instruction').value===$('b-instruction').dataset.orig) $('b-instruction-set').checked=false;
+  });
+  sw.addEventListener('click',async()=>{
+    const sel=selRows(); if(!sel.length||sw.classList.contains('busy')) return;
+    sw.classList.add('busy');
+    const fd=new FormData(); fd.append('csrf',form.querySelector('[name=csrf]').value); fd.append('do',sw.dataset.next);
+    sel.forEach(r=>fd.append('sel',r.value));
+    try{
+      const r=await fetch('/admin/contacts/bulk',{method:'POST',body:fd,headers:{'Accept':'application/json'}});
+      const j=await r.json(); if(!j.ok) throw new Error(j.error||'Fehler');
+      sel.forEach(row=>{const b=rowSwitch(row); b.classList.toggle('on',j.on); b.setAttribute('aria-checked',j.on?'true':'false');
+        b.querySelector('.lbl').textContent=j.on?'An':'Aus'; b.value=b.value.split('|')[0]+'|'+(j.on?0:1);});
+    }catch(err){ alert('Konnte den Schalter nicht setzen: '+err.message); }
+    sw.classList.remove('busy'); barSync();
+  });
+  form.addEventListener('click',async e=>{
+    const b=e.target.closest('.sec-toggle'); if(!b||b.id==='selbar-switch') return;
+    e.preventDefault(); e.stopPropagation(); if(b.classList.contains('busy')) return;
+    b.classList.add('busy');
+    const fd=new FormData(); fd.append('csrf',form.querySelector('[name=csrf]').value); fd.append('toggle',b.value);
+    try{
+      const r=await fetch('/admin/contacts/secretary',{method:'POST',body:fd,headers:{'Accept':'application/json'}});
+      const j=await r.json(); if(!j.ok) throw new Error(j.error||'Fehler');
+      b.classList.toggle('on',j.on); b.setAttribute('aria-checked',j.on?'true':'false');
+      b.querySelector('.lbl').textContent=j.on?'An':'Aus'; b.value=b.value.split('|')[0]+'|'+(j.on?0:1);
+    }catch(err){ alert('Konnte den Schalter nicht setzen: '+err.message); }
+    b.classList.remove('busy'); barSync();
+  });
+  sync();
+})();
+</script>"""
 
 
 @router.get("/admin/contacts", response_class=HTMLResponse)
@@ -420,20 +544,22 @@ async def contacts_page(request: Request, _: bool = Depends(auth.require_admin),
     chips = "".join(
         f'<a class="chip{" active" if k == scope else ""}" href="/admin/contacts?scope={k}{"&q=" + quote(q) if q else ""}">'
         f'{esc(v)} · {counts[k]}</a>' for k, v in _SCOPES.items())
-    msg = {"created": "Karte angelegt.", "deleted": "Karte gelöscht.",
-           "bulk": f"Regeln auf {n} Einträge angewendet.", "bulkdel": f"{n} Karten gelöscht.",
-           "bulkon": f"Secretary für {n} Einträge eingeschaltet.", "bulkoff": f"Secretary für {n} Einträge ausgeschaltet.",
+    what = "1 Kontakt" if n == 1 else f"{n} Kontakte"
+    msg = {"created": "Karte angelegt.", "deleted": "Karte gelöscht.", "saved": "Gespeichert.",
+           "bulk": "Gespeichert." if n == 1 else f"Einstellungen auf {what} angewendet.",
+           "bulkdel": "Karte gelöscht." if n == 1 else f"{n} Karten gelöscht.",
+           "bulkon": f"Secretary für {what} eingeschaltet.", "bulkoff": f"Secretary für {what} ausgeschaltet.",
            "secon": "Secretary eingeschaltet.", "secoff": "Secretary ausgeschaltet.",
-           "bulknone": "Nichts ausgewählt bzw. nichts zu ändern."}.get(saved, "")
+           "bulknone": "Nichts ausgewählt bzw. nichts geändert."}.get(saved, "")
     table = (f'<div class="panel"><table class="x-tbl" id="dirtbl"><thead><tr>'
              f'<th><input type="checkbox" id="selall" aria-label="Alle auswählen"></th><th>Name</th><th>Secretary</th>'
-             f'<th class="num">Stufe</th><th>Regel</th><th>Stil</th></tr></thead>'
+             f'<th class="num">Stufe</th><th>Vorgehen</th><th>Stil</th></tr></thead>'
              f'<tbody>{"".join(_dir_row(r) for r in rows) or "<tr><td colspan=6 class=x-muted>Keine Einträge in dieser Ansicht.</td></tr>"}</tbody></table></div>')
     body = f"""
 <section class="hero"><div class="lab-eyebrow">SECRETARY</div><h1>Personen &amp; Gruppen</h1>
-<p>Hier stellst du ein, wie der <b>Secretary</b> mit jedem Kontakt umgeht. Klick auf einen Kontakt: oben schaltest du den
-Secretary für ihn <b>an oder aus</b>, darunter liegen die Feineinstellungen. Oder wähle mehrere (oder alle) aus und setze
-Regeln in einem Rutsch. Gruppen funktionieren wie Nutzer: nur was du freigibst, existiert für ASTRA.</p></section>
+<p>Hier stellst du ein, wie der <b>Secretary</b> mit jedem Kontakt umgeht. Ein Klick wählt einen Kontakt aus — der Schalter in der
+Zeile schaltet den Secretary für ihn <b>an oder aus</b>, die Feineinstellungen erscheinen <b>unten</b>. Mehrere wählst du mit den
+Häkchen (oder Strg/Cmd-Klick); dann gilt jede Änderung für alle Ausgewählten.</p></section>
 {_flash("ok", msg)}
 <div class="chips">{chips}</div>
 <form method="get" class="x-form" style="margin-bottom:14px"><input type="hidden" name="scope" value="{esc(scope)}">
@@ -446,73 +572,14 @@ Regeln in einem Rutsch. Gruppen funktionieren wie Nutzer: nur was du freigibst, 
   <span class="x-muted">Secretary für alle Ausgewählten:</span>
   <button type="button" class="sec-toggle" id="selbar-switch" role="switch" aria-checked="false"
           title="Secretary für alle Ausgewählten ein-/ausschalten"><span class="track"></span><span class="lbl">An</span></button>
-  <a href="#bulkpanel" class="x-muted">Weitere Regeln ↓</a>
+  <a href="#bulkpanel" class="x-muted">Einstellungen ↓</a>
 </div>
 {table}
 {_bulk_panel()}
 </form>
-<script>
-(function(){{
-  const form=document.getElementById('bulkform'), all=document.getElementById('selall');
-  const rows=()=>[...form.querySelectorAll('.rowsel')];
-  function sync(){{
-    const n=rows().filter(r=>r.checked).length;
-    document.getElementById('selcount').textContent=n+' ausgewählt';
-    document.getElementById('bulkapply').disabled=n===0;
-    document.getElementById('bulkdelete').disabled=n===0;
-    document.getElementById('bulkon').disabled=n===0; document.getElementById('bulkoff').disabled=n===0;
-    barSync();
-    all.checked=n>0&&n===rows().length; all.indeterminate=n>0&&n<rows().length;
-  }}
-  const bar=document.getElementById('selbar'), sw=document.getElementById('selbar-switch');
-  const selRows=()=>rows().filter(r=>r.checked);
-  const rowSwitch=r=>r.closest('tr').querySelector('.sec-toggle');
-  function barSync(){{
-    const sel=selRows(); bar.hidden=sel.length===0;
-    document.getElementById('selbar-n').textContent=sel.length+(sel.length===1?' ausgewählt':' ausgewählt');
-    const on=sel.filter(r=>rowSwitch(r).classList.contains('on')).length;
-    const state=on===sel.length?'on':(on===0?'off':'mixed');
-    sw.classList.toggle('on',state==='on'); sw.classList.toggle('mixed',state==='mixed');
-    sw.setAttribute('aria-checked',state==='on'?'true':(state==='mixed'?'mixed':'false'));
-    sw.querySelector('.lbl').textContent=state==='on'?'An':(state==='off'?'Aus':'Gemischt ('+on+' von '+sel.length+' an)');
-    sw.dataset.next=state==='on'?'sec_off':'sec_on';                    // gemischt → erst alle an
-  }}
-  sw.addEventListener('click',async()=>{{
-    const sel=selRows(); if(!sel.length||sw.classList.contains('busy')) return;
-    sw.classList.add('busy');
-    const fd=new FormData(); fd.append('csrf',form.querySelector('[name=csrf]').value); fd.append('do',sw.dataset.next);
-    sel.forEach(r=>fd.append('sel',r.value));
-    try{{
-      const r=await fetch('/admin/contacts/bulk',{{method:'POST',body:fd,headers:{{'Accept':'application/json'}}}});
-      const j=await r.json(); if(!j.ok) throw new Error(j.error||'Fehler');
-      sel.forEach(row=>{{const b=rowSwitch(row); b.classList.toggle('on',j.on); b.setAttribute('aria-checked',j.on?'true':'false');
-        b.querySelector('.lbl').textContent=j.on?'An':'Aus'; b.value=b.value.split('|')[0]+'|'+(j.on?0:1);}});
-    }}catch(err){{ alert('Konnte den Schalter nicht setzen: '+err.message); }}
-    sw.classList.remove('busy'); barSync();
-  }});
-  all.addEventListener('change',()=>{{rows().forEach(r=>r.checked=all.checked);sync();}});
-  form.addEventListener('click',e=>{{           // ganze Zeile anklickbar (außer Häkchen, Schalter, Links)
-    if(e.target.closest('input,button,a,label')) return;
-    const link=e.target.closest('tr')?.querySelector('a.rowlink'); if(link) location.href=link.href;
-  }});
-  form.addEventListener('click',async e=>{{
-    const b=e.target.closest('.sec-toggle'); if(!b||b.id==='selbar-switch') return;
-    e.preventDefault(); if(b.classList.contains('busy')) return;
-    b.classList.add('busy');
-    const fd=new FormData(); fd.append('csrf',form.querySelector('[name=csrf]').value);
-    fd.append('toggle',b.value); 
-    try {{
-      const r=await fetch('/admin/contacts/secretary',{{method:'POST',body:fd,headers:{{'Accept':'application/json'}}}});
-      const j=await r.json(); if(!j.ok) throw new Error(j.error||'Fehler');
-      b.classList.toggle('on',j.on); b.setAttribute('aria-checked',j.on?'true':'false');
-      b.querySelector('.lbl').textContent=j.on?'An':'Aus'; b.value=b.value.split('|')[0]+'|'+(j.on?0:1);
-    }} catch(err) {{ alert('Konnte den Schalter nicht setzen: '+err.message); }}
-    b.classList.remove('busy'); barSync();
-  }});
-  form.addEventListener('change',e=>{{if(e.target.classList.contains('rowsel'))sync();}});
-  sync();
-}})();
-</script>
+<style>tr.pick{{cursor:pointer}}tr.pick:hover td{{background:rgba(255,255,255,.03)}}
+tr.pick.sel td{{background:color-mix(in srgb,var(--link) 14%,transparent)}}#bulkpanel [hidden]{{display:none!important}}</style>
+{_LIST_JS}
 <div class="section-head x-sec"><h2>Neu anlegen</h2></div>
 <div class="x-grid2"><div class="panel">{_new_card_form("person", token)}</div><div class="panel">{_new_card_form("group", token)}</div></div>
 <p class="x-muted" style="margin-top:12px">Neue Absender bekommen automatisch eine Karte, sobald du bei einer Freigabe „Immer erlauben“ drückst.</p>"""

@@ -624,6 +624,27 @@ def decode_ref(ref: str) -> dict | None:
     return None
 
 
+def row_cfg(card: dict) -> dict:
+    """Aktuelle Werte einer Karte in der Form der Sammel-/Einzel-Einstellungen (Felder `b_<name>`).
+    Werte, die die Auswahllisten dort nicht abbilden (eigener Stiltext, Zeitfenster), bleiben leer."""
+    c = sanitize(card)
+    style_key = c["style"] if c["style"] in _STYLE_KEYS() else ""
+    mode = c["active"]["mode"]
+    cfg = {"rule": c["rule"] if c["rule"] != "block" else "", "trust_tier": str(c["trust_tier"]), "style": style_key,
+           "share_availability": c["share"]["availability"],
+           "active_mode": mode if mode in ("inherit", "always") else "inherit",
+           "model_tier": c["model"].get("tier", "") if c["model"].get("tier") in ("small", "medium", "heavy", "code") else "",
+           "group_trigger": c["group"]["trigger"], "group_role": c["group"]["role"], "instruction": c["instruction"]}
+    for t in SHARE_TOPICS[1:]:
+        cfg[f"share_{t}"] = c["share"][t]
+    return cfg
+
+
+def _STYLE_KEYS() -> set:
+    from .styles import STYLES
+    return set(STYLES)
+
+
 def directory(card_list: list[dict], contacts: list[dict]) -> list[dict]:
     """Eine Liste aus Karten + bekannten Kontakten ohne Karte. Jede Zeile hat `key` (Karte)
     oder `channel`/`handle` (noch keine Karte). Sortiert: Karten zuerst, dann Kontakte."""
@@ -633,7 +654,7 @@ def directory(card_list: list[dict], contacts: list[dict]) -> list[dict]:
                      "channels": sorted({h["channel"] for h in c["handles"]}), "tier": c["trust_tier"],
                      "rule": c["rule"], "style": c["style"], "relationship": c["relationship"],
                      "active": (c["active"] or {}).get("mode", "inherit"), "proposals": len(c["proposals"]),
-                     "sec_on": secretary_on(c)})
+                     "sec_on": secretary_on(c), "cfg": row_cfg(c)})
     seen = set()
     for ct in contacts:
         ch, hd = str(ct.get("channel") or ""), str(ct.get("handle") or "")
@@ -645,7 +666,9 @@ def directory(card_list: list[dict], contacts: list[dict]) -> list[dict]:
                      "kind": "group" if is_group_handle(ch, hd) else "person", "has_card": False,
                      "channels": [ch], "tier": int(ct.get("trust_tier") if ct.get("trust_tier") is not None else 3),
                      "rule": "", "style": "", "relationship": str(ct.get("relationship") or ""),
-                     "active": "inherit", "proposals": 0, "sec_on": True})
+                     "active": "inherit", "proposals": 0, "sec_on": True,
+                     "cfg": row_cfg({"kind": "group" if is_group_handle(ch, hd) else "person", "name": name,
+                                     "trust_tier": ct.get("trust_tier") if ct.get("trust_tier") is not None else 3})})
     return rows
 
 
@@ -672,10 +695,14 @@ def bulk_patch(get) -> dict:
     """Formularfelder `b_<feld>` → Änderungen. '' = nicht ändern, '__clear__' = auf Standard/leer."""
     patch: dict = {}
     for f in PATCH_FIELDS:
+        if f == "instruction":                       # Freitext: nur mit ausdrücklichem Häkchen (darf auch leeren)
+            continue
         v = get("b_" + f)
         if v is None or str(v) == "":
             continue
         patch[f] = "" if v == "__clear__" else v
+    if get("b_instruction_set"):
+        patch["instruction"] = str(get("b_instruction") or "")
     return patch
 
 

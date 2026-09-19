@@ -15,17 +15,18 @@ Befristete Übersteuerung (`override`) fällt danach automatisch auf den vorheri
 ## Kontakte & Gruppen (Karten)
 Admin → **Kontakte** (alles dort sind **Secretary-Einstellungen**): eine Liste aller Personen/Gruppen, auch solcher ohne Karte.
 
-- **Kontakt anklicken** (ganze Zeile): Oben steht der große **Secretary-Schalter An/Aus** für diese Person/Gruppe (wirkt sofort),
-  darunter die **Feineinstellungen**: Wie antwortet der Secretary (Stil, Vorgehen, Anweisung) · Was darf sie/er erfahren ·
-  Wann aktiv · Person & Vertrauen. Ist der Schalter aus, werden die Einstellungen abgedunkelt mit Hinweis; Speichern ändert den
-  Schalter nie.
-- **Aus** = der Secretary antwortet dieser Person/Gruppe nicht, notiert die Nachrichten aber weiter; **An** hebt „nie"/„blockieren"
-  wieder auf. Kontakte ohne Karte lassen sich öffnen, ohne dass etwas gespeichert wird (bis du schaltest oder speicherst); die
-  bekannte Vertrauensstufe bleibt dabei erhalten.
-- **In der Liste:** ein Schalter pro Zeile und Filter „Secretary aus". Sobald du Kontakte anhakst (oder oben „alle"), erscheint eine
-  **feste Leiste mit einem Secretary-Schalter für alle Ausgewählten** (An / Aus / „Gemischt (x von y an)"; bei „Gemischt" schaltet ein
-  Klick zuerst alle ein). Darunter „Regeln für die Auswahl" (Regel, Vertrauensstufe, Stil, Freigaben, Aktivzeiten, Modell, Gruppen-Trigger — nur
-  was du änderst, wird gesetzt).
+- **Klick wählt aus, Einstellungen unten:** Ein Klick auf eine Zeile wählt den Kontakt nur aus (nichts wird geöffnet; nochmal klicken =
+  abwählen). Mehrere: Häkchen oder Strg/Cmd-Klick, „alle" oben. Direkt **unter der Liste** erscheinen die **Secretary-Einstellungen**:
+  bei **einem** Kontakt mit seinen aktuellen Werten (Vorgehen, Vertrauensstufe, Stil, Freigaben, Aktivzeiten, Modell, Anweisung, bei
+  Gruppen Auslöser und Rolle) — „Speichern" sendet nur, was du geändert hast; bei **mehreren** als Sammeländerung („nicht ändern" ist
+  Standard). Für Notizen, Zeitfenster, Kennungen, Verlauf und „Alles vergessen" gibt es den Link „Alle Details →".
+- **Secretary An/Aus:** ein Schalter pro Zeile (wirkt sofort) und bei Auswahl eine feste Leiste oben mit einem Schalter für alle
+  Ausgewählten (An / Aus / „Gemischt (x von y an)"; bei „Gemischt" schaltet ein Klick zuerst alle ein). **Aus** = der Secretary
+  antwortet nicht, notiert die Nachrichten aber weiter; **An** hebt „nie"/„blockieren" wieder auf. Filter „Secretary aus" zeigt alle
+  Stummen.
+- **Kontakte ohne Karte** lassen sich auswählen und einstellen; die Karte entsteht erst beim Speichern/Schalten (mit der bekannten
+  Vertrauensstufe). Ein reines Ansehen ändert nichts — wichtig, weil ein Kontakt mit Karte nicht mehr als „unbekannter Absender"
+  nachgefragt wird.
 
 Eine Karte enthält: Regel (nie/fragen/erlaubt/direkt) · Vertrauensstufe 0–3 · Stil · Anweisung · Freigaben
 (Kalender gestuft, Ort/Schule/Kontaktdaten/Persönliches ja/nein) · Aktivzeiten · eigenes Modell · Notizen ·

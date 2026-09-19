@@ -525,7 +525,7 @@ def test_directory_lists_known_contacts_without_cards_and_all_can_be_selected(bu
     page = c.get("/admin/contacts").text
     assert "Tom" in page and "ohne Karte" in page and "Astroclub" in page
     assert "Lena WA" not in page                                      # gleiche Nummer wie Karte → keine Dublette
-    assert 'id="selall"' in page and "Regeln für die Auswahl" in page
+    assert 'id="selall"' in page and 'id="bulkpanel"' in page and "Secretary-Einstellungen" in page
     nocard = c.get("/admin/contacts?scope=nocard").text
     assert "Tom" in nocard and "aria-label=\"Lena auswählen\"" not in nocard
 
@@ -622,7 +622,7 @@ def test_bulk_secretary_off_and_on_for_selection(bulkdb):
     c = _client()
     _create(c)
     page = c.get("/admin/contacts").text
-    assert "Ausschalten" in page and "Einschalten" in page
+    assert 'id="selbar-switch"' in page                                                      # Schalter für alle Ausgewählten
     csrf = c.cookies.get(auth.CSRF_COOKIE)
     sel = [_ref_for(page, "Lena"), _ref_for(page, "Tom"), _ref_for(page, "Astroclub")]
     r = c.post("/admin/contacts/bulk", data={"csrf": csrf, "do": "sec_off", "sel": sel}, follow_redirects=False)
@@ -687,7 +687,7 @@ def test_contact_without_card_opens_a_virtual_detail_page_without_saving(bulkdb)
     c = _client()
     page = c.get("/admin/contacts").text
     ref = _ref_for(page, "Tom")
-    assert f'/admin/contacts/open?ref=' in page and 'class="rowlink"' in page
+    assert 'data-detail="/admin/contacts/open?ref=' in page and 'class="rowlink"' not in page       # kein Link in der Zeile
     detail = c.get(f"/admin/contacts/open?ref={quote(ref)}")
     assert detail.status_code == 200 and "Secretary für Tom" in detail.text and "noch keine Karte" in detail.text
     assert 'action="/admin/contacts/create"' in detail.text and "Alles vergessen" not in detail.text
@@ -745,3 +745,71 @@ def test_selection_bar_and_json_bulk_switch(bulkdb):
     # ohne Accept-Header (kein JavaScript) bleibt es bei der Weiterleitung
     r = c.post("/admin/contacts/bulk", data={"csrf": csrf, "do": "sec_off", "sel": sel[:1]}, follow_redirects=False)
     assert r.status_code == 303 and "bulkoff" in r.headers["location"]
+
+
+# ─── Klick wählt aus, Einstellungen unten ─────────────────────────────────────
+def _row_attrs(page: str, name: str) -> dict:
+    import html as h
+    import json as j
+    import re
+    m = re.search(r'<tr class="pick" data-name="' + re.escape(name) + r'" data-kind="(\w+)" data-card="(\d)" '
+                  r'data-detail="([^"]*)" data-cfg="([^"]*)"', page)
+    assert m, f"{name}: keine auswählbare Zeile"
+    return {"kind": m.group(1), "card": m.group(2), "detail": h.unescape(m.group(3)), "cfg": j.loads(h.unescape(m.group(4)))}
+
+
+def test_rows_select_instead_of_navigating_and_carry_their_current_settings(bulkdb):
+    c = _client()
+    c.post("/admin/contacts/new", data={"csrf": _csrf(c, "/admin/contacts"), "kind": "person", "name": "Lena",
+                                        "handle": "whatsapp: +49 171 1234567"})
+    bulkdb["lena"].update(rule="ask", style="arrogant", instruction="Duzen", trust_tier=1)
+    bulkdb["lena"]["share"]["location"] = "no"
+    bulkdb["lena"]["model"] = {"tier": "heavy"}
+    page = c.get("/admin/contacts").text
+    assert 'class="rowlink"' not in page and "location.href" not in page                 # ein Klick navigiert nie
+    lena = _row_attrs(page, "Lena")
+    assert lena["card"] == "1" and lena["detail"] == "/admin/contacts/lena"
+    assert lena["cfg"]["rule"] == "ask" and lena["cfg"]["style"] == "arrogant" and lena["cfg"]["trust_tier"] == "1"
+    assert lena["cfg"]["share_location"] == "no" and lena["cfg"]["model_tier"] == "heavy"
+    assert lena["cfg"]["instruction"] == "Duzen"
+    tom = _row_attrs(page, "Tom")                                                         # Kontakt ohne Karte: Standardwerte
+    assert tom["card"] == "0" and tom["detail"].startswith("/admin/contacts/open?ref=") and tom["cfg"]["rule"] == ""
+    assert _row_attrs(page, "Astroclub")["kind"] == "group"
+
+
+def test_settings_panel_sits_below_the_list_with_group_only_fields_marked(bulkdb):
+    c = _client()
+    page = c.get("/admin/contacts").text
+    assert page.index('id="dirtbl"') < page.index('id="bulkpanel"') < page.index("Neu anlegen")
+    assert page.count('class="field grp"') == 2                       # Gruppen-Auslöser und -Rolle, nur bei Gruppen sichtbar
+    assert 'name="b_instruction"' in page and 'name="b_instruction_set"' in page
+    assert 'value="block"' not in page and 'value="never"' not in page
+
+
+def test_instruction_is_only_applied_with_the_explicit_flag_and_can_be_cleared(bulkdb):
+    c = _client()
+    c.post("/admin/contacts/new", data={"csrf": _csrf(c, "/admin/contacts"), "kind": "person", "name": "Lena",
+                                        "handle": "whatsapp: +49 171 1234567"})
+    bulkdb["lena"]["instruction"] = "Alt"
+    csrf = _csrf(c, "/admin/contacts")
+
+    def apply(**extra):
+        return c.post("/admin/contacts/bulk", data={"csrf": csrf, "do": "apply", "sel": "card:lena", **extra},
+                      follow_redirects=False).headers["location"]
+    assert "bulknone" in apply(b_instruction="Neu")                        # Text ohne Häkchen ändert nichts
+    assert bulkdb["lena"]["instruction"] == "Alt"
+    assert "saved=bulk" in apply(b_instruction="Neu", b_instruction_set="1")
+    assert bulkdb["lena"]["instruction"] == "Neu"
+    assert "saved=bulk" in apply(b_instruction="", b_instruction_set="1")   # leeren
+    assert bulkdb["lena"]["instruction"] == ""
+
+
+def test_single_save_with_only_changed_fields_keeps_everything_else(bulkdb):
+    c = _client()
+    c.post("/admin/contacts/new", data={"csrf": _csrf(c, "/admin/contacts"), "kind": "person", "name": "Lena",
+                                        "handle": "whatsapp: +49 171 1234567"})
+    bulkdb["lena"].update(style="warm", rule="ask")
+    csrf = _csrf(c, "/admin/contacts")
+    c.post("/admin/contacts/bulk", data={"csrf": csrf, "do": "apply", "sel": "card:lena", "b_share_location": "no",
+                                         "b_rule": "", "b_style": ""}, follow_redirects=False)
+    assert bulkdb["lena"]["share"]["location"] == "no" and bulkdb["lena"]["style"] == "warm" and bulkdb["lena"]["rule"] == "ask"
