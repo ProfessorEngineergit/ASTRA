@@ -157,6 +157,10 @@ curl -s localhost:8088/briefing/preview -H "X-Astra-Secret: $CORTEX_SHARED_SECRE
 curl -X POST localhost:8088/briefing/run -H "X-Astra-Secret: $CORTEX_SHARED_SECRET"  # wirklich senden
 ```
 
+### 🗂️ Chief of Staff: Sekretär, Kontakte, Moderation, Kosten
+Secretary-Schalter, Personen-/Gruppenkarten mit Sammelaktionen, Moderations-Leiter, Kontext-Journal, Prompt-Werkstatt,
+Token-/Kostenübersicht und Modellwahl pro Chat — Details in [`docs/chief-of-staff.md`](docs/chief-of-staff.md).
+
 ### 📊 Dashboard
 Status-GUI (read-only) unter **`http://127.0.0.1:8088/dashboard`** — aktive Threads, offene Freigaben, Audit-Log, welche Fähigkeiten live sind. Hinter VPN/Caddy halten.
 
@@ -267,7 +271,7 @@ Prüfen, dass die Datei wirklich im Image liegt: `docker compose run --rm cortex
 
 ## 🧭 Offene Punkte / nächste Schritte
 
-- **Signal-Eingang:** `signal-cli-rest-api` im `json-rpc`-Mode pusht keine Webhooks. Optionen: (a) ein n8n-Schedule-Workflow, der `GET {SIGNAL_BASE_URL}/v1/receive/{NUMBER}` pollt und jede Nachricht an `/ingress/signal` weiterreicht, oder (b) den nativen Empfangs-Websocket nutzen. Ausgang funktioniert bereits.
+- **Signal-Eingang:** cortex hört per WebSocket (`ws://signal-cli:8080/v1/receive/<Nummer>`, sobald `SIGNAL_PHONE_NUMBER` gesetzt ist); `/ingress/signal` bleibt als Webhook-Alternative.
 - **Kalender-Schreibzugriff:** der Briefing-/Konflikt-Flow (Klavier↔Astroclub) liest bereits Stundenplan & ÖPNV; ein `calendar_add`/CalDAV- oder Google-Calendar-n8n-Workflow als nächstes Tool ergänzt das aktive Umbuchen.
 - **Verbleibende Katalog-Platzhalter:** CalDAV, HVV, IServ, MQTT, Vaultwarden und Zigbee2MQTT sind im Katalog gelistet, aber noch nicht implementiert (brauchen Libs/Auth, die noch fehlen) — als „bald" markiert.
 - **Proxmox-Agent & RMV-Trip-Routing:** als weitere owner-only Tools nach demselben Muster (`plugins/builtin/` — eine Datei pro Plugin).
