@@ -63,12 +63,38 @@ class SecretaryServiceStatus:
 _SERVICE_CACHE: dict[tuple[str, str], tuple[datetime, SecretaryServiceStatus]] = {}
 
 
+def active_override(raw_override: dict | None, now: datetime | None = None) -> dict | None:
+    """Zeitlich begrenzte Übersteuerung ({"mode": "on"|"off", "until": ISO}) — nur solange
+    `until` in der Zukunft liegt. Danach ist sie einfach weg und der Grundmodus gilt wieder
+    (kein Aufräumen nötig, kein „vergessen wieder anzuschalten“)."""
+    ov = raw_override or {}
+    mode = str(ov.get("mode") or "").lower()
+    if mode not in ("on", "off"):
+        return None
+    try:
+        until = datetime.fromisoformat(str(ov.get("until")))
+    except (TypeError, ValueError):
+        return None
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=ZoneInfo("UTC"))
+    current = now or datetime.now(ZoneInfo("UTC"))
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=ZoneInfo("UTC"))
+    if until <= current:
+        return None
+    return {"mode": mode, "until": until}
+
+
 def secretary_settings(app_settings: dict | None) -> dict:
     raw = (app_settings or {}).get("secretary", {}) or {}
     channels = raw.get("channels") or {}
     activation_mode = str(raw.get("activation_mode") or "").strip().lower()
     if activation_mode not in ACTIVATION_MODES:
         activation_mode = "auto" if bool(raw.get("enabled", True)) else "off"
+    base_mode = activation_mode
+    override = active_override(raw.get("override"))
+    if override:                       # „bis 18 Uhr aus“ schlägt den Grundmodus
+        activation_mode = override["mode"]
 
     def as_int(key: str, fallback: int) -> int:
         try:
@@ -89,6 +115,8 @@ def secretary_settings(app_settings: dict | None) -> dict:
         # The three-state activation_mode is authoritative once present.
         "enabled": activation_mode != "off",
         "activation_mode": activation_mode,
+        "base_mode": base_mode,
+        "override": override,
         "tone": raw.get("tone", "warm"),
         "default_tone": (raw.get("default_tone") or "").strip(),
         "jailbreak_tone": raw.get("jailbreak_tone", "firm"),
@@ -302,24 +330,21 @@ def is_group_context(channel: str, handle: str, meta: dict | None = None) -> boo
 
 
 def tone_instruction(app_settings: dict | None, thread_meta: dict | None = None) -> str:
+    """Tonanweisung. Vorrang: Sicherheitsüberwachung/Eskalation > Stil der Person >
+    Standard-Freitext > globaler Stil. Stile kommen aus der Bibliothek (styles.py);
+    Freitext funktioniert weiter wie bisher."""
+    from . import styles
     settings = secretary_settings(app_settings)
     meta = thread_meta or {}
-    # Security watch and an explicit per-thread override beat the standard tone.
+    # Eskalation durch die Moderation (überheblich/bestimmt) schlägt alles andere.
+    if meta.get("tone_override"):
+        return styles.instruction(meta["tone_override"])
     if meta.get("security_watch"):
-        tone = settings.get("jailbreak_tone") or "firm"
-    elif meta.get("tone_override"):
-        tone = meta["tone_override"]
-    elif settings.get("default_tone"):
+        return styles.instruction(settings.get("jailbreak_tone") or "firm")
+    if settings.get("default_tone"):
         # Freeform standard tone set by Bahrian (used when no per-person tone applies).
         return f"Tonfall (Standard): {settings['default_tone']}."
-    else:
-        tone = settings["tone"]
-    return {
-        "warm": "Tonfall: warm, ruhig, klar und menschlich.",
-        "crisp": "Tonfall: knapp, praezise und ohne Smalltalk.",
-        "formal": "Tonfall: formell, hoeflich und sauber abgegrenzt.",
-        "firm": "Tonfall: freundlich, aber deutlich distanziert und konsequent.",
-    }.get(tone, "Tonfall: warm, ruhig, klar und menschlich.")
+    return styles.instruction(settings["tone"])
 
 
 def plan_for(
