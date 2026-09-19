@@ -117,8 +117,39 @@ def _compressed_context(entries: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _journal_line(entry: dict) -> str:
+    """Eine lesbare Markdown-Zeile: `- 2026-09-18 14:03 **Lena**: Text` (mehrzeilig → ⏎)."""
+    ts = str(entry.get("ts", ""))[:16].replace("T", " ")
+    who = {"assistant": "ASTRA", "owner": "Bahrian"}.get(
+        entry.get("role", ""), entry.get("participant_display") or entry.get("display")
+        or entry.get("handle") or "?")
+    text = " ⏎ ".join((entry.get("text") or "").split("\n"))
+    return f"- {ts} **{who}**: {text}"
+
+
+def _append_journal(root: Path, entry: dict) -> None:
+    """Markdown-Journal je Kontakt/Gruppe — verbatim, chronologisch, von Hand lesbar."""
+    line = _journal_line(entry) + "\n"
+    targets = [("contacts", f"{entry.get('channel')}:{entry.get('handle')}")]
+    if entry.get("is_group"):
+        targets = [("groups", f"{entry.get('channel')}:{entry.get('group_id') or entry.get('thread_id')}")]
+        if entry.get("participant_handle"):
+            targets.append(("contacts", f"{entry.get('channel')}:{entry['participant_handle']}"))
+    for kind, key in targets:
+        f = root / "journal" / kind / f"{_safe(key)}.md"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        if not f.exists():
+            f.write_text(f"# Journal {key}\n\n", encoding="utf-8")
+        with f.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+
+
 def _append(entry: dict) -> None:
     root = _root()
+    try:
+        _append_journal(root, entry)
+    except Exception:  # noqa: BLE001 — das Journal darf den Ablauf nie stören
+        pass
     thread_file = root / "threads" / f"{_safe(entry['thread_id'])}.jsonl"
     thread_file.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(entry, ensure_ascii=False, sort_keys=True)
