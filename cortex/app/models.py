@@ -22,15 +22,18 @@ laut (Bahrians Entscheidung — Vorhersagbarkeit vor Verfügbarkeit).
 """
 from __future__ import annotations
 
+import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 from openai import AsyncOpenAI
 from pydantic import BaseModel
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
+from . import usage
 from .config import get_settings
 
 log = logging.getLogger("astra.models")
@@ -214,10 +217,54 @@ def get_economy() -> bool:
     return _ECONOMY
 
 
+def _oa_usage(resp: Any) -> tuple[int | None, int | None]:
+    """Token-Zahlen aus einer OpenAI-kompatiblen Antwort (None = Anbieter liefert keine)."""
+    u = getattr(resp, "usage", None)
+    if not u:
+        return None, None
+    return getattr(u, "prompt_tokens", None), getattr(u, "completion_tokens", None)
+
+
+def resolve_pick(pick: dict | None, default_role: str) -> tuple[Provider, str, str]:
+    """(Anbieter, Modell, Rollenlabel) für eine Modellwahl.
+
+    `pick` kommt aus der UI (pro Chat / pro Kontakt) und ist entweder
+    {"tier": "small|medium|heavy|code|osint"} oder {"provider": "openrouter", "model": "x/y"}.
+    Leer/None = die Standardrolle des Aufrufs. Ein unbekannter Anbieter wirft laut."""
+    pick = pick or {}
+    tier = str(pick.get("tier") or "").strip().lower()
+    if tier in ROLES:
+        prov, model = role_target(tier)
+        return prov, model, tier
+    name, model = str(pick.get("provider") or "").strip().lower(), str(pick.get("model") or "").strip()
+    if name and model:
+        prov = providers().get(name)
+        if prov is None:
+            raise ModelError(f"Unbekannter Anbieter '{name}'.")
+        if not prov.configured:
+            raise ModelError(f"Anbieter '{name}' ist nicht konfiguriert (Key/URL fehlt).")
+        return prov, model, "custom"
+    prov, model = role_target(default_role)
+    return prov, model, default_role
+
+
 class TriageResult(BaseModel):
     mode: str          # auto | defer | ask
     sensitivity: str   # none | freebusy | details
     reason: str = ""
+
+
+# Konfigurationsfehler (fehlender Key, unbekannter Anbieter, Budget) sind nach dem
+# ersten Versuch nicht heilbar — nur echte Netz-/API-Fehler lohnen einen Retry.
+_RETRY = retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8),
+               reraise=True, retry=retry_if_not_exception_type(ModelError))
+
+
+def _msgs_text(messages: list[dict[str, Any]]) -> str:
+    try:
+        return json.dumps(messages, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001
+        return str(messages)
 
 
 class ModelGateway:
@@ -243,8 +290,22 @@ class ModelGateway:
             self._clients[provider.name] = AsyncOpenAI(**kwargs)
         return self._clients[provider.name]
 
+    @staticmethod
+    async def _gate() -> None:
+        """Budget-Bremse: sperrt nur FREMDEN Verkehr, nie Bahrian selbst."""
+        try:
+            await usage.budget_gate(third_party=usage.is_third_party())
+        except usage.BudgetExceeded as e:
+            raise ModelError(str(e)) from e
+
+    async def _fail(self, provider: Provider, model: str, role: str, started: float,
+                    err: Exception) -> None:
+        await usage.record(usage.build_event(
+            provider=provider.name, model=model, role=role, prompt_tokens=0,
+            completion_tokens=0, started=started, ok=False, error=str(err)))
+
     # ── Tool-calling chat (used by the agent loop) ────────────────────────────
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8), reraise=True)
+    @_RETRY
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -253,30 +314,46 @@ class ModelGateway:
         model: str | None = None,
         temperature: float = 0.4,
         role: str = MEDIUM,
+        pick: dict | None = None,
     ) -> Any:
-        provider, role_model = role_target(role)
+        """`pick` (pro Chat/Kontakt aus der UI) schlägt die Rolle; `model` schlägt beides."""
+        await self._gate()
+        provider, role_model, label = resolve_pick(pick, role)
         if tools and not provider.tools:
             raise ModelError(
-                f"Rolle '{role}' zeigt auf {provider.name}, der in diesem Loop kein "
-                "Tool-Calling kann. Wähle dort einen OpenAI-kompatiblen Anbieter."
+                f"'{provider.name}' kann in diesem Loop kein Tool-Calling. Wähle für diesen Chat "
+                "ein Modell eines OpenAI-kompatiblen Anbieters (OpenAI, OpenRouter, Ollama …)."
             )
         client = self._openai_client(provider)
-        kwargs: dict[str, Any] = {
-            "model": model or role_model,
-            "messages": messages,
-            "temperature": temperature,
-        }
+        used_model = model or role_model
+        kwargs: dict[str, Any] = {"model": used_model, "messages": messages,
+                                  "temperature": temperature}
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
-        resp = await client.chat.completions.create(**kwargs)
-        return resp.choices[0].message
+        started = time.perf_counter()
+        try:
+            resp = await client.chat.completions.create(**kwargs)
+        except Exception as e:  # noqa: BLE001
+            await self._fail(provider, used_model, label, started, e)
+            raise
+        msg = resp.choices[0].message
+        pt, ct = _oa_usage(resp)
+        await usage.record(usage.build_event(
+            provider=provider.name, model=used_model, role=label, prompt_tokens=pt,
+            completion_tokens=ct, started=started, fallback_in=_msgs_text(messages),
+            fallback_out=(getattr(msg, "content", "") or "")))
+        return msg
 
     # ── Structured triage (cheap pre-step) ────────────────────────────────────
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8), reraise=True)
+    @_RETRY
     async def triage(self, system: str, user: str) -> TriageResult:
+        await self._gate()
         provider, model = role_target(SMALL)
         client = self._openai_client(provider)
+        started = time.perf_counter()
+        parsed = None
+        pt = ct = None
         try:
             completion = await client.beta.chat.completions.parse(
                 model=model,
@@ -286,64 +363,93 @@ class ModelGateway:
                 temperature=0,
             )
             parsed = completion.choices[0].message.parsed
+            pt, ct = _oa_usage(completion)
         except Exception:  # noqa: BLE001
             # Structured-output parsing is an OpenAI extension; local/other backends
             # may not have it. Fall back to plain JSON so triage still works there.
             log.debug("structured triage unsupported on %s — plain JSON fallback", provider.name)
-            resp = await client.chat.completions.create(
-                model=model, temperature=0,
-                messages=[{"role": "system", "content": system +
-                           '\nAntworte NUR als JSON: {"mode":"auto|defer|ask",'
-                           '"sensitivity":"none|freebusy|details","reason":"…"}'},
-                          {"role": "user", "content": user}],
-            )
-            import json as _json
+            try:
+                resp = await client.chat.completions.create(
+                    model=model, temperature=0,
+                    messages=[{"role": "system", "content": system +
+                               '\nAntworte NUR als JSON: {"mode":"auto|defer|ask",'
+                               '"sensitivity":"none|freebusy|details","reason":"…"}'},
+                              {"role": "user", "content": user}],
+                )
+            except Exception as e:  # noqa: BLE001
+                await self._fail(provider, model, SMALL, started, e)
+                raise
+            pt, ct = _oa_usage(resp)
             raw = (resp.choices[0].message.content or "").strip().strip("`")
             raw = raw.removeprefix("json").strip()
             try:
-                parsed = TriageResult(**_json.loads(raw))
+                parsed = TriageResult(**json.loads(raw))
             except Exception:  # noqa: BLE001
                 parsed = None
+        await usage.record(usage.build_event(
+            provider=provider.name, model=model, role=SMALL, prompt_tokens=pt,
+            completion_tokens=ct, started=started, fallback_in=system + user, fallback_out="{}"))
         return parsed or TriageResult(mode="defer", sensitivity="details", reason="parse-fallback")
 
-    # ── Role: reason (the "big brain" for HomeLab jobs & hard analysis) ───────
-    # Deliberately single-shot (no tool loop): the agent loop still speaks OpenAI's
-    # message shape, and porting it is a separate, riskier change. This gives us a
-    # second provider today without touching that hot path.
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8), reraise=True)
-    async def complete(self, role: str, system: str, user: str, *, max_tokens: int = 2000) -> str:
-        """Single-shot Textantwort einer Rolle. Deckt heavy/code/osint ab und ist der
-        Weg, auf dem auch Anbieter ohne Tool-Calling (Anthropic) nutzbar sind."""
-        provider, model = role_target(role)
+    # ── Single-shot Text einer Rolle (heavy/code/osint, auch Anthropic) ───────
+    @_RETRY
+    async def complete(self, role: str, system: str, user: str, *, max_tokens: int = 2000,
+                       pick: dict | None = None) -> str:
+        """Single-shot Textantwort. Weg, auf dem auch Anbieter ohne Tool-Calling
+        (Anthropic) nutzbar sind."""
+        await self._gate()
+        provider, model, label = resolve_pick(pick, role)
+        started = time.perf_counter()
         if provider.kind == "anthropic":
-            async with httpx.AsyncClient(timeout=180) as c:
-                r = await c.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={"x-api-key": provider.api_key,
-                             "anthropic-version": "2023-06-01",
-                             "content-type": "application/json"},
-                    json={"model": model, "max_tokens": max_tokens, "system": system,
-                          "messages": [{"role": "user", "content": user}]},
-                )
-                r.raise_for_status()
-                blocks = r.json().get("content") or []
-                return "".join(b.get("text", "") for b in blocks
-                               if b.get("type") == "text").strip()
+            try:
+                async with httpx.AsyncClient(timeout=180) as c:
+                    r = await c.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers={"x-api-key": provider.api_key,
+                                 "anthropic-version": "2023-06-01",
+                                 "content-type": "application/json"},
+                        json={"model": model, "max_tokens": max_tokens, "system": system,
+                              "messages": [{"role": "user", "content": user}]},
+                    )
+                    r.raise_for_status()
+                    data = r.json()
+            except Exception as e:  # noqa: BLE001
+                await self._fail(provider, model, label, started, e)
+                raise
+            blocks = data.get("content") or []
+            text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+            u = data.get("usage") or {}
+            await usage.record(usage.build_event(
+                provider=provider.name, model=model, role=label,
+                prompt_tokens=u.get("input_tokens"), completion_tokens=u.get("output_tokens"),
+                started=started, fallback_in=system + user, fallback_out=text))
+            return text
         client = self._openai_client(provider)
-        resp = await client.chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": user}],
-        )
-        return (resp.choices[0].message.content or "").strip()
+        try:
+            resp = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "system", "content": system},
+                          {"role": "user", "content": user}],
+            )
+        except Exception as e:  # noqa: BLE001
+            await self._fail(provider, model, label, started, e)
+            raise
+        text = (resp.choices[0].message.content or "").strip()
+        pt, ct = _oa_usage(resp)
+        await usage.record(usage.build_event(
+            provider=provider.name, model=model, role=label, prompt_tokens=pt,
+            completion_tokens=ct, started=started, fallback_in=system + user, fallback_out=text))
+        return text
 
     async def reason(self, system: str, user: str, *, max_tokens: int = 2000) -> str:
         """Das große Gehirn (Rolle `heavy`) — Planen, Analyse, HomeLab-Jobs."""
-        return await self.complete(HEAVY, system, user, max_tokens=max_tokens)
+        with usage.tag(purpose="reason"):
+            return await self.complete(HEAVY, system, user, max_tokens=max_tokens)
 
     # ── Rolling summary (cheap; keeps long threads in budget) ─────────────────
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8), reraise=True)
+    @_RETRY
     async def summarize(self, prior_summary: str, new_turns: str) -> str:
+        await self._gate()
         provider, model = role_target(SMALL)
         client = self._openai_client(provider)
         prompt = (
@@ -351,12 +457,20 @@ class ModelGateway:
             "offene Fragen, Zusagen und Fakten. Bisherige Zusammenfassung:\n"
             f"{prior_summary or '(keine)'}\n\nNeue Nachrichten:\n{new_turns}"
         )
-        resp = await client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
-        return (resp.choices[0].message.content or "").strip()
+        started = time.perf_counter()
+        try:
+            resp = await client.chat.completions.create(
+                model=model, messages=[{"role": "user", "content": prompt}], temperature=0.2)
+        except Exception as e:  # noqa: BLE001
+            await self._fail(provider, model, SMALL, started, e)
+            raise
+        text = (resp.choices[0].message.content or "").strip()
+        pt, ct = _oa_usage(resp)
+        with usage.tag(purpose=usage.current().get("purpose") or "summary"):
+            await usage.record(usage.build_event(
+                provider=provider.name, model=model, role=SMALL, prompt_tokens=pt,
+                completion_tokens=ct, started=started, fallback_in=prompt, fallback_out=text))
+        return text
 
 
 _gateway: ModelGateway | None = None

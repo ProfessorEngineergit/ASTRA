@@ -6,7 +6,7 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from . import knowledge, world
+from . import knowledge, usage, world
 from .config import get_settings
 from .models import get_gateway
 from .persona import Register, system_prompt
@@ -72,6 +72,9 @@ async def generate_reply(
     max_sensitivity: str = "none",
     extra_system: str = "",
     permission_mode: str = "auto",
+    principal: str = "",
+    model_pick: dict | None = None,
+    chat_id: str = "",
 ) -> str:
     result = await generate_reply_meta(
         register=register,
@@ -83,6 +86,9 @@ async def generate_reply(
         max_sensitivity=max_sensitivity,
         extra_system=extra_system,
         permission_mode=permission_mode,
+        principal=principal,
+        model_pick=model_pick,
+        chat_id=chat_id,
     )
     return result["reply"]
 
@@ -99,6 +105,35 @@ async def generate_reply_meta(
     extra_system: str = "",
     permission_mode: str = "auto",
     principal: str = "",
+    model_pick: dict | None = None,
+    chat_id: str = "",
+) -> dict:
+    # Verbrauch wird pro Zweck/Kanal/Chat verbucht (siehe usage.py).
+    with usage.tag(purpose="chat" if register != Register.THIRD else "secretary_reply",
+                   channel=channel, thread_id=thread_id, chat_id=chat_id or None,
+                   contact=str((contact or {}).get("display_name")
+                               or (contact or {}).get("handle") or "") or None,
+                   principal=principal or None, third_party=(register == Register.THIRD)):
+        return await _generate_reply_meta(
+            register=register, contact=contact, thread_id=thread_id, channel=channel,
+            history=history, summary=summary, max_sensitivity=max_sensitivity,
+            extra_system=extra_system, permission_mode=permission_mode,
+            principal=principal, model_pick=model_pick)
+
+
+async def _generate_reply_meta(
+    *,
+    register: Register,
+    contact: dict,
+    thread_id: str,
+    channel: str,
+    history: list[dict],
+    summary: str = "",
+    max_sensitivity: str = "none",
+    extra_system: str = "",
+    permission_mode: str = "auto",
+    principal: str = "",
+    model_pick: dict | None = None,
 ) -> dict:
     s = get_settings()
     gw = get_gateway()
@@ -166,7 +201,7 @@ async def generate_reply_meta(
 
     tool_trace = []
     for _ in range(MAX_TOOL_ITERS):
-        msg = await gw.chat(messages, tools=tools)
+        msg = await gw.chat(messages, tools=tools, pick=model_pick)
         tool_calls = getattr(msg, "tool_calls", None)
         if not tool_calls:
             return {"reply": (msg.content or "").strip(), "tool_calls": tool_trace}
@@ -218,5 +253,5 @@ async def generate_reply_meta(
             })
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
-    final = await gw.chat(messages)
+    final = await gw.chat(messages, pick=model_pick)
     return {"reply": (final.content or "").strip(), "tool_calls": tool_trace}

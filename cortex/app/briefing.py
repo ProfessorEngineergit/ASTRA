@@ -69,7 +69,9 @@ async def _intro(sections: list[str]) -> str:
         ]
         # One throwaway greeting sentence does not need the expensive model.
         from .models import SMALL
-        out = await gw.chat(msg, temperature=0.7, role=SMALL)
+        from . import usage
+        with usage.tag(purpose="briefing", channel="telegram", third_party=False):
+            out = await gw.chat(msg, temperature=0.7, role=SMALL)
         return "☀️ " + (out.content or "Guten Morgen!").strip()
     except Exception as e:  # noqa: BLE001
         log.warning("briefing intro failed: %s", e)
