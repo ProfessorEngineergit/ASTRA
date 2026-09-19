@@ -353,8 +353,9 @@ def test_directory_merges_cards_and_cardless_contacts_without_duplicates():
 
 
 def test_refs_roundtrip_and_reject_garbage():
-    row = {"key": None, "channel": "waha", "handle": "49|171@c.us", "name": "Zoë | Test"}
-    assert cards.decode_ref(cards.encode_ref(row)) == {"channel": "waha", "handle": "49|171@c.us", "name": "Zoë | Test"}
+    row = {"key": None, "channel": "waha", "handle": "49|171@c.us", "name": "Zoë | Test", "tier": 2}
+    assert cards.decode_ref(cards.encode_ref(row)) == {"channel": "waha", "handle": "49|171@c.us", "name": "Zoë | Test",
+                                                       "tier": 2}
     assert cards.decode_ref("card:lena") == {"key": "lena"}
     assert cards.decode_ref("new:%%%") is None and cards.decode_ref("evil") is None
 
@@ -409,3 +410,11 @@ def test_directory_reports_secretary_state_and_off_scope():
                             cards.sanitize({"name": "Tom"})], [{"channel": "waha", "handle": "4915@c.us", "display_name": "Mia"}])
     assert {r["name"]: r["sec_on"] for r in rows} == {"Lena": False, "Tom": True, "Mia": True}
     assert [r["name"] for r in cards.filter_directory(rows, scope="off")] == ["Lena"]
+
+
+def test_switching_on_again_keeps_a_configured_time_window():
+    card = cards.sanitize({"name": "Lena", "active": {"mode": "window", "start": "08:00", "end": "20:00", "days": [0, 1]}})
+    off = cards.set_secretary(card, False)
+    back = cards.set_secretary(off, True)
+    assert off["active"]["mode"] == "never" and back["active"]["mode"] == "window"
+    assert back["active"]["start"] == "08:00" and back["active"]["days"] == [0, 1]

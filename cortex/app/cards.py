@@ -603,7 +603,8 @@ def encode_ref(row: dict) -> str:
     """Auswahl-Wert einer Zeile: vorhandene Karte oder (noch) kartenloser Kontakt."""
     if row.get("key"):
         return "card:" + row["key"]
-    raw = _json.dumps({"c": row["channel"], "h": row["handle"], "n": row.get("name", "")}, ensure_ascii=False)
+    raw = _json.dumps({"c": row["channel"], "h": row["handle"], "n": row.get("name", ""),
+                       "t": row.get("tier", 3), "k": row.get("kind", "")}, ensure_ascii=False)
     return "new:" + _b64.urlsafe_b64encode(raw.encode()).decode()
 
 
@@ -613,7 +614,11 @@ def decode_ref(ref: str) -> dict | None:
             return {"key": ref[5:]}
         if ref.startswith("new:"):
             d = _json.loads(_b64.urlsafe_b64decode(ref[4:].encode()).decode())
-            return {"channel": str(d["c"]), "handle": str(d["h"]), "name": str(d.get("n") or "")}
+            try:
+                tier = max(0, min(3, int(d.get("t", 3))))
+            except (TypeError, ValueError):
+                tier = 3
+            return {"channel": str(d["c"]), "handle": str(d["h"]), "name": str(d.get("n") or ""), "tier": tier}
     except Exception:  # noqa: BLE001
         return None
     return None
@@ -695,7 +700,8 @@ def set_secretary(card: dict, on: bool) -> dict:
     c = sanitize(card)
     if on:
         if c["active"]["mode"] == "never":
-            c["active"]["mode"] = "inherit"
+            a = c["active"]
+            a["mode"] = "window" if (a["start"] or a["end"] or a["days"]) else "inherit"   # eigene Zeiten nicht verlieren
         if c["rule"] == "block":
             c["rule"] = ""
     else:

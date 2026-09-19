@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import pytest
 from fastapi import FastAPI
@@ -172,7 +173,7 @@ def test_group_editor_shows_group_fields_and_saves_trigger(cardsdb):
     c = _client()
     _create(c, kind="group", name="Astroclub", handle="whatsapp: 12-34@g.us")
     page = c.get("/admin/contacts/astroclub")
-    assert "Gruppen-Verhalten" in page.text and "Moderator" in page.text
+    assert "Wann reagiert der Secretary in der Gruppe?" in page.text and "Moderator" in page.text
     csrf = _csrf(c, "/admin/contacts/astroclub")
     c.post("/admin/contacts/astroclub", data={
         "csrf": csrf, "name": "Astroclub", "handles": "whatsapp: 12-34@g.us", "trust_tier": "3",
@@ -635,3 +636,90 @@ def test_editor_shows_the_switch(bulkdb):
     c = _client()
     _create(c)
     assert 'role="switch"' in c.get("/admin/contacts/lena").text
+
+
+# ─── Detailseite: Secretary-Schalter oben, Feineinstellungen darunter ─────────
+def test_detail_page_leads_with_the_secretary_switch_and_labels_settings_as_secretary(bulkdb):
+    c = _client()
+    _create(c)
+    page = c.get("/admin/contacts/lena").text
+    assert "SECRETARY · PERSON" in page and "Secretary für Lena" in page
+    assert page.index('role="switch"') < page.index("Secretary-Feineinstellungen")          # Schalter kommt zuerst
+    assert "Wie antwortet der Secretary?" in page and "Wann ist der Secretary für Lena aktiv?" in page
+    assert 'value="block"' not in page and 'value="never"' not in page                       # kein doppeltes „aus“
+    assert 'id="secnote" hidden' in page                                                      # an → kein „aus“-Hinweis
+
+
+def test_detail_switch_off_dims_the_settings_and_shows_the_note(bulkdb):
+    c = _client()
+    _create(c)
+    csrf = _csrf(c, "/admin/contacts/lena")
+    r = c.post("/admin/contacts/secretary", data={"csrf": csrf, "toggle": "card:lena|0", "back": "detail"},
+               follow_redirects=False)
+    assert r.headers["location"] == "/admin/contacts/lena?saved=secoff"
+    page = c.get("/admin/contacts/lena").text
+    assert 'class="x-stack dim"' in page and 'id="secnote" hidden' not in page and "Der Secretary ist für Lena" in page
+    assert "Aus: Der Secretary antwortet nicht" in page
+
+
+def test_saving_the_fine_settings_never_flips_the_switch(bulkdb):
+    c = _client()
+    _create(c)
+    csrf = _csrf(c, "/admin/contacts/lena")
+    c.post("/admin/contacts/secretary", data={"csrf": csrf, "toggle": "card:lena|0"}, follow_redirects=False)
+    form = {"csrf": csrf, "name": "Lena", "handles": "whatsapp: +49 171 1234567", "trust_tier": "1", "rule": "direct",
+            "style": "arrogant", "active_mode": "inherit"}
+    c.post("/admin/contacts/lena", data=form, follow_redirects=False)
+    saved = bulkdb["lena"]
+    assert saved["style"] == "arrogant" and saved["rule"] == "direct"                       # gespeichert …
+    assert cards_secretary_on(saved) is False                                                # … aber weiter aus
+    c.post("/admin/contacts/secretary", data={"csrf": csrf, "toggle": "card:lena|1"}, follow_redirects=False)
+    c.post("/admin/contacts/lena", data=form, follow_redirects=False)
+    assert cards_secretary_on(bulkdb["lena"]) is True
+
+
+def cards_secretary_on(card):
+    from app import cards
+    return cards.secretary_on(card)
+
+
+def test_contact_without_card_opens_a_virtual_detail_page_without_saving(bulkdb):
+    c = _client()
+    page = c.get("/admin/contacts").text
+    ref = _ref_for(page, "Tom")
+    assert f'/admin/contacts/open?ref=' in page and 'class="rowlink"' in page
+    detail = c.get(f"/admin/contacts/open?ref={quote(ref)}")
+    assert detail.status_code == 200 and "Secretary für Tom" in detail.text and "noch keine Karte" in detail.text
+    assert 'action="/admin/contacts/create"' in detail.text and "Alles vergessen" not in detail.text
+    assert bulkdb == {}                                                                       # nichts gespeichert
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    r = c.post("/admin/contacts/create", data={"csrf": csrf, "ref": ref, "name": "Tom", "style": "casual",
+                                               "trust_tier": "3", "handles": "waha: 4915999999999@c.us"},
+               follow_redirects=False)
+    assert r.headers["location"].startswith("/admin/contacts/tom") and bulkdb["tom"]["style"] == "casual"
+
+
+def test_cardless_contact_keeps_its_known_trust_tier_when_a_card_is_created(bulkdb, monkeypatch):
+    async def contacts_list(limit=500):
+        return [{"channel": "waha", "handle": "4915999999999@c.us", "display_name": "Jonas", "trust_tier": 1}]
+    monkeypatch.setattr(db, "contacts_list", contacts_list, raising=False)
+    c = _client()
+    ref = _ref_for(c.get("/admin/contacts").text, "Jonas")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    c.post("/admin/contacts/secretary", data={"csrf": csrf, "toggle": ref + "|0"}, headers={"Accept": "application/json"})
+    assert bulkdb["jonas"]["trust_tier"] == 1                                                  # nicht auf „fremd“ zurückgestuft
+    ref2 = ref
+    c.post("/admin/contacts/bulk", data={"csrf": csrf, "do": "apply", "sel": ref2, "b_style": "warm"})
+    assert bulkdb["jonas"]["trust_tier"] == 1
+
+
+def test_open_rejects_garbage_and_redirects_when_a_card_exists_meanwhile(bulkdb):
+    c = _client()
+    assert c.get("/admin/contacts/open?ref=müll", follow_redirects=False).status_code == 303
+    assert c.get("/admin/contacts/open", follow_redirects=False).status_code == 303
+    _create(c)
+    from app import cards
+    ref = cards.encode_ref({"key": None, "channel": "waha", "handle": "491711234567@c.us", "name": "Lena WA", "tier": 3})
+    r = c.get(f"/admin/contacts/open?ref={quote(ref)}", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/admin/contacts/lena"
+    assert c.post("/admin/contacts/create", data={"csrf": "x", "ref": ref}, follow_redirects=False).status_code == 403

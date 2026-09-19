@@ -385,8 +385,9 @@ def _sec_toggle(ref: str, on: bool, who: str) -> str:
 
 def _dir_row(r: dict) -> str:
     ref = cards.encode_ref(r)
-    name = (f'<a href="/admin/contacts/{quote(r["key"])}"><b>{esc(r["name"])}</b></a>' if r["has_card"]
-            else f'<b>{esc(r["name"])}</b> <span class="x-pill">ohne Karte</span>')
+    href = (f'/admin/contacts/{quote(r["key"])}' if r["has_card"] else f'/admin/contacts/open?ref={quote(ref)}')
+    name = (f'<a href="{href}" class="rowlink"><b>{esc(r["name"])}</b></a>'
+            + ('' if r["has_card"] else ' <span class="x-pill">ohne Karte</span>'))
     extra = f' <span class="x-pill x-warn">{r["proposals"]} Vorschlag</span>' if r["proposals"] else ""
     kind = "Gruppe" if r["kind"] == "group" else "Person"
     style = styles.label(r["style"]) if r["style"] else "—"
@@ -423,9 +424,10 @@ async def contacts_page(request: Request, _: bool = Depends(auth.require_admin),
              f'<th class="num">Stufe</th><th>Regel</th><th>Stil</th></tr></thead>'
              f'<tbody>{"".join(_dir_row(r) for r in rows) or "<tr><td colspan=6 class=x-muted>Keine Einträge in dieser Ansicht.</td></tr>"}</tbody></table></div>')
     body = f"""
-<section class="hero"><div class="lab-eyebrow">KONTAKTE</div><h1>Personen &amp; Gruppen</h1>
-<p>Alle, die ASTRA kennt. Klick auf einen Namen für die Details — oder wähle mehrere (oder alle) aus und
-setze Regeln in einem Rutsch. Gruppen funktionieren wie Nutzer: nur was du freigibst, existiert für ASTRA.</p></section>
+<section class="hero"><div class="lab-eyebrow">SECRETARY</div><h1>Personen &amp; Gruppen</h1>
+<p>Hier stellst du ein, wie der <b>Secretary</b> mit jedem Kontakt umgeht. Klick auf einen Kontakt: oben schaltest du den
+Secretary für ihn <b>an oder aus</b>, darunter liegen die Feineinstellungen. Oder wähle mehrere (oder alle) aus und setze
+Regeln in einem Rutsch. Gruppen funktionieren wie Nutzer: nur was du freigibst, existiert für ASTRA.</p></section>
 {_flash("ok", msg)}
 <div class="chips">{chips}</div>
 <form method="get" class="x-form" style="margin-bottom:14px"><input type="hidden" name="scope" value="{esc(scope)}">
@@ -449,6 +451,10 @@ setze Regeln in einem Rutsch. Gruppen funktionieren wie Nutzer: nur was du freig
     all.checked=n>0&&n===rows().length; all.indeterminate=n>0&&n<rows().length;
   }}
   all.addEventListener('change',()=>{{rows().forEach(r=>r.checked=all.checked);sync();}});
+  form.addEventListener('click',e=>{{           // ganze Zeile anklickbar (außer Häkchen, Schalter, Links)
+    if(e.target.closest('input,button,a,label')) return;
+    const link=e.target.closest('tr')?.querySelector('a.rowlink'); if(link) location.href=link.href;
+  }});
   form.addEventListener('click',async e=>{{
     const b=e.target.closest('.sec-toggle'); if(!b) return;
     e.preventDefault(); if(b.classList.contains('busy')) return;
@@ -477,9 +483,38 @@ def _find_by_key(all_cards: list[dict], key: str) -> dict | None:
     return next((c for c in all_cards if c["key"] == key), None)
 
 
-def _render_card_editor(c: dict, token: str, flash: str, snapshot: dict, seen: list[dict]) -> str:
+_SEC_JS = """
+<script>
+(function(){
+  const sw=document.querySelector('.sec-big .sec-toggle'); if(!sw) return;
+  const fine=document.getElementById('fine'), note=document.getElementById('secnote');
+  sw.addEventListener('click',async e=>{
+    e.preventDefault(); if(sw.classList.contains('busy')) return; sw.classList.add('busy');
+    const fd=new FormData(); fd.append('csrf',document.querySelector('.sec-big [name=csrf]').value); fd.append('toggle',sw.value);
+    try{
+      const r=await fetch('/admin/contacts/secretary',{method:'POST',body:fd,headers:{'Accept':'application/json'}});
+      const j=await r.json(); if(!j.ok) throw new Error(j.error||'Fehler');
+      if(sw.dataset.virtual){ location.href='/admin/contacts/'+encodeURIComponent(j.key)+'?saved='+(j.on?'secon':'secoff'); return; }
+      sw.classList.toggle('on',j.on); sw.setAttribute('aria-checked',j.on?'true':'false');
+      sw.querySelector('.lbl').textContent=j.on?'An':'Aus'; sw.value=sw.value.split('|')[0]+'|'+(j.on?0:1);
+      fine.classList.toggle('dim',!j.on); note.hidden=j.on;
+      const d=document.getElementById('secdesc'); d.textContent=j.on?d.dataset.on:d.dataset.off;
+    }catch(err){ alert('Konnte den Schalter nicht setzen: '+err.message); }
+    sw.classList.remove('busy');
+  });
+})();
+</script>"""
+
+
+def _render_card_editor(c: dict, token: str, flash: str, snapshot: dict, seen: list[dict],
+                        virtual_ref: str = "") -> str:
+    """Detailseite eines Kontakts. Oben der Secretary-Schalter, darunter die Feineinstellungen.
+    `virtual_ref` gesetzt = Kontakt hat noch keine Karte: nichts ist gespeichert, bis du schaltest/speicherst."""
     is_group = c["kind"] == "group"
+    who = "diese Gruppe" if is_group else "diese Person"
+    on = cards.secretary_on(c)
     share = c["share"]
+    ref = virtual_ref or cards.encode_ref({"key": c["key"]})
     style_keys = {k: f"{e} {l}".strip() for k, l, _s, e in styles.choices()}
     style_keys = {"": "Standard (Profil / Vorgabe)", **style_keys, "__custom__": "Eigener Text …"}
     cur_style = c["style"] if c["style"] in style_keys else ("__custom__" if c["style"] else "")
@@ -491,119 +526,168 @@ def _render_card_editor(c: dict, token: str, flash: str, snapshot: dict, seen: l
     if cur_model and cur_model not in model_opts:
         model_opts[cur_model] = model_choice.label(c["model"], snapshot)
     model_opts[""] = "Standard (wie global eingestellt)"
+    # „Nie“/„Blockieren“ sind der An/Aus-Schalter oben — nicht doppelt als Auswahl anbieten.
+    rule_opts = {k: v for k, v in RULE_LABELS.items() if k != "block"}
+    active_opts = {k: v for k, v in ACTIVE_LABELS.items() if k != "never"}
+    cur_active = c["active"]["mode"] if c["active"]["mode"] in active_opts else "inherit"
     days = "".join(f'<label style="display:inline-flex;align-items:center;gap:5px;margin:0 14px 0 0;font-weight:500"><input type="checkbox" name="days" value="{i}"'
                    f'{" checked" if i in c["active"]["days"] else ""}> {n}</label>' for i, n in enumerate(DAY_NAMES))
     group_block = ""
     if is_group:
         g = c["group"]
         group_block = f"""
-<div class="panel"><div class="section-head"><h2>Gruppen-Verhalten</h2></div>
+<div class="panel"><div class="section-head"><h2>Wann reagiert der Secretary in der Gruppe?</h2></div>
   <div class="x-grid2">
-    <div class="field"><label>Wann reagiert ASTRA?</label>{_select("group_trigger", GROUP_TRIGGER_LABELS, g["trigger"])}
+    <div class="field"><label>Auslöser</label>{_select("group_trigger", GROUP_TRIGGER_LABELS, g["trigger"])}
       <div class="help">Standard: nur wenn jemand dich (@Bahrian), „astra“ oder einen Alias nennt.</div></div>
     <div class="field"><label>Rolle</label>{_select("group_role", GROUP_ROLE_LABELS, g["role"])}</div>
     <div class="field"><label>Stichwörter (Komma)</label><input type="text" name="group_keywords" value="{esc(', '.join(g['keywords']))}"></div>
     <div class="field"><label>Aliasse / Spitznamen (Komma)</label><input type="text" name="group_aliases" value="{esc(', '.join(g['aliases']))}"></div>
   </div>
-  <label><input type="checkbox" name="group_actions" value="1" {"checked" if g["actions"] else ""}> ASTRA darf in dieser Gruppe Aktionen vorbereiten (du bestätigst weiter selbst)</label>
+  <label><input type="checkbox" name="group_actions" value="1" {"checked" if g["actions"] else ""}> Der Secretary darf in dieser Gruppe Aktionen vorbereiten (du bestätigst weiter selbst)</label>
 </div>"""
-    learned = ""
-    if c["learned"]:
-        rows = "".join(
-            f'<tr><td>{esc(cards.TOPIC_LABELS.get(x["topic"], x["topic"]))}</td><td>{esc(str(x.get("level", "")))}</td>'
-            f'<td class="num"><form method="post" action="/admin/contacts/{quote(c["key"])}/revoke" style="margin:0">'
-            f'<input type="hidden" name="csrf" value="{esc(token)}"><input type="hidden" name="topic" value="{esc(x["topic"])}">'
-            f'<button class="btn ghost sm" type="submit">Widerrufen</button></form></td></tr>' for x in c["learned"][::-1][:12])
-        learned = (f'<div class="panel"><div class="section-head"><h2>Gelernt aus deinen Entscheidungen</h2></div>'
-                   f'<table class="x-tbl"><tbody>{rows}</tbody></table></div>')
-    proposals = ""
-    if c["proposals"]:
-        rows = "".join(
-            f'<tr><td><span class="x-pill">{esc(str(p.get("kind", "")))}</span></td><td>{esc(p["text"])}</td>'
-            f'<td class="num" style="white-space:nowrap"><form method="post" action="/admin/contacts/{quote(c["key"])}/proposal" style="margin:0;display:inline">'
-            f'<input type="hidden" name="csrf" value="{esc(token)}"><input type="hidden" name="i" value="{i}">'
-            f'<button class="btn sm" name="do" value="accept" type="submit">Übernehmen</button> '
-            f'<button class="btn ghost sm" name="do" value="reject" type="submit">Verwerfen</button></form></td></tr>'
-            for i, p in enumerate(c["proposals"]))
-        proposals = (f'<div class="panel"><div class="section-head"><h2>Vorschläge von ASTRA</h2></div>'
-                     f'<p class="x-muted">Aus den Nachrichten abgeleitet. Nichts davon gilt, bevor du es übernimmst.</p>'
-                     f'<table class="x-tbl"><tbody>{rows}</tbody></table></div>')
-    cap, stem = _card_capsule(c)
-    if cap:
-        quotes = "".join(f'<li>„{esc(q.get("text", "") if isinstance(q, dict) else str(q))}“</li>' for q in (cap.get("quotes") or [])[:6])
-        facts = "".join(f"<li>{esc(str(f))}</li>" for f in (cap.get("facts") or [])[:10])
-        capsule_html = (f'<p>{esc(cap.get("summary") or "")}</p>'
-                        + (f'<b>Fakten</b><ul>{facts}</ul>' if facts else "")
-                        + (f'<b>Wörtliche Zitate</b><ul>{quotes}</ul>' if quotes else "")
-                        + f'<p class="x-muted">Stand: {esc(str(cap.get("updated") or cap.get("last_ts") or "?"))}</p>')
-    else:
-        capsule_html = '<p class="x-muted">Noch keine Zusammenfassung. Sie entsteht nachts um 03:30 oder per Knopf.</p>'
-    ctx_buttons = ""
-    if c["handles"]:
-        ctx_buttons = (
-            f'<form method="post" action="/admin/contacts/{quote(c["key"])}/digest" style="display:inline">'
-            f'<input type="hidden" name="csrf" value="{esc(token)}"><button class="btn sm secondary" type="submit">Jetzt zusammenfassen</button></form> '
-            f'<form method="post" action="/admin/contacts/{quote(c["key"])}/forget" style="display:inline" '
-            f'onsubmit="return confirm(\'Journal, Rohlog und Zusammenfassung dieser {"Gruppe" if is_group else "Person"} restlos löschen?\')">'
-            f'<input type="hidden" name="csrf" value="{esc(token)}"><button class="btn ghost sm danger" type="submit">Alles vergessen</button></form>')
-    return f"""
-<section class="hero"><div class="lab-eyebrow">{"GRUPPE" if is_group else "PERSON"}</div><h1>{esc(c["name"])}</h1>
-<p><a href="/admin/contacts">← Alle Kontakte</a></p>
-<form method="post" action="/admin/contacts/secretary" style="margin-top:12px">
-  <input type="hidden" name="csrf" value="{esc(token)}">
-  <span class="x-muted" style="margin-right:8px">Secretary für {"diese Gruppe" if is_group else "diese Person"}:</span>{_sec_toggle(cards.encode_ref({"key": c["key"]}), cards.secretary_on(c), c["name"])}
-</form></section>
-{_flash("ok", flash)}
-<form method="post" action="/admin/contacts/{quote(c["key"])}" class="x-stack">
-<input type="hidden" name="csrf" value="{esc(token)}">
-<div class="panel"><div class="section-head"><h2>Identität &amp; Regel</h2></div>
-  <div class="x-grid2">
-    <div class="field"><label>Name</label><input type="text" name="name" value="{esc(c["name"])}" required></div>
-    <div class="field"><label>Beziehung</label><input type="text" name="relationship" value="{esc(c["relationship"])}" placeholder="Freundin, Lehrer, Verein …"></div>
-    <div class="field"><label>Vertrauensstufe</label>{_select("trust_tier", TIER_LABELS, c["trust_tier"])}</div>
-    <div class="field"><label>Regel</label>{_select("rule", RULE_LABELS, c["rule"])}</div>
-  </div>
-  <div class="field"><label>Kennungen (eine pro Zeile: kanal: kennung)</label>
-    <textarea name="handles" rows="3" placeholder="whatsapp: +49 171 1234567&#10;signal: +49 …">{esc(cards.handles_text(c))}</textarea>
-    <div class="help">Nummern werden tolerant verglichen (0171… = +49 171…). Kanäle: whatsapp, signal, telegram, email.</div></div>
-</div>
-<div class="panel"><div class="section-head"><h2>Ton &amp; Anweisung</h2></div>
-  <div class="x-grid2">
-    <div class="field"><label>Stil</label>{_select("style", style_keys, cur_style)}
-      <input type="text" name="style_custom" value="{esc(c["style"] if cur_style == "__custom__" else "")}" placeholder="Eigener Stil (nur bei „Eigener Text“)" style="margin-top:8px"></div>
-    <div class="field"><label>Modell nur für diese {"Gruppe" if is_group else "Person"}</label>{_select("model", model_opts, cur_model)}</div>
-  </div>
-  <details><summary class="x-muted">Stil-Vorschau</summary>{style_samples}</details>
-  <div class="field" style="margin-top:12px"><label>Anweisung (verbindlich)</label>
-    <textarea name="instruction" rows="3" placeholder="z. B. „Duze sie immer, erwähne nie meinen Stundenplan.“">{esc(c["instruction"])}</textarea></div>
-</div>
-<div class="panel"><div class="section-head"><h2>Was darf {"die Gruppe" if is_group else "sie/er"} erfahren?</h2></div>
-  <div class="x-grid2">
-    <div class="field"><label>{esc(cards.TOPIC_LABELS["availability"])}</label>{_select("share_availability", SHARE_LEVEL_LABELS, share["availability"])}</div>
-    {"".join(f'<div class="field"><label>{esc(cards.TOPIC_LABELS[t])}</label>{_select("share_" + t, YESNO_LABELS, share[t])}</div>' for t in cards.SHARE_TOPICS[1:])}
-  </div>
-  <p class="x-muted">„Standard“ heißt: es gilt die Vertrauensstufe. Alles darüber fragt ASTRA bei dir nach.</p>
-</div>
-{group_block}
-<div class="panel"><div class="section-head"><h2>Aktivzeiten</h2></div>
-  <div class="x-form">
-    <div class="field"><label>Modus</label>{_select("active_mode", ACTIVE_LABELS, c["active"]["mode"])}</div>
-    <div class="field"><label>Von</label><input type="text" name="active_start" value="{esc(c["active"]["start"])}" placeholder="08:00" style="min-width:80px"></div>
-    <div class="field"><label>Bis</label><input type="text" name="active_end" value="{esc(c["active"]["end"])}" placeholder="20:00" style="min-width:80px"></div>
-  </div>
-  <div class="field"><label>Tage (leer = alle)</label>{days}</div>
-</div>
-<div class="panel"><div class="section-head"><h2>Notizen (nur für dich)</h2></div>
-  <textarea name="notes" rows="3">{esc(c["notes"])}</textarea></div>
-<div><button class="btn" type="submit">Speichern</button></div>
-</form>
-<style>.x-stack>*{{margin-bottom:14px}}.x-stack textarea{{width:100%}}</style>
-<div class="section-head x-sec"><h2>Kontext</h2></div>
+    extras = ""
+    if not virtual_ref:
+        learned = ""
+        if c["learned"]:
+            rows = "".join(
+                f'<tr><td>{esc(cards.TOPIC_LABELS.get(x["topic"], x["topic"]))}</td><td>{esc(str(x.get("level", "")))}</td>'
+                f'<td class="num"><form method="post" action="/admin/contacts/{quote(c["key"])}/revoke" style="margin:0">'
+                f'<input type="hidden" name="csrf" value="{esc(token)}"><input type="hidden" name="topic" value="{esc(x["topic"])}">'
+                f'<button class="btn ghost sm" type="submit">Widerrufen</button></form></td></tr>' for x in c["learned"][::-1][:12])
+            learned = (f'<div class="panel"><div class="section-head"><h2>Gelernt aus deinen Entscheidungen</h2></div>'
+                       f'<table class="x-tbl"><tbody>{rows}</tbody></table></div>')
+        proposals = ""
+        if c["proposals"]:
+            rows = "".join(
+                f'<tr><td><span class="x-pill">{esc(str(p.get("kind", "")))}</span></td><td>{esc(p["text"])}</td>'
+                f'<td class="num" style="white-space:nowrap"><form method="post" action="/admin/contacts/{quote(c["key"])}/proposal" style="margin:0;display:inline">'
+                f'<input type="hidden" name="csrf" value="{esc(token)}"><input type="hidden" name="i" value="{i}">'
+                f'<button class="btn sm" name="do" value="accept" type="submit">Übernehmen</button> '
+                f'<button class="btn ghost sm" name="do" value="reject" type="submit">Verwerfen</button></form></td></tr>'
+                for i, p in enumerate(c["proposals"]))
+            proposals = (f'<div class="panel"><div class="section-head"><h2>Vorschläge von ASTRA</h2></div>'
+                         f'<p class="x-muted">Aus den Nachrichten abgeleitet. Nichts davon gilt, bevor du es übernimmst.</p>'
+                         f'<table class="x-tbl"><tbody>{rows}</tbody></table></div>')
+        cap, _stem = _card_capsule(c)
+        if cap:
+            quotes = "".join(f'<li>„{esc(q.get("text", "") if isinstance(q, dict) else str(q))}“</li>' for q in (cap.get("quotes") or [])[:6])
+            facts = "".join(f"<li>{esc(str(f))}</li>" for f in (cap.get("facts") or [])[:10])
+            capsule_html = (f'<p>{esc(cap.get("summary") or "")}</p>'
+                            + (f'<b>Fakten</b><ul>{facts}</ul>' if facts else "")
+                            + (f'<b>Wörtliche Zitate</b><ul>{quotes}</ul>' if quotes else "")
+                            + f'<p class="x-muted">Stand: {esc(str(cap.get("updated") or cap.get("last_ts") or "?"))}</p>')
+        else:
+            capsule_html = '<p class="x-muted">Noch keine Zusammenfassung. Sie entsteht nachts um 03:30 oder per Knopf.</p>'
+        ctx_buttons = ""
+        if c["handles"]:
+            ctx_buttons = (
+                f'<form method="post" action="/admin/contacts/{quote(c["key"])}/digest" style="display:inline">'
+                f'<input type="hidden" name="csrf" value="{esc(token)}"><button class="btn sm secondary" type="submit">Jetzt zusammenfassen</button></form> '
+                f'<form method="post" action="/admin/contacts/{quote(c["key"])}/forget" style="display:inline" '
+                f'onsubmit="return confirm(\'Journal, Rohlog und Zusammenfassung dieser {"Gruppe" if is_group else "Person"} restlos löschen?\')">'
+                f'<input type="hidden" name="csrf" value="{esc(token)}"><button class="btn ghost sm danger" type="submit">Alles vergessen</button></form>')
+        extras = f"""
+<div class="section-head x-sec"><h2>Was ASTRA über {esc(c["name"])} weiß</h2></div>
 <div class="panel">{capsule_html}<div style="margin-top:12px">{ctx_buttons}</div></div>
 {learned}{proposals}
 <div class="section-head x-sec"><h2>Gefahrenzone</h2></div>
 <form method="post" action="/admin/contacts/{quote(c["key"])}/delete" onsubmit="return confirm('Karte wirklich löschen?')">
 <input type="hidden" name="csrf" value="{esc(token)}"><button class="btn ghost danger sm" type="submit">Karte löschen</button></form>"""
+    form_action = "/admin/contacts/create" if virtual_ref else f"/admin/contacts/{quote(c['key'])}"
+    virtual_field = f'<input type="hidden" name="ref" value="{esc(virtual_ref)}">' if virtual_ref else ""
+    virtual_note = ('<p class="x-muted" style="margin-top:8px">Für diesen Kontakt gibt es noch keine Karte — bis du den Schalter '
+                    'betätigst oder speicherst, gilt das Standardverhalten des Secretary.</p>' if virtual_ref else "")
+    desc_on = ("An: Der Secretary beantwortet Nachrichten dieser Gruppe nach den Einstellungen unten." if is_group
+               else f"An: Der Secretary beantwortet Nachrichten von {c['name']} nach den Einstellungen unten.")
+    desc_off = "Aus: Der Secretary antwortet nicht. Nachrichten werden weiter für dich notiert."
+    toggle = (f'<button type="submit" class="sec-toggle {"on" if on else ""}" name="toggle" value="{esc(ref)}|{0 if on else 1}" '
+              f'role="switch" aria-checked="{"true" if on else "false"}" aria-label="Secretary für {esc(c["name"])}"'
+              f'{" data-virtual=1" if virtual_ref else ""}><span class="track"></span><span class="lbl">{"An" if on else "Aus"}</span></button>')
+    return f"""
+<section class="hero"><div class="lab-eyebrow">SECRETARY · {"GRUPPE" if is_group else "PERSON"}</div><h1>{esc(c["name"])}</h1>
+<p><a href="/admin/contacts">← Alle Kontakte</a></p></section>
+{_flash("ok", flash)}
+<div class="panel sec-big">
+  <form method="post" action="/admin/contacts/secretary" style="margin:0">
+    <input type="hidden" name="csrf" value="{esc(token)}"><input type="hidden" name="back" value="detail">
+    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">{toggle}
+      <div><div style="font-size:17px;font-weight:650">Secretary für {esc(c["name"])}</div>
+        <div class="x-muted" id="secdesc" data-on="{esc(desc_on)}" data-off="{esc(desc_off)}">{esc(desc_on if on else desc_off)}</div></div>
+    </div>
+  </form>{virtual_note}
+</div>
+<style>.sec-big .sec-toggle{{font-size:15px}}.sec-big .sec-toggle .track{{width:54px;height:30px}}
+.sec-big .sec-toggle .track::after{{width:24px;height:24px;top:2px;left:2px}}
+.sec-big .sec-toggle.on .track::after{{transform:translateX(24px)}}
+#fine.dim{{opacity:.55}}.x-stack>*{{margin-bottom:14px}}.x-stack textarea{{width:100%}}</style>
+<div class="section-head x-sec"><h2>Secretary-Feineinstellungen</h2></div>
+<div class="flash err" id="secnote" {"hidden" if on else ""} style="margin-bottom:14px">Der Secretary ist für {esc(c["name"])} <b>aus</b> — diese Einstellungen greifen erst, wenn du ihn oben einschaltest.</div>
+<form method="post" action="{form_action}" class="x-stack {"" if on else "dim"}" id="fine">
+<input type="hidden" name="csrf" value="{esc(token)}">{virtual_field}
+<div class="panel"><div class="section-head"><h2>Wie antwortet der Secretary?</h2></div>
+  <div class="x-grid2">
+    <div class="field"><label>Stil</label>{_select("style", style_keys, cur_style)}
+      <input type="text" name="style_custom" value="{esc(c["style"] if cur_style == "__custom__" else "")}" placeholder="Eigener Stil (nur bei „Eigener Text“)" style="margin-top:8px">
+      <details><summary class="x-muted">Stil-Vorschau</summary>{style_samples}</details></div>
+    <div class="field"><label>Vorgehen</label>{_select("rule", rule_opts, c["rule"])}
+      <div class="help">Standard: es gilt die Vertrauensstufe. „Immer erst Bahrian fragen“ schickt jede Antwort zur Freigabe an dich.</div></div>
+  </div>
+  <div class="field"><label>Anweisung (verbindlich)</label>
+    <textarea name="instruction" rows="3" placeholder="z. B. „Duze sie immer, erwähne nie meinen Stundenplan.“">{esc(c["instruction"])}</textarea></div>
+</div>
+<div class="panel"><div class="section-head"><h2>Was darf {"die Gruppe" if is_group else "sie/er"} über dich erfahren?</h2></div>
+  <div class="x-grid2">
+    <div class="field"><label>{esc(cards.TOPIC_LABELS["availability"])}</label>{_select("share_availability", SHARE_LEVEL_LABELS, share["availability"])}</div>
+    {"".join(f'<div class="field"><label>{esc(cards.TOPIC_LABELS[t])}</label>{_select("share_" + t, YESNO_LABELS, share[t])}</div>' for t in cards.SHARE_TOPICS[1:])}
+  </div>
+  <p class="x-muted">„Standard“ heißt: es gilt die Vertrauensstufe. Alles darüber fragt der Secretary bei dir nach.</p>
+</div>
+{group_block}
+<div class="panel"><div class="section-head"><h2>Wann ist der Secretary für {esc(c["name"])} aktiv?</h2></div>
+  <div class="x-form">
+    <div class="field"><label>Zeiten</label>{_select("active_mode", active_opts, cur_active)}</div>
+    <div class="field"><label>Von</label><input type="text" name="active_start" value="{esc(c["active"]["start"])}" placeholder="08:00" style="min-width:80px"></div>
+    <div class="field"><label>Bis</label><input type="text" name="active_end" value="{esc(c["active"]["end"])}" placeholder="20:00" style="min-width:80px"></div>
+  </div>
+  <div class="field"><label>Tage (leer = alle)</label>{days}</div>
+</div>
+<div class="panel"><div class="section-head"><h2>Person &amp; Vertrauen</h2></div>
+  <div class="x-grid2">
+    <div class="field"><label>Name</label><input type="text" name="name" value="{esc(c["name"])}" required></div>
+    <div class="field"><label>Beziehung</label><input type="text" name="relationship" value="{esc(c["relationship"])}" placeholder="Freundin, Lehrer, Verein …"></div>
+    <div class="field"><label>Vertrauensstufe</label>{_select("trust_tier", TIER_LABELS, c["trust_tier"])}</div>
+    <div class="field"><label>Modell nur für {who}</label>{_select("model", model_opts, cur_model)}</div>
+  </div>
+  <div class="field"><label>Kennungen (eine pro Zeile: kanal: kennung)</label>
+    <textarea name="handles" rows="3" placeholder="whatsapp: +49 171 1234567&#10;signal: +49 …">{esc(cards.handles_text(c))}</textarea>
+    <div class="help">Nummern werden tolerant verglichen (0171… = +49 171…). Kanäle: whatsapp, signal, telegram, email.</div></div>
+  <div class="field"><label>Notizen (nur für dich)</label><textarea name="notes" rows="2">{esc(c["notes"])}</textarea></div>
+</div>
+<div><button class="btn" type="submit">Speichern</button></div>
+</form>
+{extras}{_SEC_JS}"""
+
+
+@router.get("/admin/contacts/open", response_class=HTMLResponse)
+async def contact_open(request: Request, _: bool = Depends(auth.require_admin), ref: str = ""):
+    """Kontakt ohne Karte öffnen: Detailansicht auf Basis der bekannten Daten, ohne etwas zu speichern."""
+    r = cards.decode_ref(ref)
+    if not r or "handle" not in r:
+        return RedirectResponse("/admin/contacts", status_code=303)
+    existing = cards.find_in(await cards.load_all(force=True), r["channel"], r["handle"])
+    if existing:                                                     # inzwischen angelegt
+        return RedirectResponse(f"/admin/contacts/{quote(existing['key'])}", status_code=303)
+    token = await auth.issue_csrf()
+    kind = "group" if cards.is_group_handle(r["channel"], r["handle"]) else "person"
+    card = cards.new_card(kind, r["name"] or r["handle"], [{"channel": r["channel"], "id": r["handle"]}])
+    card["trust_tier"] = 3 if kind == "group" else r["tier"]
+    try:
+        seen = await db.usage_models_seen()
+    except Exception:  # noqa: BLE001
+        seen = []
+    html = _render_card_editor(card, token, "", models.model_config_snapshot(), seen, virtual_ref=ref)
+    return _html_with_csrf(_shell(card["name"], html, "contacts"), token)
 
 
 @router.get("/admin/contacts/{key}", response_class=HTMLResponse)
@@ -664,8 +748,7 @@ async def _card_for_ref(ref: dict, existing: list[dict], by_key: dict, keys: set
     while card["key"] in keys:
         card["key"], i = f"{base}_{i}", i + 1
     keys.add(card["key"])
-    if kind == "group":
-        card["trust_tier"] = 3
+    card["trust_tier"] = 3 if kind == "group" else int(ref.get("tier", 3))
     return card
 
 
@@ -691,7 +774,10 @@ async def contacts_secretary_toggle(request: Request, _: bool = Depends(auth.req
     await db.audit("card_secretary_toggled", actor="owner", detail={"key": saved["key"], "on": on})
     if wants_json:
         return JSONResponse({"ok": True, "on": on, "key": saved["key"], "name": saved["name"]})
-    return RedirectResponse(f"/admin/contacts?saved={'secon' if on else 'secoff'}", status_code=303)
+    flag_saved = "secon" if on else "secoff"
+    if str(form.get("back") or "") == "detail":            # Schalter auf der Detailseite → dort bleiben
+        return RedirectResponse(f"/admin/contacts/{quote(saved['key'])}?saved={flag_saved}", status_code=303)
+    return RedirectResponse(f"/admin/contacts?saved={flag_saved}", status_code=303)
 
 
 @router.post("/admin/contacts/bulk")
@@ -735,6 +821,23 @@ async def contacts_bulk(request: Request, _: bool = Depends(auth.require_admin))
     return RedirectResponse(f"/admin/contacts?saved={saved}&n={n}", status_code=303)
 
 
+@router.post("/admin/contacts/create")
+async def contact_create_from_ref(request: Request, _: bool = Depends(auth.require_admin)):
+    """Erstes Speichern eines Kontakts ohne Karte."""
+    form, ok = await _csrf_form(request)
+    if not ok:
+        return JSONResponse({"ok": False, "error": "CSRF-Prüfung fehlgeschlagen."}, status_code=403)
+    ref = cards.decode_ref(str(form.get("ref") or ""))
+    if not ref or "handle" not in ref:
+        return RedirectResponse("/admin/contacts", status_code=303)
+    existing = await cards.load_all(force=True)
+    card = await _card_for_ref(ref, existing, {c["key"]: c for c in existing}, {c["key"] for c in existing})
+    new = cards.card_from_form(form, card)
+    saved = await cards.save_card(new)
+    await db.audit("card_created", actor="owner", detail={"key": saved["key"], "from": "contact"})
+    return RedirectResponse(f"/admin/contacts/{quote(saved['key'])}?saved=saved", status_code=303)
+
+
 @router.post("/admin/contacts/{key}")
 async def contact_save(key: str, request: Request, _: bool = Depends(auth.require_admin)):
     form, ok = await _csrf_form(request)
@@ -744,6 +847,8 @@ async def contact_save(key: str, request: Request, _: bool = Depends(auth.requir
     if not existing:
         return RedirectResponse("/admin/contacts", status_code=303)
     card = cards.card_from_form(form, existing)
+    # An/Aus gehört allein dem Schalter oben: Speichern der Feineinstellungen ändert ihn nie.
+    card = cards.set_secretary(card, cards.secretary_on(existing))
     await cards.save_card(card)
     await db.audit("card_saved", actor="owner", detail={"key": key})
     return RedirectResponse(f"/admin/contacts/{quote(key)}?saved=saved", status_code=303)

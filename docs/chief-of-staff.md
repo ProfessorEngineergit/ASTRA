@@ -13,12 +13,18 @@ und — soweit sinnvoll — per Tool durch ASTRA selbst (owner-only, im Web-Chat
 Befristete Übersteuerung (`override`) fällt danach automatisch auf den vorherigen Modus zurück.
 
 ## Kontakte & Gruppen (Karten)
-Admin → **Kontakte**: eine Liste aller Personen/Gruppen (auch solcher ohne Karte). Pro Zeile ein **Secretary-Schalter
-An/Aus** (wirkt sofort): Aus = ASTRA antwortet dieser Person/Gruppe nicht, notiert die Nachrichten aber weiter; An hebt
-„nie"/„blockieren" wieder auf. Filter „Secretary aus" zeigt alle Stummen; für die Auswahl gibt es Einschalten/Ausschalten
-als Sammelknopf. Namen anklicken = Details (dort ebenfalls der Schalter);
-**Häkchen setzen (oder „alle") → „Regeln für die Auswahl"** setzt Regel, Vertrauensstufe, Stil, Freigaben, Aktivzeiten,
-Modell und Gruppen-Trigger in einem Rutsch (nur was geändert wird, sonst bleibt alles wie es ist).
+Admin → **Kontakte** (alles dort sind **Secretary-Einstellungen**): eine Liste aller Personen/Gruppen, auch solcher ohne Karte.
+
+- **Kontakt anklicken** (ganze Zeile): Oben steht der große **Secretary-Schalter An/Aus** für diese Person/Gruppe (wirkt sofort),
+  darunter die **Feineinstellungen**: Wie antwortet der Secretary (Stil, Vorgehen, Anweisung) · Was darf sie/er erfahren ·
+  Wann aktiv · Person & Vertrauen. Ist der Schalter aus, werden die Einstellungen abgedunkelt mit Hinweis; Speichern ändert den
+  Schalter nie.
+- **Aus** = der Secretary antwortet dieser Person/Gruppe nicht, notiert die Nachrichten aber weiter; **An** hebt „nie"/„blockieren"
+  wieder auf. Kontakte ohne Karte lassen sich öffnen, ohne dass etwas gespeichert wird (bis du schaltest oder speicherst); die
+  bekannte Vertrauensstufe bleibt dabei erhalten.
+- **In der Liste:** ein Schalter pro Zeile, Filter „Secretary aus", und für mehrere/alle Angehakten Sammelknöpfe Einschalten/
+  Ausschalten sowie „Regeln für die Auswahl" (Regel, Vertrauensstufe, Stil, Freigaben, Aktivzeiten, Modell, Gruppen-Trigger — nur
+  was du änderst, wird gesetzt).
 
 Eine Karte enthält: Regel (nie/fragen/erlaubt/direkt) · Vertrauensstufe 0–3 · Stil · Anweisung · Freigaben
 (Kalender gestuft, Ort/Schule/Kontaktdaten/Persönliches ja/nein) · Aktivzeiten · eigenes Modell · Notizen ·
