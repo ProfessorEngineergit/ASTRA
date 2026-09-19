@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
 from .. import __version__ as ASTRA_VERSION
-from .. import db, knowledge, model_choice, models, sysinfo, usage
+from .. import db, google_hub, google_oauth, knowledge, model_choice, models, sysinfo, usage
 from ..config import get_settings
 from ..config_store import SECRET_SENTINEL, get_config_store
 from ..google_oauth import authorization_url, exchange_code, token_patch, user_email
@@ -769,6 +769,20 @@ def _field_input(f, value, is_set: bool) -> str:
     return f'<input type="{itype}" name="{esc(f.key)}" value="{esc(value if value is not None else "")}">'
 
 
+def _google_account_select(value) -> str:
+    """Konto-Auswahl im Plugin-Formular: Standardkonto · verbundene Konten · eigene Zugangsdaten."""
+    cur = str(value or "")
+    accounts = google_hub.summary()["accounts"]
+    default = next((a["email"] for a in accounts if a["default"]), "")
+    opts = [("", f"Standardkonto{f' ({default})' if default else ' (keins verbunden)'}")]
+    opts += [(a["id"], a["email"]) for a in accounts]
+    opts.append((google_oauth.ACCOUNT_LEGACY, "Eigene Zugangsdaten dieses Plugins"))
+    if cur and cur not in {o[0] for o in opts}:
+        opts.append((cur, f"{cur} (nicht mehr vorhanden)"))
+    inner = "".join(f'<option value="{esc(v)}"{" selected" if v == cur else ""}>{esc(l)}</option>' for v, l in opts)
+    return f'<select name="google_account">{inner}</select>'
+
+
 @router.get("/admin/plugin/{slug}", response_class=HTMLResponse)
 async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.require_admin),
                       saved: str = "", installation: str = "default", oauth: str = ""):
@@ -792,8 +806,14 @@ async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.requir
         val = "" if f.secret else active_inst.get(f.key, f.default)
         help_ = f'<div class="help">{esc(f.help)}</div>' if f.help else ""
         req = ' <span class="req">*</span>' if f.required else ""
+        if f.key == "google_account" and getattr(cls, "google_scopes", None):
+            input_html = _google_account_select(val)
+            help_ = ('<div class="help">Verwaltung aller Konten: <a href="/admin/google">Admin → Google</a>. '
+                     '„Eigene Zugangsdaten“ nutzt Client-ID/-Secret/Token weiter unten in diesem Formular.</div>')
+        else:
+            input_html = _field_input(f, val, meta.get(f.key, False))
         fields_html += (f'<div class="field"><label>{esc(f.label)}{req}</label>'
-                        f'{_field_input(f, val, meta.get(f.key, False))}{help_}</div>')
+                        f'{input_html}{help_}</div>')
 
     soon = getattr(cls, "coming_soon", False)
     soon_banner = ('<div class="flash err">Dieses Plugin ist im Katalog gelistet, aber noch '
@@ -815,16 +835,26 @@ async def plugin_form(slug: str, request: Request, _: bool = Depends(auth.requir
     oauth_html = ""
     scopes = getattr(cls, "google_scopes", [])
     if scopes:
-        connected = active_inst.get("account_email") or ("Token gesetzt" if meta.get("refresh_token") else "nicht verbunden")
+        route_kind, route_acct = google_oauth.route(active_inst.cfg)
+        if route_kind == "hub":
+            acct = google_hub.resolve(route_acct)
+            connected = (f"Zentrales Konto: {acct['email']}" if acct else "kein Google-Konto verbunden")
+        else:
+            connected = active_inst.get("account_email") or ("Token gesetzt" if meta.get("refresh_token") else "nicht verbunden")
         oauth_html = f"""
         <div class="panel" style="margin-top:14px">
-          <div class="row" style="justify-content:space-between;align-items:center">
-            <div><h2 style="margin:0;font-size:16px">Google OAuth</h2>
-              <div class="note">Status: {esc(connected)} · Redirect: {esc(str(request.url_for("oauth_google_callback")))}</div></div>
-            <button class="btn sm" type="submit" form="plugin-config-form"
-                    formaction="/admin/plugin/{esc(slug)}/oauth/google/start" formmethod="post"
-                    name="oauth_connect" value="1">Mit Google verbinden</button>
+          <div class="row" style="justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+            <div><h2 style="margin:0;font-size:16px">Google-Anmeldung</h2>
+              <div class="note">{esc(connected)}</div></div>
+            <a class="btn sm" href="/admin/google">Google-Konten verwalten</a>
           </div>
+          <details style="margin-top:12px"><summary class="note">Eigene Zugangsdaten nur für dieses Plugin (Erweitert)</summary>
+            <div class="row" style="justify-content:space-between;align-items:center;margin-top:10px">
+              <div class="note">Redirect: {esc(str(request.url_for("oauth_google_callback")))} — Google akzeptiert das nur bei https-Domain oder localhost.</div>
+              <button class="btn ghost sm" type="submit" form="plugin-config-form"
+                      formaction="/admin/plugin/{esc(slug)}/oauth/google/start" formmethod="post"
+                      name="oauth_connect" value="1">Mit eigenem Client verbinden</button>
+            </div></details>
         </div>"""
     test_btn = ('' if soon else
                 '<button class="btn secondary" type="button" id="testbtn">Verbindung testen</button>'
@@ -1058,6 +1088,10 @@ async def plugin_google_oauth_start(slug: str, request: Request, _: bool = Depen
 @router.get("/admin/oauth/google/callback", name="oauth_google_callback")
 async def oauth_google_callback(request: Request, code: str = "", state: str = "", error: str = ""):
     if error:
+        pre = await auth.read_oauth_state(state) if state.startswith("v1.") else None
+        if pre and pre.get("provider") == "google_hub":
+            from .admin_google import finish
+            return await finish("", state, error)
         return HTMLResponse(page("OAuth", f'<div class="flash err">Google OAuth: {esc(error)}</div>'), 400)
     if state.startswith("v1."):
         state_data = await auth.read_oauth_state(state)
@@ -1065,6 +1099,9 @@ async def oauth_google_callback(request: Request, code: str = "", state: str = "
         # Existing OAuth attempts created before 0.15.13 used a random state
         # stored in Postgres. Keep them valid during the rolling update.
         state_data = await db.get_setting(f"oauth_state:{state}", None)
+    if state_data and state_data.get("provider") == "google_hub":
+        from .admin_google import finish
+        return await finish(code, state, "")
     if not state_data or state_data.get("provider") != "google":
         return HTMLResponse(page("OAuth", '<div class="flash err">OAuth-State ungueltig oder abgelaufen.</div>'), 400)
     mgr = get_manager()

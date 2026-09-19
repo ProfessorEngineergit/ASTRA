@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 
-from . import cards, db, digest, owner_commands, prompts, styles, usage
+from . import cards, db, digest, google_hub, owner_commands, prompts, styles, usage
 from .config import get_settings
 from .tools import Tool, ToolContext, register, tool_result
 
@@ -182,6 +182,45 @@ async def _prompt_propose(args: dict, ctx: ToolContext) -> str:
         f"Vorschlag {pid} gespeichert. Er wirkt NICHT, bis Bahrian ihn unter Admin → Prompts freigibt."))
 
 
+# ─── Google-Konten ────────────────────────────────────────────────────────────
+async def _google_accounts(args: dict, ctx: ToolContext) -> str:
+    await google_hub.load()
+    summ = google_hub.summary()
+    if not summ["accounts"]:
+        return tool_result(ok=True, summary="Kein Google-Konto verbunden (Admin → Google).", data=[], source="google")
+    lines = [f'{"★ " if a["default"] else ""}{a["email"]} — ' + (", ".join(google_hub.PRODUCTS[p].label for p in a["products"]) or "keine Produkte")
+             + ("" if a["status"] == "ok" else " (neu verbinden!)") for a in summ["accounts"]]
+    return tool_result(ok=True, summary="\n".join(lines), source="google",
+                       data=[{"id": a["id"], "email": a["email"], "default": a["default"], "products": a["products"],
+                              "status": a["status"]} for a in summ["accounts"]])
+
+
+async def _google_default(args: dict, ctx: ToolContext) -> str:
+    await google_hub.load()
+    q = str(args.get("account") or "").strip().lower()
+    hits = [a for a in google_hub.summary()["accounts"] if q and (q == a["id"] or q in a["email"].lower())]
+    if len(hits) != 1:
+        return tool_result(ok=False, source="google", summary=(
+            "Kein eindeutiges Konto gefunden." if not hits else "Mehrdeutig: " + ", ".join(a["email"] for a in hits)))
+    await google_hub.set_default(hits[0]["id"])
+    await db.audit("google_default_set", actor="astra", detail={"account": hits[0]["id"]})
+    return tool_result(ok=True, source="google", summary=f"Standard-Google-Konto ist jetzt {hits[0]['email']}.")
+
+
+async def _google_test(args: dict, ctx: ToolContext) -> str:
+    await google_hub.load()
+    q = str(args.get("account") or "").strip().lower()
+    accts = google_hub.summary()["accounts"]
+    hit = next((a for a in accts if q and (q == a["id"] or q in a["email"].lower())), None) if q else \
+        next((a for a in accts if a["default"]), None)
+    if not hit:
+        return tool_result(ok=False, source="google", summary="Kein Google-Konto gefunden.")
+    results = [await google_hub.probe(hit["id"], p) for p in hit["products"]]
+    lines = [("✅ " if r["ok"] else "❌ ") + r["message"] + (f" ({r['action_url']})" if r["action_url"] else "") for r in results]
+    return tool_result(ok=all(r["ok"] for r in results), source="google",
+                       summary=f"{hit['email']}:\n" + ("\n".join(lines) or "keine Produkte freigegeben"))
+
+
 def register_chief_tools() -> None:
     def reg(**kw):
         register(Tool(owner_only=True, **kw))
@@ -218,6 +257,16 @@ def register_chief_tools() -> None:
     reg(name="context_forget", handler=_context_forget, safety="destructive", intents=["control"],
         description="Journal, Rohlog und Zusammenfassung einer Person/Gruppe restlos löschen.",
         parameters={"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]})
+    reg(name="google_accounts", handler=_google_accounts, safety="private_read", intents=["status"],
+        description="Verbundene Google-Konten mit freigegebenen Produkten (Kalender, Aufgaben, Gmail) und Standardkonto.",
+        parameters={"type": "object", "properties": {}})
+    reg(name="google_set_default_account", handler=_google_default, safety="mutation", intents=["control"],
+        description="Standard-Google-Konto wechseln (E-Mail oder Teil davon).",
+        parameters={"type": "object", "properties": {"account": {"type": "string"}}, "required": ["account"]},
+        examples=["Nimm ab jetzt mein Schulkonto bei Google"])
+    reg(name="google_test", handler=_google_test, safety="private_read", intents=["status"],
+        description="Google-Zugriff eines Kontos prüfen (Kalender/Aufgaben/Gmail) und Fehlerursache erklären.",
+        parameters={"type": "object", "properties": {"account": {"type": "string"}}})
     reg(name="prompt_show", handler=_prompt_show, safety="private_read", intents=["search"],
         description="Einen System-Prompt-Baustein lesen: " + ", ".join(prompts.NAMES) + ".",
         parameters={"type": "object", "properties": {"name": {"type": "string", "enum": list(prompts.NAMES)}},

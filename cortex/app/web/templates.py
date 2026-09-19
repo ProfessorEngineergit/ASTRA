@@ -1052,6 +1052,7 @@ def page(
         navhtml = (
             '<nav>'
             f'{navlink("/admin", "Plugins", "plugins")}'
+            f'{navlink("/admin/google", "Google", "google")}'
             f'{navlink("/admin/chat", "Chat", "chat")}'
             f'{navlink("/admin/brain", "Wissen", "brain")}'
             f'{navlink("/admin/prompts", "Prompts", "prompts")}'

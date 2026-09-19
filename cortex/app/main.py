@@ -42,6 +42,7 @@ from .integrations.transcription import get_transcriber
 from .plugins.registry import get_manager
 from .web import admin as web_admin
 from .web import admin_extra as web_admin_extra
+from .web import admin_google as web_admin_google
 from .web import auth as web_auth
 
 log = logging.getLogger("astra.main")
@@ -345,6 +346,13 @@ async def lifespan(app: FastAPI):
     await db.init_pool()
     await web_auth.ensure_password_from_env()
 
+    # Zentrale Google-Konten VOR den Plugins laden (deren Health-Checks fragen sie synchron ab).
+    try:
+        from . import google_hub
+        await google_hub.load(force=True)
+    except Exception:  # noqa: BLE001
+        log.warning("Google-Konten konnten nicht geladen werden.", exc_info=True)
+
     # Load plugins → register their tools + start their background tasks.
     await get_manager().rebuild()
 
@@ -441,6 +449,7 @@ if _STATIC_DIR.is_dir():
 
 app.include_router(web_admin.router)
 app.include_router(web_admin_extra.router)
+app.include_router(web_admin_google.router)
 
 
 # ─── Auth helper ──────────────────────────────────────────────────────────────

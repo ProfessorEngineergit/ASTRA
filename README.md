@@ -161,6 +161,9 @@ curl -X POST localhost:8088/briefing/run -H "X-Astra-Secret: $CORTEX_SHARED_SECR
 Secretary-Schalter, Personen-/Gruppenkarten mit Sammelaktionen, Moderations-Leiter, Kontext-Journal, Prompt-Werkstatt,
 Token-/Kostenübersicht und Modellwahl pro Chat — Details in [`docs/chief-of-staff.md`](docs/chief-of-staff.md).
 
+### 🔐 Google-Konten
+Zentrale Anmeldung für Kalender, Aufgaben und Gmail mit mehreren Konten und Kontowechsel — siehe [`docs/google.md`](docs/google.md).
+
 ### 📊 Dashboard
 Status-GUI (read-only) unter **`http://127.0.0.1:8088/dashboard`** — aktive Threads, offene Freigaben, Audit-Log, welche Fähigkeiten live sind. Hinter VPN/Caddy halten.
 

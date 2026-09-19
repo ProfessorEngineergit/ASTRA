@@ -6,6 +6,7 @@ from urllib.parse import urlencode
 
 import httpx
 
+from . import google_hub
 from .plugins.base import ConfigField, FieldType
 
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -13,8 +14,14 @@ TOKEN_URL = "https://oauth2.googleapis.com/token"
 USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 
 
+ACCOUNT_LEGACY = "legacy"
+
+
 def google_oauth_fields() -> list[ConfigField]:
     return [
+        ConfigField("google_account", "Google-Konto", required=False,
+                    help="Leer = Standardkonto aus Admin → Google. Oder die Konto-ID / „legacy“ für die "
+                         "eigenen Zugangsdaten dieses Plugins (unten). Auswahl am besten unter Admin → Google."),
         ConfigField("client_id", "Google OAuth Client ID", required=False,
                     help="Google Cloud Console -> OAuth Client (Web application)."),
         ConfigField("client_secret", "Google OAuth Client Secret", FieldType.PASSWORD,
@@ -28,8 +35,28 @@ def google_oauth_fields() -> list[ConfigField]:
     ]
 
 
-def has_google_connection(cfg: dict) -> bool:
+def _legacy_ready(cfg: dict) -> bool:
     return bool(cfg.get("client_id") and cfg.get("client_secret") and cfg.get("refresh_token"))
+
+
+def route(cfg: dict) -> tuple[str, str]:
+    """Woher kommt der Zugriff? → ("hub", konto_id | "") oder ("legacy", "").
+
+    Ausdrücklich gewähltes Konto gewinnt; sonst bleiben bestehende Plugin-eigene Tokens bewusst
+    in Betrieb (nichts bricht beim Update); erst ohne die gilt das Standardkonto der Zentrale."""
+    acct = str(cfg.get("google_account") or "").strip()
+    if acct == ACCOUNT_LEGACY:
+        return "legacy", ""
+    if acct:
+        return "hub", acct
+    if _legacy_ready(cfg):
+        return "legacy", ""
+    return "hub", ""
+
+
+def has_google_connection(cfg: dict) -> bool:
+    kind, acct = route(cfg)
+    return _legacy_ready(cfg) if kind == "legacy" else google_hub.usable(acct)
 
 
 def authorization_url(*, client_id: str, redirect_uri: str, scopes: list[str], state: str) -> str:
@@ -68,6 +95,9 @@ async def user_email(access_token: str) -> str:
 
 
 async def access_token(plugin) -> str:
+    kind, acct = route(plugin.cfg if hasattr(plugin, "cfg") else {})
+    if kind == "hub":
+        return await google_hub.access_token(acct)
     token = str(plugin.get("access_token") or "")
     try:
         expires_at = float(plugin.get("expires_at") or 0)
@@ -86,18 +116,24 @@ async def access_token(plugin) -> str:
             "refresh_token": refresh,
             "grant_type": "refresh_token",
         })
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise google_hub.GoogleApiError(google_hub.explain_error(r.status_code, google_hub._body(r)))
         data = r.json()
     return str(data["access_token"])
 
 
 async def google_api(plugin, method: str, url: str, **kwargs) -> httpx.Response:
+    kind, acct = route(plugin.cfg if hasattr(plugin, "cfg") else {})
+    if kind == "hub":
+        return await google_hub.api(acct, method, url, **kwargs)
     token = await access_token(plugin)
     headers = dict(kwargs.pop("headers", {}) or {})
     headers["Authorization"] = f"Bearer {token}"
     async with httpx.AsyncClient(timeout=25) as c:
         r = await c.request(method, url, headers=headers, **kwargs)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise google_hub.GoogleApiError(
+                google_hub.explain_error(r.status_code, google_hub._body(r), google_hub.product_for_url(url)))
         return r
 
 

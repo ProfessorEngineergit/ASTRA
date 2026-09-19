@@ -159,3 +159,20 @@ def test_usage_report_tool_clamps_arguments(env, monkeypatch):
     assert call("usage_report", {"period": "week", "by": "purpose"})["summary"] == "Bericht"
     call("usage_report", {"period": "'; drop", "by": "??"})
     assert got["a"] == ("month", "model")
+
+
+def test_google_tools_list_switch_and_test_accounts(env, hub):
+    from app import google_hub as gh
+    asyncio.run(gh.set_client("cid", "sek"))
+    asyncio.run(gh.upsert_account(email="a@b.de", refresh_token="RT-A", scopes=gh.scopes_for(["calendar"])))
+    asyncio.run(gh.upsert_account(email="schule@x.de", refresh_token="RT-S", scopes=gh.scopes_for(["tasks"])))
+    lst = call("google_accounts", {})
+    assert "★ a@b.de" in lst["summary"] and "Kalender" in lst["summary"] and "Aufgaben" in lst["summary"]
+    assert call("google_set_default_account", {"account": "schule"})["ok"] and gh.summary()["default"] == "schule_x_de"
+    assert not call("google_set_default_account", {"account": "gibtsnicht"})["ok"]
+    assert not call("google_set_default_account", {"account": ""})["ok"]
+    t = call("google_test", {})
+    assert t["ok"] and "schule@x.de" in t["summary"] and "Aufgaben: funktioniert" in t["summary"]
+    for name in ("google_accounts", "google_set_default_account", "google_test"):
+        assert tools.REGISTRY[name].owner_only
+    assert tools.needs_confirmation("google_set_default_account") and not tools.needs_confirmation("google_test")
