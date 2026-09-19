@@ -165,6 +165,12 @@ services:
       WHATSAPP_HOOK_EVENTS: message
       # Forward the shared secret so cortex can authenticate the webhook
       WHATSAPP_HOOK_CUSTOM_HEADERS: X-Astra-Secret:${CORTEX_SHARED_SECRET}
+      # NOWEB statt WEBJS: die WEBJS-Engine (Headless-Chromium) kann gegen aktuelles
+      # WhatsApp Web keine Empfangs-Events registrieren — Senden ging, Empfangen nie.
+      # NOWEB spricht das Protokoll direkt und liefert Events zuverlässig.
+      WHATSAPP_DEFAULT_ENGINE: NOWEB
+      # Die Box hat keine IPv6-Route; ohne das löst Node WhatsApp auf IPv6 auf.
+      NODE_OPTIONS: --dns-result-order=ipv4first
     volumes:
       - waha_data:/app/.sessions
     ports:
