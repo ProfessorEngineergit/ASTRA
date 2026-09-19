@@ -627,7 +627,8 @@ def directory(card_list: list[dict], contacts: list[dict]) -> list[dict]:
         rows.append({"key": c["key"], "name": c["name"], "kind": c["kind"], "has_card": True,
                      "channels": sorted({h["channel"] for h in c["handles"]}), "tier": c["trust_tier"],
                      "rule": c["rule"], "style": c["style"], "relationship": c["relationship"],
-                     "active": (c["active"] or {}).get("mode", "inherit"), "proposals": len(c["proposals"])})
+                     "active": (c["active"] or {}).get("mode", "inherit"), "proposals": len(c["proposals"]),
+                     "sec_on": secretary_on(c)})
     seen = set()
     for ct in contacts:
         ch, hd = str(ct.get("channel") or ""), str(ct.get("handle") or "")
@@ -639,7 +640,7 @@ def directory(card_list: list[dict], contacts: list[dict]) -> list[dict]:
                      "kind": "group" if is_group_handle(ch, hd) else "person", "has_card": False,
                      "channels": [ch], "tier": int(ct.get("trust_tier") if ct.get("trust_tier") is not None else 3),
                      "rule": "", "style": "", "relationship": str(ct.get("relationship") or ""),
-                     "active": "inherit", "proposals": 0})
+                     "active": "inherit", "proposals": 0, "sec_on": True})
     return rows
 
 
@@ -652,6 +653,8 @@ def filter_directory(rows: list[dict], *, q: str = "", scope: str = "all") -> li
         if scope == "nocard" and r["has_card"]:
             continue
         if scope == "proposals" and not r["proposals"]:
+            continue
+        if scope == "off" and r["sec_on"]:
             continue
         if q and q not in r["name"].lower() and not any(q in c for c in r["channels"]) \
                 and q not in str(r.get("handle") or "").lower():
@@ -675,3 +678,26 @@ def apply_bulk(card: dict, patch: dict) -> tuple[dict, list[str]]:
     """Wie apply_patch, aber Gruppenfelder betreffen nur Gruppen."""
     p = {k: v for k, v in patch.items() if not k.startswith("group_") or card.get("kind") == "group"}
     return apply_patch(card, p)
+
+
+# ─── Secretary pro Person/Gruppe an/aus (rein) ────────────────────────────────
+def secretary_on(card: dict | None) -> bool:
+    """Antwortet ASTRA dieser Person/Gruppe überhaupt? Aus = eigene Aktivzeit „nie“ oder Regel „blockieren“.
+    Eine Person ohne Karte folgt dem globalen Secretary (also: an)."""
+    if not card:
+        return True
+    return (card.get("active") or {}).get("mode") != "never" and card.get("rule") != "block"
+
+
+def set_secretary(card: dict, on: bool) -> dict:
+    """Schalter setzen. AUS: ASTRA schweigt (Nachrichten werden weiter notiert). AN: die Sperren
+    (nie / blockieren) fallen weg, ansonsten bleibt alles wie eingestellt."""
+    c = sanitize(card)
+    if on:
+        if c["active"]["mode"] == "never":
+            c["active"]["mode"] = "inherit"
+        if c["rule"] == "block":
+            c["rule"] = ""
+    else:
+        c["active"]["mode"] = "never"
+    return sanitize(c)

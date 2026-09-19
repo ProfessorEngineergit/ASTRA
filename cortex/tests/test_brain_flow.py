@@ -588,3 +588,26 @@ def test_owner_usage_command_returns_the_report_without_llm(flow, monkeypatch):
     monkeypatch.setattr(brain.usage, "report", fake_report)
     _owner_says(flow, "/verbrauch woche zweck")
     assert seen["args"] == ("week", "purpose") and "3 Aufrufe" in flow.sent_texts[-1] and flow.replies == []
+
+
+# ─── Secretary-Schalter pro Person/Gruppe ─────────────────────────────────────
+def test_person_switched_off_gets_no_reply_but_message_is_still_noted(flow):
+    card = flow.add_card(name="Lena", handles=[{"channel": "waha", "id": "491511111111@c.us"}])
+    flow.db.cards_[card["key"]] = cards.set_secretary(card, False)
+    cards.invalidate()
+    flow.inbound("Hey, bist du da?")
+    assert flow.sent == [] and flow.replies == []
+    assert any(m["content"] == "Hey, bist du da?" for m in flow.db.messages)          # weiter notiert
+    flow.db.cards_[card["key"]] = cards.set_secretary(flow.db.cards_[card["key"]], True)
+    cards.invalidate()
+    flow.inbound("Und jetzt?")
+    assert len(flow.replies) == 1 and len(flow.sent) == 1
+
+
+def test_group_switched_off_stays_silent_even_when_mentioned(flow):
+    card = flow.add_card(kind="group", name="Astroclub", handles=[{"channel": "waha", "id": "12345-6789@g.us"}],
+                         group={"trigger": "mention", "role": "assistant"})
+    flow.db.cards_[card["key"]] = cards.set_secretary(card, False)
+    cards.invalidate()
+    flow.group("@Bahrian bist du da?", meta={"mentioned_us": True})
+    assert flow.sent == [] and flow.replies == []

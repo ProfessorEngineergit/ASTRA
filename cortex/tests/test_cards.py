@@ -381,3 +381,31 @@ def test_bulk_patch_semantics_and_group_fields_only_hit_groups():
     assert "group_trigger" not in changed and new["group"]["trigger"] == "mention"
     grp = cards.sanitize({"kind": "group", "name": "Club"})
     assert cards.apply_bulk(grp, patch)[0]["group"]["trigger"] == "always"
+
+
+# ─── Secretary-Schalter pro Person ────────────────────────────────────────────
+def test_secretary_on_semantics_and_setting():
+    assert cards.secretary_on(None) is True                                  # ohne Karte: folgt dem globalen Secretary
+    lena = cards.sanitize({"name": "Lena"})
+    assert cards.secretary_on(lena) is True
+    off = cards.set_secretary(lena, False)
+    assert cards.secretary_on(off) is False and off["active"]["mode"] == "never"
+    back = cards.set_secretary(off, True)
+    assert cards.secretary_on(back) is True and back["active"]["mode"] == "inherit"
+    blocked = cards.sanitize({"name": "Spam", "rule": "block"})
+    assert cards.secretary_on(blocked) is False
+    assert cards.set_secretary(blocked, True)["rule"] == ""                  # Einschalten hebt die Sperre auf
+
+
+def test_switching_on_keeps_other_settings_and_always_window():
+    card = cards.sanitize({"name": "Lena", "style": "arrogant", "rule": "ask", "active": {"mode": "always"}})
+    on = cards.set_secretary(card, True)
+    assert on["style"] == "arrogant" and on["rule"] == "ask" and on["active"]["mode"] == "always"
+    assert cards.set_secretary(card, False)["style"] == "arrogant"
+
+
+def test_directory_reports_secretary_state_and_off_scope():
+    rows = cards.directory([cards.set_secretary(cards.sanitize({"name": "Lena"}), False),
+                            cards.sanitize({"name": "Tom"})], [{"channel": "waha", "handle": "4915@c.us", "display_name": "Mia"}])
+    assert {r["name"]: r["sec_on"] for r in rows} == {"Lena": False, "Tom": True, "Mia": True}
+    assert [r["name"] for r in cards.filter_directory(rows, scope="off")] == ["Lena"]

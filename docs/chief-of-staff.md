@@ -13,7 +13,10 @@ und — soweit sinnvoll — per Tool durch ASTRA selbst (owner-only, im Web-Chat
 Befristete Übersteuerung (`override`) fällt danach automatisch auf den vorherigen Modus zurück.
 
 ## Kontakte & Gruppen (Karten)
-Admin → **Kontakte**: eine Liste aller Personen/Gruppen (auch solcher ohne Karte). Namen anklicken = Details;
+Admin → **Kontakte**: eine Liste aller Personen/Gruppen (auch solcher ohne Karte). Pro Zeile ein **Secretary-Schalter
+An/Aus** (wirkt sofort): Aus = ASTRA antwortet dieser Person/Gruppe nicht, notiert die Nachrichten aber weiter; An hebt
+„nie"/„blockieren" wieder auf. Filter „Secretary aus" zeigt alle Stummen; für die Auswahl gibt es Einschalten/Ausschalten
+als Sammelknopf. Namen anklicken = Details (dort ebenfalls der Schalter);
 **Häkchen setzen (oder „alle") → „Regeln für die Auswahl"** setzt Regel, Vertrauensstufe, Stil, Freigaben, Aktivzeiten,
 Modell und Gruppen-Trigger in einem Rutsch (nur was geändert wird, sonst bleibt alles wie es ist).
 

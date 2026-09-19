@@ -578,3 +578,60 @@ def test_bulk_requires_csrf_and_cannot_write_arbitrary_fields(bulkdb):
     c.post("/admin/contacts/bulk", data={"csrf": csrf, "sel": "card:lena", "b_rule": "root", "b_key": "hack",
                                          "b_handles": "x"}, follow_redirects=False)
     assert bulkdb["lena"]["rule"] == "" and bulkdb["lena"]["key"] == "lena"
+
+
+# ─── Secretary-Schalter in der Liste ──────────────────────────────────────────
+def test_secretary_toggle_json_flips_and_creates_cards_for_cardless_contacts(bulkdb):
+    c = _client()
+    _create(c)
+    page = c.get("/admin/contacts").text
+    assert 'role="switch"' in page and ">An<" in page and "Secretary" in page
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    ref = _ref_for(page, "Lena")
+    r = c.post("/admin/contacts/secretary", data={"csrf": csrf, "toggle": ref + "|0"},
+               headers={"Accept": "application/json"})
+    assert r.json() == {"ok": True, "on": False, "key": "lena", "name": "Lena"}
+    assert bulkdb["lena"]["active"]["mode"] == "never"
+    assert ">Aus<" in c.get("/admin/contacts").text
+    assert "Lena" in c.get("/admin/contacts?scope=off").text
+    csrf = c.cookies.get(auth.CSRF_COOKIE)                    # jede Seite stellt ein neues Token aus
+    r = c.post("/admin/contacts/secretary", data={"csrf": csrf, "toggle": ref + "|1"}, headers={"Accept": "application/json"})
+    assert r.json()["on"] is True and bulkdb["lena"]["active"]["mode"] == "inherit"
+    tom = _ref_for(c.get("/admin/contacts").text, "Tom")
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    r = c.post("/admin/contacts/secretary", data={"csrf": csrf, "toggle": tom + "|0"}, headers={"Accept": "application/json"})
+    assert r.json()["on"] is False and bulkdb["tom"]["active"]["mode"] == "never"      # Karte neu angelegt
+
+
+def test_secretary_toggle_without_js_redirects_and_validates(bulkdb):
+    c = _client()
+    _create(c)
+    csrf = _csrf(c, "/admin/contacts")
+    r = c.post("/admin/contacts/secretary", data={"csrf": csrf, "toggle": "card:lena|0"}, follow_redirects=False)
+    assert r.status_code == 303 and "secoff" in r.headers["location"]
+    for bad in ("card:lena|2", "müll|1", "|", ""):
+        r = c.post("/admin/contacts/secretary", data={"csrf": csrf, "toggle": bad}, headers={"Accept": "application/json"})
+        assert r.status_code == 400, bad
+    assert c.post("/admin/contacts/secretary", data={"csrf": csrf, "toggle": "card:gibtsnicht|1"},
+                  headers={"Accept": "application/json"}).status_code == 404
+    assert c.post("/admin/contacts/secretary", data={"csrf": "x", "toggle": "card:lena|0"}).status_code == 403
+
+
+def test_bulk_secretary_off_and_on_for_selection(bulkdb):
+    c = _client()
+    _create(c)
+    page = c.get("/admin/contacts").text
+    assert "Ausschalten" in page and "Einschalten" in page
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    sel = [_ref_for(page, "Lena"), _ref_for(page, "Tom"), _ref_for(page, "Astroclub")]
+    r = c.post("/admin/contacts/bulk", data={"csrf": csrf, "do": "sec_off", "sel": sel}, follow_redirects=False)
+    assert "bulkoff&n=3" in r.headers["location"]
+    assert all(bulkdb[k]["active"]["mode"] == "never" for k in ("lena", "tom", "astroclub"))
+    c.post("/admin/contacts/bulk", data={"csrf": csrf, "do": "sec_on", "sel": sel[:1]}, follow_redirects=False)
+    assert bulkdb["lena"]["active"]["mode"] == "inherit" and bulkdb["tom"]["active"]["mode"] == "never"
+
+
+def test_editor_shows_the_switch(bulkdb):
+    c = _client()
+    _create(c)
+    assert 'role="switch"' in c.get("/admin/contacts/lena").text

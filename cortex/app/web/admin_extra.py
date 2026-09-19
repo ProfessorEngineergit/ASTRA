@@ -44,6 +44,16 @@ _X_CSS = """
 .x-warn{color:#f8dfa0}
 .x-pill{display:inline-block;padding:2px 9px;border-radius:99px;border:1px solid var(--border);
   font-size:11.5px;color:var(--text-dim)}
+.sec-toggle{display:inline-flex;align-items:center;gap:8px;background:none;border:0;padding:2px;cursor:pointer;
+  color:var(--text-dim);font:600 12.5px inherit;font-family:inherit}
+.sec-toggle .track{width:38px;height:22px;border-radius:99px;background:var(--surface-2);border:1px solid var(--border);
+  position:relative;transition:background .15s,border-color .15s;flex:0 0 auto}
+.sec-toggle .track::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;
+  background:var(--text-faint);transition:transform .15s,background .15s}
+.sec-toggle.on{color:#a7f3d0}.sec-toggle.on .track{background:rgba(54,211,153,.22);border-color:rgba(54,211,153,.45)}
+.sec-toggle.on .track::after{transform:translateX(16px);background:#36d399}
+.sec-toggle:focus-visible{outline:2px solid var(--link);border-radius:8px}
+.sec-toggle.busy{opacity:.5;pointer-events:none}
 @media(max-width:640px){.x-tbl{font-size:12.5px}.x-tbl td,.x-tbl th{padding:7px 6px}}
 </style>
 """
@@ -319,7 +329,7 @@ def _new_card_form(kind: str, token: str) -> str:
             f'<button class="btn sm" type="submit">Anlegen</button></form>')
 
 
-_SCOPES = {"all": "Alle", "person": "Personen", "group": "Gruppen", "nocard": "Ohne Karte", "proposals": "Vorschläge"}
+_SCOPES = {"all": "Alle", "person": "Personen", "group": "Gruppen", "nocard": "Ohne Karte", "off": "Secretary aus", "proposals": "Vorschläge"}
 _KEEP = {"": "— nicht ändern —"}
 
 
@@ -351,6 +361,11 @@ def _bulk_panel() -> str:
   <div class="section-head"><h2>Regeln für die Auswahl</h2><span class="count" id="selcount">0 ausgewählt</span></div>
   <p class="x-muted">Nur was du hier änderst, wird gesetzt — alles andere bleibt pro Person wie es ist.
   Kontakte ohne Karte bekommen dabei automatisch eine. Gruppen-Felder wirken nur auf Gruppen.</p>
+  <div class="x-form" style="margin-bottom:14px">
+    <b>Secretary für die Auswahl:</b>
+    <button class="btn secondary sm" type="submit" name="do" value="sec_on" id="bulkon" disabled>✅ Einschalten</button>
+    <button class="btn secondary sm" type="submit" name="do" value="sec_off" id="bulkoff" disabled>🔕 Ausschalten</button>
+  </div>
   <div class="x-grid2" style="grid-template-columns:repeat(auto-fit,minmax(210px,1fr))">{fields}</div>
   <div class="x-form" style="margin-top:6px">
     <button class="btn sm" type="submit" name="do" value="apply" id="bulkapply" disabled>Auf Auswahl anwenden</button>
@@ -358,6 +373,14 @@ def _bulk_panel() -> str:
       onclick="return confirm('Die Karten der ausgewählten Einträge löschen? (Nachrichten-Journale bleiben.)')">Karten löschen</button>
   </div>
 </div>"""
+
+
+def _sec_toggle(ref: str, on: bool, who: str) -> str:
+    """Schalter „Secretary“ für eine Person/Gruppe. Ohne JavaScript ein normaler Formular-Knopf."""
+    return (f'<button type="submit" class="sec-toggle {"on" if on else ""}" formaction="/admin/contacts/secretary" '
+            f'name="toggle" value="{esc(ref)}|{0 if on else 1}" role="switch" aria-checked="{"true" if on else "false"}" '
+            f'aria-label="Secretary für {esc(who)}" title="Secretary für {esc(who)} {"ausschalten" if on else "einschalten"}">'
+            f'<span class="track"></span><span class="lbl">{"An" if on else "Aus"}</span></button>')
 
 
 def _dir_row(r: dict) -> str:
@@ -368,11 +391,11 @@ def _dir_row(r: dict) -> str:
     kind = "Gruppe" if r["kind"] == "group" else "Person"
     style = styles.label(r["style"]) if r["style"] else "—"
     rule = RULE_LABELS.get(r["rule"], r["rule"]).split(" (")[0] if r["rule"] else "—"
-    active = ACTIVE_LABELS.get(r["active"], "").split(" (")[0] if r["active"] != "inherit" else "—"
     return (f'<tr><td style="width:34px"><input type="checkbox" name="sel" value="{esc(ref)}" class="rowsel" aria-label="{esc(r["name"])} auswählen"></td>'
             f'<td>{name}{extra}<div class="x-muted">{kind} · {esc(", ".join(r["channels"]))}'
             f'{" · " + esc(r["relationship"]) if r["relationship"] else ""}</div></td>'
-            f'<td class="num">{r["tier"]}</td><td>{esc(rule)}</td><td>{esc(style)}</td><td>{esc(active)}</td></tr>')
+            f'<td>{_sec_toggle(ref, r["sec_on"], r["name"])}</td>'
+            f'<td class="num">{r["tier"]}</td><td>{esc(rule)}</td><td>{esc(style)}</td></tr>')
 
 
 @router.get("/admin/contacts", response_class=HTMLResponse)
@@ -392,10 +415,12 @@ async def contacts_page(request: Request, _: bool = Depends(auth.require_admin),
         f'{esc(v)} · {counts[k]}</a>' for k, v in _SCOPES.items())
     msg = {"created": "Karte angelegt.", "deleted": "Karte gelöscht.",
            "bulk": f"Regeln auf {n} Einträge angewendet.", "bulkdel": f"{n} Karten gelöscht.",
+           "bulkon": f"Secretary für {n} Einträge eingeschaltet.", "bulkoff": f"Secretary für {n} Einträge ausgeschaltet.",
+           "secon": "Secretary eingeschaltet.", "secoff": "Secretary ausgeschaltet.",
            "bulknone": "Nichts ausgewählt bzw. nichts zu ändern."}.get(saved, "")
     table = (f'<div class="panel"><table class="x-tbl" id="dirtbl"><thead><tr>'
-             f'<th><input type="checkbox" id="selall" aria-label="Alle auswählen"></th><th>Name</th>'
-             f'<th class="num">Stufe</th><th>Regel</th><th>Stil</th><th>Aktiv</th></tr></thead>'
+             f'<th><input type="checkbox" id="selall" aria-label="Alle auswählen"></th><th>Name</th><th>Secretary</th>'
+             f'<th class="num">Stufe</th><th>Regel</th><th>Stil</th></tr></thead>'
              f'<tbody>{"".join(_dir_row(r) for r in rows) or "<tr><td colspan=6 class=x-muted>Keine Einträge in dieser Ansicht.</td></tr>"}</tbody></table></div>')
     body = f"""
 <section class="hero"><div class="lab-eyebrow">KONTAKTE</div><h1>Personen &amp; Gruppen</h1>
@@ -420,9 +445,24 @@ setze Regeln in einem Rutsch. Gruppen funktionieren wie Nutzer: nur was du freig
     document.getElementById('selcount').textContent=n+' ausgewählt';
     document.getElementById('bulkapply').disabled=n===0;
     document.getElementById('bulkdelete').disabled=n===0;
+    document.getElementById('bulkon').disabled=n===0; document.getElementById('bulkoff').disabled=n===0;
     all.checked=n>0&&n===rows().length; all.indeterminate=n>0&&n<rows().length;
   }}
   all.addEventListener('change',()=>{{rows().forEach(r=>r.checked=all.checked);sync();}});
+  form.addEventListener('click',async e=>{{
+    const b=e.target.closest('.sec-toggle'); if(!b) return;
+    e.preventDefault(); if(b.classList.contains('busy')) return;
+    b.classList.add('busy');
+    const fd=new FormData(); fd.append('csrf',form.querySelector('[name=csrf]').value);
+    fd.append('toggle',b.value); 
+    try {{
+      const r=await fetch('/admin/contacts/secretary',{{method:'POST',body:fd,headers:{{'Accept':'application/json'}}}});
+      const j=await r.json(); if(!j.ok) throw new Error(j.error||'Fehler');
+      b.classList.toggle('on',j.on); b.setAttribute('aria-checked',j.on?'true':'false');
+      b.querySelector('.lbl').textContent=j.on?'An':'Aus'; b.value=b.value.split('|')[0]+'|'+(j.on?0:1);
+    }} catch(err) {{ alert('Konnte den Schalter nicht setzen: '+err.message); }}
+    b.classList.remove('busy');
+  }});
   form.addEventListener('change',e=>{{if(e.target.classList.contains('rowsel'))sync();}});
   sync();
 }})();
@@ -508,7 +548,11 @@ def _render_card_editor(c: dict, token: str, flash: str, snapshot: dict, seen: l
             f'<input type="hidden" name="csrf" value="{esc(token)}"><button class="btn ghost sm danger" type="submit">Alles vergessen</button></form>')
     return f"""
 <section class="hero"><div class="lab-eyebrow">{"GRUPPE" if is_group else "PERSON"}</div><h1>{esc(c["name"])}</h1>
-<p><a href="/admin/contacts">← Alle Kontakte</a></p></section>
+<p><a href="/admin/contacts">← Alle Kontakte</a></p>
+<form method="post" action="/admin/contacts/secretary" style="margin-top:12px">
+  <input type="hidden" name="csrf" value="{esc(token)}">
+  <span class="x-muted" style="margin-right:8px">Secretary für {"diese Gruppe" if is_group else "diese Person"}:</span>{_sec_toggle(cards.encode_ref({"key": c["key"]}), cards.secretary_on(c), c["name"])}
+</form></section>
 {_flash("ok", flash)}
 <form method="post" action="/admin/contacts/{quote(c["key"])}" class="x-stack">
 <input type="hidden" name="csrf" value="{esc(token)}">
@@ -606,6 +650,50 @@ async def contact_new(request: Request, _: bool = Depends(auth.require_admin)):
     return RedirectResponse(f"/admin/contacts/{quote(saved['key'])}?saved=saved", status_code=303)
 
 
+async def _card_for_ref(ref: dict, existing: list[dict], by_key: dict, keys: set) -> dict | None:
+    """Karte zu einer Auswahl-Referenz: vorhandene Karte oder — für Kontakte ohne Karte — eine neue."""
+    card = by_key.get(ref.get("key", ""))
+    if card is not None or not ref.get("handle"):
+        return card
+    found = cards.find_in(existing, ref["channel"], ref["handle"])
+    if found is not None:
+        return found
+    kind = "group" if cards.is_group_handle(ref["channel"], ref["handle"]) else "person"
+    card = cards.new_card(kind, ref["name"] or ref["handle"], [{"channel": ref["channel"], "id": ref["handle"]}])
+    base, i = card["key"], 2
+    while card["key"] in keys:
+        card["key"], i = f"{base}_{i}", i + 1
+    keys.add(card["key"])
+    if kind == "group":
+        card["trust_tier"] = 3
+    return card
+
+
+@router.post("/admin/contacts/secretary")
+async def contacts_secretary_toggle(request: Request, _: bool = Depends(auth.require_admin)):
+    """Ein Schalter „Secretary an/aus“ für genau eine Person/Gruppe (`toggle` = '<ref>|<0/1>')."""
+    form, ok = await _csrf_form(request)
+    wants_json = "application/json" in request.headers.get("accept", "")
+    if not ok:
+        return JSONResponse({"ok": False, "error": "CSRF-Prüfung fehlgeschlagen."}, status_code=403)
+    raw, _, flag = str(form.get("toggle") or "").rpartition("|")
+    ref = cards.decode_ref(raw)
+    if not ref or flag not in ("0", "1"):
+        return JSONResponse({"ok": False, "error": "Ungültige Auswahl."}, status_code=400) if wants_json \
+            else RedirectResponse("/admin/contacts?saved=bulknone", status_code=303)
+    existing = await cards.load_all(force=True)
+    card = await _card_for_ref(ref, existing, {c["key"]: c for c in existing}, {c["key"] for c in existing})
+    if card is None:
+        return JSONResponse({"ok": False, "error": "Karte nicht gefunden."}, status_code=404) if wants_json \
+            else RedirectResponse("/admin/contacts?saved=bulknone", status_code=303)
+    saved = await cards.save_card(cards.set_secretary(card, flag == "1"))
+    on = cards.secretary_on(saved)
+    await db.audit("card_secretary_toggled", actor="owner", detail={"key": saved["key"], "on": on})
+    if wants_json:
+        return JSONResponse({"ok": True, "on": on, "key": saved["key"], "name": saved["name"]})
+    return RedirectResponse(f"/admin/contacts?saved={'secon' if on else 'secoff'}", status_code=303)
+
+
 @router.post("/admin/contacts/bulk")
 async def contacts_bulk(request: Request, _: bool = Depends(auth.require_admin)):
     form, ok = await _csrf_form(request)
@@ -617,39 +705,34 @@ async def contacts_bulk(request: Request, _: bool = Depends(auth.require_admin))
         return RedirectResponse("/admin/contacts?saved=bulknone", status_code=303)
     existing = await cards.load_all(force=True)
     by_key = {c["key"]: c for c in existing}
-    if form.get("do") == "delete":
+    action = str(form.get("do") or "apply")
+    if action == "delete":
         n = 0
         for r in refs:
             if r.get("key") in by_key:
                 n += await cards.delete_card(r["key"])
         await db.audit("cards_bulk_deleted", actor="owner", detail={"n": n})
         return RedirectResponse(f"/admin/contacts?saved=bulkdel&n={n}", status_code=303)
-    patch = cards.bulk_patch(form.get)
-    if not patch:
-        return RedirectResponse("/admin/contacts?saved=bulknone", status_code=303)
+    if action in ("sec_on", "sec_off"):
+        patcher = lambda c: cards.set_secretary(c, action == "sec_on")   # noqa: E731
+        fields = ["secretary"]
+    else:
+        patch = cards.bulk_patch(form.get)
+        if not patch:
+            return RedirectResponse("/admin/contacts?saved=bulknone", status_code=303)
+        patcher = lambda c: cards.apply_bulk(c, patch)[0]               # noqa: E731
+        fields = sorted(patch)
     keys, n = set(by_key), 0
     for r in refs:
-        card = by_key.get(r.get("key", ""))
-        if card is None and r.get("handle"):
-            found = cards.find_in(existing, r["channel"], r["handle"])
-            if found is None:                                   # Kontakt ohne Karte → Karte anlegen
-                kind = "group" if cards.is_group_handle(r["channel"], r["handle"]) else "person"
-                card = cards.new_card(kind, r["name"] or r["handle"], [{"channel": r["channel"], "id": r["handle"]}])
-                base, i = card["key"], 2
-                while card["key"] in keys:
-                    card["key"], i = f"{base}_{i}", i + 1
-                keys.add(card["key"])
-                if kind == "group":
-                    card["trust_tier"] = 3
-            else:
-                card = found
+        card = await _card_for_ref(r, existing, by_key, keys)
         if card is None:
             continue
-        new, _changed = cards.apply_bulk(card, patch)
-        await cards.save_card(new)
+        await cards.save_card(patcher(card))
         n += 1
-    await db.audit("cards_bulk_saved", actor="owner", detail={"n": n, "fields": sorted(patch)})
-    return RedirectResponse(f"/admin/contacts?saved=bulk&n={n}", status_code=303)
+    await db.audit("cards_bulk_saved", actor="owner", detail={"n": n, "fields": fields,
+                                                              "secretary": action if action.startswith("sec_") else None})
+    saved = {"sec_on": "bulkon", "sec_off": "bulkoff"}.get(action, "bulk")
+    return RedirectResponse(f"/admin/contacts?saved={saved}&n={n}", status_code=303)
 
 
 @router.post("/admin/contacts/{key}")
