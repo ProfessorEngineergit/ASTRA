@@ -234,3 +234,112 @@ def test_all_mutations_require_csrf_and_login(env):
     app = FastAPI()
     app.include_router(admin_google.router)
     assert TestClient(app).get("/admin/google", follow_redirects=False).status_code == 303
+
+
+# ─── Eigene Domain / flexible Weiterleitung ───────────────────────────────────
+DOMAIN = "https://astra.bahriannovotny.space"
+DOMAIN_CB = DOMAIN + "/admin/oauth/google/callback"
+LOCAL_CB = "http://localhost:8088/admin/oauth/google/callback"
+
+
+def _save(c, mode="auto", domain="", **extra):
+    csrf = _csrf(c)
+    return c.post("/admin/google/client", data={"csrf": csrf, "client_id": "cid", "client_secret": "sek",
+                                                "redirect_mode": mode, "redirect_domain": domain, **extra},
+                  follow_redirects=False)
+
+
+def test_domain_mode_can_be_chosen_while_connected_locally_and_shows_both_uris(env):
+    c = _client("http://10.60.0.190:8088")
+    page = c.get("/admin/google").text
+    assert 'name="redirect_mode"' in page and "Eigene Domain" in page and 'name="redirect_domain"' in page
+    r = _save(c, "domain", "astra.bahriannovotny.space")                       # nackte Domain reicht
+    assert r.headers["location"] == "/admin/google?saved=client"
+    assert gh.summary()["redirect_uri"] == DOMAIN_CB
+    page = c.get("/admin/google").text
+    assert DOMAIN_CB in page and LOCAL_CB in page                              # beide zum Eintragen bei Google
+    assert "über eine andere Adresse verbunden" in page                        # Hinweis: lokal gestartet, Domain als Rückweg
+    assert '<option value="domain" selected>' in page
+
+
+def test_invalid_domain_is_rejected_before_saving_anything(env):
+    c = _client()
+    for bad, needle in (("http://10.60.0.190:8088", "http"), ("https://astra.local", "Domain"),
+                        ("https://astra.example.com/admin/login", "enden"), ("", "Domain")):
+        r = _save(c, "domain", bad)
+        assert r.headers["location"].startswith("/admin/google?err="), bad
+    assert not gh.has_client() and gh.summary()["redirect_uri"] == ""
+
+
+def test_manual_and_auto_modes_roundtrip(env):
+    c = _client("http://10.60.0.190:8088")
+    _save(c, "manual")
+    assert gh.summary()["redirect_uri"] == "manual"
+    assert '<option value="manual" selected>' in c.get("/admin/google").text
+    _save(c, "auto")
+    assert gh.summary()["redirect_uri"] == ""
+
+
+def test_connect_uses_the_domain_and_remembers_where_you_started(env):
+    c = _client("http://10.60.0.190:8088")
+    _save(c, "domain", DOMAIN)
+    _, q = _start(c)
+    assert q["redirect_uri"] == [DOMAIN_CB]
+    payload = asyncio.run(auth.read_oauth_state(q["state"][0]))
+    assert payload["redirect_uri"] == DOMAIN_CB and payload["return_to"] == "http://10.60.0.190:8088/"
+
+
+def test_manual_button_forces_localhost_even_when_a_domain_is_configured(env):
+    c = _client("http://10.60.0.190:8088")
+    _save(c, "domain", DOMAIN)
+    csrf = _csrf(c)
+    r = c.post("/admin/google/connect", data={"csrf": csrf, "products": ["calendar"], "redirect": "manual"},
+               follow_redirects=False)
+    q = parse_qs(urlparse(r.headers["location"]).query)
+    assert q["redirect_uri"] == [LOCAL_CB]
+    assert asyncio.run(auth.read_oauth_state(q["state"][0]))["mode"] == "manual"
+
+
+def test_callback_on_the_domain_finishes_the_login_and_sends_you_back_to_where_you_started(env):
+    local = _client("http://10.60.0.190:8088")
+    _save(local, "domain", DOMAIN)
+    _, q = _start(local)
+    # Google leitet auf die DOMAIN zurück (anderer Ursprung, dort ist niemand angemeldet)
+    dom = TestClient(_app_for_callback(), base_url=DOMAIN)
+    r = dom.get("/admin/oauth/google/callback", params={"state": q["state"][0], "code": "4/0X"}, follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "http://10.60.0.190:8088/admin/google?saved=connected"
+    assert gh.has_accounts()
+    # Fehler von Google gehen ebenfalls zurück zum Ausgangspunkt
+    r = dom.get("/admin/oauth/google/callback", params={"state": q["state"][0], "error": "access_denied"},
+                follow_redirects=False)
+    assert r.headers["location"].startswith("http://10.60.0.190:8088/admin/google?err=")
+
+
+def _app_for_callback():
+    app = FastAPI()
+    app.include_router(web_admin.router)
+    app.include_router(admin_google.router)
+    return app
+
+
+def test_same_origin_callback_stays_relative_and_forged_return_to_is_impossible(env):
+    c = _client(DOMAIN)
+    _save(c, "domain", DOMAIN)
+    _, q = _start(c)
+    r = c.get("/admin/oauth/google/callback", params={"state": q["state"][0], "code": "4/0X"}, follow_redirects=False)
+    assert r.headers["location"] == "/admin/google?saved=connected"
+    # ein selbst gebauter State (ohne Signatur) wird nicht akzeptiert → kein Rücksprung an fremde Adressen
+    r = c.get("/admin/oauth/google/callback", params={"state": "v1.evil", "code": "x"}, follow_redirects=False)
+    assert r.status_code == 400
+
+
+def test_forwarded_headers_make_a_proxied_domain_count_as_https(env):
+    c = _client("http://astra.bahriannovotny.space")          # Proxy terminiert TLS: intern kommt http an
+    plain = c.get("/admin/google").text
+    assert 'id="g-redirect-0" readonly value="http://localhost/admin/oauth/google/callback"' in plain   # ohne Header: manuell
+    page = c.get("/admin/google", headers={"X-Forwarded-Proto": "https"}).text
+    assert f'id="g-redirect-0" readonly value="{DOMAIN_CB}"' in page       # erkannt: https + echte Domain → direkter Weg
+    csrf = _csrf(c)
+    r = c.post("/admin/google/connect", data={"csrf": csrf}, headers={"X-Forwarded-Proto": "https"},
+               follow_redirects=False)
+    assert "/admin/google?err=" in r.headers["location"]       # ohne Client noch kein Google-Aufruf

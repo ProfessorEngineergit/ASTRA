@@ -1091,7 +1091,7 @@ async def oauth_google_callback(request: Request, code: str = "", state: str = "
         pre = await auth.read_oauth_state(state) if state.startswith("v1.") else None
         if pre and pre.get("provider") == "google_hub":
             from .admin_google import finish
-            return await finish("", state, error)
+            return await finish("", state, error, request)
         return HTMLResponse(page("OAuth", f'<div class="flash err">Google OAuth: {esc(error)}</div>'), 400)
     if state.startswith("v1."):
         state_data = await auth.read_oauth_state(state)
@@ -1101,7 +1101,7 @@ async def oauth_google_callback(request: Request, code: str = "", state: str = "
         state_data = await db.get_setting(f"oauth_state:{state}", None)
     if state_data and state_data.get("provider") == "google_hub":
         from .admin_google import finish
-        return await finish(code, state, "")
+        return await finish(code, state, "", request)
     if not state_data or state_data.get("provider") != "google":
         return HTMLResponse(page("OAuth", '<div class="flash err">OAuth-State ungueltig oder abgelaufen.</div>'), 400)
     mgr = get_manager()

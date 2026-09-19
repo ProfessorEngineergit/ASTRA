@@ -264,3 +264,43 @@ def test_legacy_path_now_raises_readable_errors(hub, monkeypatch):
     with pytest.raises(gh.GoogleApiError) as e:
         run(go.google_api(p, "GET", "https://tasks.googleapis.com/tasks/v1/users/@me/lists"))
     assert e.value.kind == "api_disabled" and "999999999" in e.value.action_url
+
+
+# ─── Eigene Domain / flexible Weiterleitung ───────────────────────────────────
+@pytest.mark.parametrize("text,uri,err", [
+    ("", "", ""),
+    ("manual", "manual", ""),
+    ("MANUAL", "manual", ""),
+    ("astra.bahriannovotny.space", "https://astra.bahriannovotny.space/admin/oauth/google/callback", ""),
+    ("https://astra.bahriannovotny.space/", "https://astra.bahriannovotny.space/admin/oauth/google/callback", ""),
+    ("https://astra.bahriannovotny.space/admin/login", "", "muss auf"),
+    ("https://astra.bahriannovotny.space/admin", "https://astra.bahriannovotny.space/admin/oauth/google/callback", ""),
+    ("https://Astra.Example.com:8443/admin/oauth/google/callback?x=1",
+     "https://astra.example.com:8443/admin/oauth/google/callback", ""),
+    ("https://astra.example.com:443", "https://astra.example.com/admin/oauth/google/callback", ""),
+    ("http://astra.example.com", "", "http nur für localhost"),
+    ("http://10.60.0.190:8088", "", "http nur für localhost"),
+    ("https://10.60.0.190", "", "echten Domain"),
+    ("https://astra.local", "", "echten Domain"),
+    ("http://localhost:8088", "http://localhost:8088/admin/oauth/google/callback", ""),
+    ("https://", "", "gültige Adresse"),
+])
+def test_normalize_redirect(text, uri, err):
+    got_uri, got_err = gh.normalize_redirect(text)
+    assert got_uri == uri and (err in got_err if err else got_err == "")
+
+
+def test_pick_redirect_manual_forced_and_invalid_config_falls_back_to_auto():
+    lan = "http://10.60.0.190:8088/"
+    assert gh.pick_redirect(lan, "manual")["mode"] == "manual"
+    assert gh.pick_redirect("https://astra.example.com/", force_manual=True)["uri"] == "http://localhost/admin/oauth/google/callback"
+    r = gh.pick_redirect(lan, "astra.bahriannovotny.space")
+    assert r["mode"] == "configured" and r["uri"] == "https://astra.bahriannovotny.space/admin/oauth/google/callback"
+    assert gh.pick_redirect(lan, "http://10.0.0.1")["mode"] == "manual"          # ungültig → sicherer Automatik-Fall
+    assert "Domain" in gh.pick_redirect(lan)["reason"]                            # Hinweis auf die Domain-Option
+
+
+def test_origin_of():
+    assert gh.origin_of("https://Astra.Example.com/admin/x?y=1") == "https://astra.example.com"
+    assert gh.origin_of("http://10.60.0.190:8088/") == "http://10.60.0.190:8088"
+    assert gh.origin_of("müll") == "" and gh.origin_of("") == ""

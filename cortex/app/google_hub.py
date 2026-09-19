@@ -112,27 +112,76 @@ def _public_domain(host: str) -> bool:
     return not host.endswith((".local", ".lan", ".home", ".internal", ".localdomain", ".home.arpa", ".intranet"))
 
 
-def pick_redirect(base_url: str, configured: str = "") -> dict:
+REDIRECT_MANUAL = "manual"
+
+
+def normalize_redirect(text: str) -> tuple[str, str]:
+    """Eingabe „Eigene Domain“ → (Weiterleitungs-URI, Fehler). Rein.
+
+    Erlaubt: leer (automatisch), „manual“, eine Domain (`astra.example.com`), eine Adresse mit https
+    (`https://astra.example.com`) oder die volle Callback-Adresse. Google akzeptiert nur https mit echter
+    Domain oder http://localhost — alles andere wird hier abgelehnt, bevor Google es tut."""
+    raw = (text or "").strip()
+    if not raw:
+        return "", ""
+    if raw.lower() == REDIRECT_MANUAL:
+        return REDIRECT_MANUAL, ""
+    if "://" not in raw:
+        raw = "https://" + raw.lstrip("/")
+    u = urlparse(raw)
+    host = (u.hostname or "").lower()
+    if not host:
+        return "", "Das ist keine gültige Adresse."
+    path = u.path.rstrip("/")
+    if path in ("", "/admin"):
+        path = CALLBACK_PATH
+    if path != CALLBACK_PATH:
+        return "", (f"Die Adresse muss auf {CALLBACK_PATH} enden — oder gib nur die Domain an "
+                    f"(z. B. https://astra.example.com).")
+    local = host in ("localhost", "127.0.0.1", "::1")
+    if not (local or (u.scheme == "https" and _public_domain(host))):
+        why = ("Google erlaubt http nur für localhost." if u.scheme == "http" and not local
+               else "Google erlaubt nur https mit einer echten Domain (keine IP, kein .local/.lan).")
+        return "", why
+    port = f":{u.port}" if u.port and not (u.port == 443 and u.scheme == "https") and not (
+        u.port == 80 and u.scheme == "http") else ""
+    return f"{u.scheme}://{host}{port}{CALLBACK_PATH}", ""
+
+
+def origin_of(url: str) -> str:
+    """scheme://host[:port] einer Adresse (ohne Pfad), '' wenn ungültig."""
+    u = urlparse(url or "")
+    return f"{u.scheme}://{u.netloc}".lower() if u.scheme and u.netloc else ""
+
+
+def pick_redirect(base_url: str, configured: str = "", *, force_manual: bool = False) -> dict:
     """Weiterleitungsadresse wählen. → {uri, mode: direct|manual|configured, reason}.
 
-    `base_url` ist die Adresse, unter der der Admin gerade offen ist (z. B. http://10.60.0.190:8088/)."""
-    if (configured or "").strip():
-        return {"uri": configured.strip(), "mode": "configured",
-                "reason": "Von dir festgelegte Weiterleitungsadresse."}
+    `base_url` ist die Adresse, unter der der Admin gerade offen ist (z. B. http://10.60.0.190:8088/).
+    `configured`: leer = automatisch, „manual“ = immer localhost + Adresse einfügen, sonst eigene Domain/URI."""
     u = urlparse(base_url)
     host, scheme = (u.hostname or ""), (u.scheme or "http")
     port = f":{u.port}" if u.port and not (u.port == 80 and scheme == "http") and not (
         u.port == 443 and scheme == "https") else ""
+    manual = {"uri": f"http://localhost{port}{CALLBACK_PATH}", "mode": "manual",
+              "reason": ("Google leitet auf localhost zurück; die Seite lädt nicht — kopiere dann die Adresse aus der "
+                         "Browserleiste und füge sie in ASTRA ein.")}
+    if force_manual or (configured or "").strip().lower() == REDIRECT_MANUAL:
+        return manual
+    if (configured or "").strip():
+        uri, err = normalize_redirect(configured)
+        if uri and not err:
+            return {"uri": uri, "mode": "configured",
+                    "reason": "Von dir festgelegte Weiterleitungsadresse (eigene Domain)."}
     if host in ("localhost", "127.0.0.1", "::1"):
         return {"uri": f"{scheme}://{host}{port}{CALLBACK_PATH}", "mode": "direct",
                 "reason": "Du bist über localhost verbunden — Google darf direkt zurückleiten."}
     if scheme == "https" and _public_domain(host):
         return {"uri": f"https://{host}{port}{CALLBACK_PATH}", "mode": "direct",
                 "reason": "Du bist über eine https-Domain verbunden — Google darf direkt zurückleiten."}
-    return {"uri": f"http://localhost{port}{CALLBACK_PATH}", "mode": "manual",
-            "reason": ("Google erlaubt für Weiterleitungen keine LAN-Adresse (nur https-Domain oder localhost). "
-                       "Darum leitet Google auf localhost zurück; die Seite lädt nicht — kopiere dann die Adresse "
-                       "aus der Browserleiste und füge sie in ASTRA ein.")}
+    manual["reason"] = ("Google erlaubt für Weiterleitungen keine LAN-Adresse (nur https-Domain oder localhost). "
+                        + manual["reason"] + " Oder trage unten deine Domain ein.")
+    return manual
 
 
 def parse_pasted(text: str) -> dict:
