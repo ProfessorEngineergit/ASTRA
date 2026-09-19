@@ -73,6 +73,33 @@ aber nie selbst anwenden — Vorschläge ohne Links/Schlüssel/Manipulationsmust
 - **Modell pro Chat:** Web-Chat → Seitenleiste „Modell", oder überall `/modell klein|mittel|schwer|code|auto` bzw.
   `/modell openrouter:anthropic/claude-sonnet-5`. Pro Person/Gruppe zusätzlich in der Karte. Branches erben das Modell.
 
+## Smart-Antwort (wann ASTRA wartet, antwortet oder schweigt)
+Gilt für Einzelchats auf WhatsApp/Signal/Slack bei **„Immer an"** oder Kanalmodus **„Smart"** (Admin → Secretary). Ausdrücklich gewählte
+Kanalmodi „Direkt / Warten / Immer fragen" und Karten-Regeln „direkt / fragen" bleiben, wie sie sind. **Wichtig:** Steht ein Kanal auf
+„Direkt", wartet ASTRA nie — für das Verhalten unten den Kanalmodus auf „Smart" stellen.
+
+1. **Frische Unterhaltung:** ASTRA wartet ~1 Minute (einstellbar), ob du selbst antwortest. Schreibst du der Person, bleibt ASTRA still.
+   Kommt während des Wartens noch etwas dazu, läuft der Timer weiter (ab der ersten Nachricht).
+2. **Danach nach Art der Nachricht** (ohne Modell, kein Token):
+   - **Anfrage** (Kalender, Termine, Verabredung, „richte ihm aus", Uhrzeiten, Wochentage …) → ASTRA beantwortet sie.
+   - **„Hallo / bist du da? / kann ich mit dir reden?" oder Smalltalk** → **eine** Vorstellung: „Ich bin Bahrians KI-Assistent, er hat sich noch nicht
+     gemeldet, ich kann zu … helfen — frag mich gern." Sie sagt ehrlich, was geht (**Kalenderzugriff ja/nein**, Kartenfreigabe beachtet).
+     Danach **Ruhephase** (Standard 3 Std.): Smalltalk bekommt keine Antwort mehr, eine konkrete Anfrage schon.
+   - **Emoji, GIF/Sticker/Link, Lachen, „ok", „danke"** → gar keine Antwort (auch kein Ratenlimit-Zähler).
+3. **Laufendes Gespräch** (ASTRAs letzte Antwort < 30 Min.): Anfragen bekommen sofort eine Antwort, Smalltalk wird ignoriert.
+   Stellt ASTRA eine **Rückfrage** („…?"), zählt auch ein kurzes „ja / gerne / nein" als Antwort.
+4. **Du greifst ein** (du schreibst der Person selbst — auch mitten im Gespräch): ASTRA hört **sofort** auf und vergisst das laufende
+   Gespräch; die nächste Nachricht wartet wieder eine Minute. ASTRAs **eigene** Nachrichten (WhatsApp meldet sie als „fromMe" zurück)
+   werden per Echo-Filter erkannt und zählen nie als Eingreifen.
+5. **Ungelesen:** Nach ASTRAs Antwort wird der Chat auf deinem Handy wieder auf „ungelesen" gesetzt (WAHA `chats/{id}/unread`, Best effort;
+   Einstellung „Chats ungelesen lassen"). Unterstützt deine WAHA-Version das nicht, wird es einmal geloggt und übersprungen.
+
+Einstellbar unter Admin → Secretary → Smart-Antwort: Wartezeit, Gesprächsfenster, Ruhephase, Rausch-Filter, ungelesen lassen.
+
+**Stilwechsel mitten im Chat:** Die Stil-Anweisung steht jetzt zusätzlich als „Stil-Erinnerung" **hinter** dem Gesprächsverlauf im Prompt
+(„frühere Antworten können anders klingen — richte dich nicht nach ihnen"). Vorher orientierte sich das Modell am Ton seiner eigenen
+früheren Antworten, ein neu gewählter Stil kam deshalb nicht an.
+
 ## Kalender-Intelligenz
 Tool `suggest_meeting_times`: freie Slots mit Puffer und Verteilung über die Tage; Dritten nur Zeiten, nie Titel,
 nur im Rahmen ihrer Kartenfreigabe.

@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
-from . import db
+from . import db, outbox
 from .config import get_settings
 
 log = logging.getLogger("astra.channels")
@@ -46,8 +47,11 @@ class Channels:
         await self._http.aclose()
 
     # ── Public API ─────────────────────────────────────────────────────────────
-    async def send(self, channel: str, to: str, text: str) -> bool:
+    async def send(self, channel: str, to: str, text: str, *, keep_unread: bool = False) -> bool:
+        """`keep_unread`: die Antwort von ASTRA soll den Chat auf DEINEM Handy nicht „gelesen“ machen (WhatsApp)."""
         self._last_errors.pop(channel, None)
+        if channel in ("waha", "signal"):
+            outbox.remember(text)      # das Echo („fromMe“) dieser Nachricht ist kein Eingreifen von Bahrian
         if self.s.astra_dry_run:
             log.info("[DRY_RUN] → %s/%s: %s", channel, to, text)
             return True
@@ -59,7 +63,7 @@ class Channels:
             # ASTRA_SEND_BACKEND=n8n must not bypass the Secretary installation
             # stored in app_settings.
             if channel == "waha":
-                return await self._waha(to, text)
+                return await (self._waha(to, text, keep_unread=True) if keep_unread else self._waha(to, text))
             if self.s.astra_send_backend == "n8n":
                 return await self._via_n8n(channel, to, text)
             if channel == "signal":
@@ -164,7 +168,27 @@ class Channels:
             return f"WAHA lehnt die Nachricht ab (HTTP 422).{detail}"
         return f"WAHA antwortet mit HTTP {status}."
 
-    async def _waha(self, chat_id: str, text: str) -> bool:
+    _unread_unsupported: str = ""
+
+    async def _mark_unread(self, base_url: str, session: str, headers: dict, target: str) -> None:
+        """Chat wieder als ungelesen markieren (WAHA: POST /api/{session}/chats/{chatId}/unread).
+
+        Best effort: eine Antwort von ASTRA darf nie daran scheitern. Meldet WAHA „gibt es nicht“ (ältere
+        Version/Engine), wird es bis zum Neustart nicht mehr versucht und einmal geloggt."""
+        if self._unread_unsupported:
+            return
+        try:
+            r = await self._http.post(f"{base_url}/api/{session}/chats/{quote(target, safe='@')}/unread",
+                                      headers=headers)
+            if r.status_code in (404, 405, 501):
+                self._unread_unsupported = f"HTTP {r.status_code}"
+                log.info("WAHA kann Chats nicht als ungelesen markieren (%s) — Funktion ist aus.", r.status_code)
+            elif not r.is_success:
+                log.debug("WAHA unread failed: HTTP %s", r.status_code)
+        except Exception:  # noqa: BLE001
+            log.debug("WAHA unread failed", exc_info=True)
+
+    async def _waha(self, chat_id: str, text: str, keep_unread: bool = False) -> bool:
         base_url, session, api_key = await self._waha_runtime_config()
         if not base_url:
             raise RuntimeError("WAHA Base URL fehlt.")
@@ -231,6 +255,8 @@ class Channels:
                 except Exception:  # noqa: BLE001
                     pass
             raise RuntimeError(message)
+        if keep_unread and chat_id != "__self__":
+            await self._mark_unread(base_url, session, headers, target)
         return True
 
     async def _signal(self, recipient: str, text: str) -> bool:

@@ -61,7 +61,9 @@ def state_for_mode(mode: Mode) -> ThreadState:
 def next_state(current: ThreadState, signal: Signal) -> Transition:
     # Owner stepping in always wins.
     if signal == Signal.INBOUND_OWNER:
-        if current in (ThreadState.DEFERRED, ThreadState.AWAITING_APPROVAL):
+        # Auch mitten im Gespräch (ANSWERED): sobald Bahrian selbst schreibt, hört ASTRA sofort auf.
+        # (Eigene Sendungen von ASTRA laufen als Echo nie hier an — siehe outbox.py.)
+        if current in (ThreadState.DEFERRED, ThreadState.AWAITING_APPROVAL, ThreadState.ANSWERED):
             return Transition(ThreadState.STANDDOWN, Act.STAND_DOWN)
         return Transition(current, Act.NONE)
 

@@ -157,3 +157,35 @@ def test_waha_send_exposes_actionable_http_error(memdb):
     assert ok is False
     assert channels.last_error("waha") == (
         "WAHA lehnt die Nachricht ab (HTTP 422). Invalid chatId")
+
+
+# ─── ungelesen lassen (WAHA) ──────────────────────────────────────────────────
+def test_waha_send_can_mark_the_chat_unread_afterwards_and_survives_failures(monkeypatch):
+    import asyncio
+    import httpx
+    from app.channels import Channels
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append((req.method, str(req.url)))
+        if req.url.path.endswith("/sendText"):
+            return httpx.Response(201, json={"id": "x"})
+        return httpx.Response(unread_status, json={})
+    unread_status = 201
+    ch = Channels()
+    ch._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def cfg():
+        return "http://waha:3000", "default", "key"
+    monkeypatch.setattr(ch, "_waha_runtime_config", cfg)
+    assert asyncio.run(ch._waha("4915111111111@c.us", "Hi", keep_unread=True)) is True
+    assert calls[-1] == ("POST", "http://waha:3000/api/default/chats/4915111111111@c.us/unread")
+    assert asyncio.run(ch._waha("4915111111111@c.us", "Hi")) is True                    # ohne Flag kein zweiter Aufruf
+    assert sum(1 for c in calls if c[1].endswith("/unread")) == 1
+    unread_status = 404                                                                  # Funktion gibt es nicht
+    assert asyncio.run(ch._waha("4915111111111@c.us", "Hi", keep_unread=True)) is True   # Senden klappt trotzdem
+    assert ch._unread_unsupported == "HTTP 404"
+    n = len(calls)
+    assert asyncio.run(ch._waha("4915111111111@c.us", "Hi", keep_unread=True)) is True
+    assert sum(1 for c in calls[n:] if c[1].endswith("/unread")) == 0                    # nicht erneut versucht
+    asyncio.run(ch._http.aclose())

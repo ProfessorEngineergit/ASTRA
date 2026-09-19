@@ -15,8 +15,8 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from . import (abuse, cards, db, digest, knowledge, model_choice, models, moderation,
-               moderation_gate, prompts, styles, usage)
-from .agent import generate_reply
+               moderation_gate, outbox, prompts, smart_reply, styles, usage)
+from .agent import TAIL_MARK, generate_reply
 from .channels import get_channels
 from .config import get_settings
 from .context_ledger import record_interaction
@@ -26,8 +26,8 @@ from .persona import TRIAGE_INSTRUCTIONS, Register
 from .policy import Decision, Mode, Sensitivity, TrustTier, reconcile
 from .secretary import (
     CHANNEL_LABELS, SECRETARY_CHANNELS, channel_enabled, contact_rule_for, is_group_context,
-    plan_for, resolve_service_status, shadow_enabled, tone_instruction, unknown_sender_action,
-    with_secretary_header,
+    plan_for, resolve_service_status, secretary_settings, shadow_enabled, tone_instruction,
+    unknown_sender_action, with_secretary_header,
 )
 from .security import check_inbound, check_outbound
 from .state import Act, Signal, ThreadState, next_state
@@ -121,13 +121,19 @@ def _secretary_system(
         capsule = ""
     if capsule:
         card_block = (card_block + " " if card_block else "") + capsule
-    return (
+    head = (
         prompts.get("secretary_core")
         + f"{tone} {group_note}"
         f"{card_block + ' ' if card_block else ''}"
         f"Policy-Grund: {plan_reason or 'secretary'}."
         f"{person_block}"
     )
+    # Stil-Erinnerung NACH dem Gesprächsverlauf: sonst richtet sich das Modell nach dem Ton seiner eigenen
+    # früheren Antworten — ein neu gewählter Stil (z. B. „überheblich“) käme mitten im Chat nicht an.
+    reminder = ("Stil-Erinnerung (verbindlich für DIESE Antwort): " + tone.strip() +
+                " Frühere Antworten in diesem Chat können in einem anderen Stil geschrieben sein — richte dich "
+                "NICHT nach ihnen, sondern ausschließlich nach diesem Stil.")
+    return head + TAIL_MARK + reminder
 
 
 async def _send_and_record(
@@ -181,7 +187,15 @@ async def _send_and_record(
                     out.text, first_interaction=False, app_settings=appset)
             else:
                 text = out.text
-    ok = await get_channels().send(channel, peer, text)
+    # Antworten an Dritte lassen den Chat auf Bahrians Handy „ungelesen“ (Einstellung, Standard an).
+    keep_unread = False
+    if channel == "waha" and not contact.get("is_owner"):
+        try:
+            keep_unread = bool(smart_reply.settings(await _app_settings())["keep_unread"])
+        except Exception:  # noqa: BLE001
+            keep_unread = False
+    ok = await (get_channels().send(channel, peer, text, keep_unread=True) if keep_unread
+                else get_channels().send(channel, peer, text))
     await db.add_message(thread_id, "assistant", text)
     try:
         thread = await db.get_thread(thread_id)
@@ -240,6 +254,11 @@ async def handle_inbound(
     """Process one inbound message. `force_owner` overrides owner detection — used
     by the WAHA ingress for `fromMe` messages (you replying yourself = stand-down)."""
     s = get_settings()
+    # Echo der eigenen Antwort (ASTRA sendet über DEINEN Account, WhatsApp meldet es als „fromMe“ zurück):
+    # kein Eingreifen von Bahrian — sonst würde sich ASTRA bei jeder Antwort selbst unterbrechen.
+    if force_owner and channel in ("waha", "signal") and outbox.is_echo(text):
+        log.debug("Echo of own message on %s ignored.", channel)
+        return
     thread_meta = dict(thread_meta or {})
     thread_meta.setdefault("source_channel", channel)
     if is_group_context(channel, sender_handle, thread_meta):
@@ -339,7 +358,10 @@ async def handle_inbound(
     if author_is_owner:
         if next_state(ThreadState(thread["state"]), Signal.INBOUND_OWNER).act == Act.STAND_DOWN:
             await db.set_thread_state(thread_id, ThreadState.STANDDOWN.value)
-            await db.audit("standdown", channel=channel, thread_id=thread_id, contact_id=contact["id"])
+            # Auch das laufende Gespräch/die Ruhephase ist damit vorbei: beim nächsten Mal wartet ASTRA wieder.
+            await db.merge_thread_meta(thread_id, smart_reply.meta_after_owner())
+            await db.audit("standdown", channel=channel, thread_id=thread_id, contact_id=contact["id"],
+                           detail={"was": thread["state"]})
             log.info("Owner stepped in on %s → stand down.", thread_id)
         _remember(contact, text, owner=True)
         return
@@ -359,6 +381,22 @@ async def handle_inbound(
         await db.audit("contact_blocked", channel=channel, thread_id=thread_id,
                        contact_id=contact["id"])
         return
+
+    # Emojis, GIF-/Link-Nachrichten, „ok“, „danke“, Lachen: keine Antwort, kein Ratenlimit-Zähler, keine Rückfrage
+    # bei unbekannten Absendern — kostet nichts und wirkt nicht wie „gelesen und ignoriert“ durch einen Bot.
+    if not thread_meta.get("is_group") and smart_reply.settings(appset_pre)["ignore_noise"]:
+        early_kind = smart_reply.classify(text)
+        ignore_it = early_kind == smart_reply.NOISE
+        if early_kind == smart_reply.THANKS:
+            # „ja“/„gerne“/„ok“ als Antwort auf eine Rückfrage von ASTRA ist keine Höflichkeitsfloskel.
+            meta_now = thread.get("meta") or {}
+            running = float(meta_now.get("smart_until") or 0) > time.time() or float(meta_now.get("quiet_until") or 0) > time.time()
+            ignore_it = not (running and smart_reply.awaiting_answer(await db.recent_messages(thread_id)))
+        if ignore_it:
+            await db.audit("smart_ignored", channel=channel, thread_id=thread_id, contact_id=contact["id"],
+                           detail={"kind": early_kind, "reason": "smart-noise" if early_kind == smart_reply.NOISE
+                                   else "smart-ack"})
+            return
 
     # Cheap abuse / rate guards BEFORE any LLM or triage cost. The owner has
     # already been handled above, so this only ever clamps third parties.
@@ -512,6 +550,41 @@ async def handle_inbound(
     # ── Third party → triage + policy ──────────────────────────────────────────
     tier = TrustTier(int(card["trust_tier"]) if card else int(contact["trust_tier"]))
     history = await db.recent_messages(thread_id)
+
+    # ── Smart-Antwort: wann warten, antworten oder schweigen? (kein Token, bevor es sich lohnt) ─────────
+    smart_kind, smart_instant = "", False
+    if not is_group:
+        scfg = smart_reply.settings(appset_pre)
+        smart_on = smart_reply.applies(secretary_settings(appset_pre), channel, {"rule": contact_rule}, scfg)
+        smart_kind = smart_reply.classify(text)
+        now_ts = time.time()
+        verdict = smart_reply.decide(smart_kind, smart=smart_on, ignore_noise=scfg["ignore_noise"],
+                                     state=thread["state"], meta=thread.get("meta") or {}, now=now_ts,
+                                     awaiting=smart_reply.awaiting_answer(history))
+        if verdict.action == "ignore":
+            await db.audit("smart_ignored", channel=channel, thread_id=thread_id, contact_id=contact["id"],
+                           detail={"kind": smart_kind, "reason": verdict.reason})
+            log.info("Smart: %s on %s not answered (%s).", smart_kind, thread_id, verdict.reason)
+            return
+        if verdict.action == "wait":
+            meta_now = thread.get("meta") or {}
+            du = thread.get("defer_until")
+            waiting = thread["state"] == ThreadState.DEFERRED.value and du is not None and (
+                du.timestamp() if hasattr(du, "timestamp") else float(du)) > now_ts
+            kind_now = smart_reply.merge_kind(str(meta_now.get("smart_kind") or ""), smart_kind) if waiting else smart_kind
+            patch = {"smart_kind": kind_now}
+            if not waiting:                        # Wartezeit läuft ab der ERSTEN Nachricht, nicht ab der letzten
+                ceiling = cards.share_ceiling(card) or reconcile(Mode.AUTO, tier, Sensitivity.DETAILS).max_sensitivity.value
+                patch["max_sensitivity"] = ceiling
+                until = datetime.now(timezone.utc) + timedelta(seconds=scfg["wait_seconds"])
+                await db.set_thread_state(thread_id, ThreadState.DEFERRED.value, defer_until=until)
+            await db.merge_thread_meta(thread_id, patch)
+            await db.audit("deferred", channel=channel, thread_id=thread_id, contact_id=contact["id"],
+                           detail={"defer_seconds": scfg["wait_seconds"], "smart": verdict.reason, "kind": kind_now})
+            log.info("Smart: waiting %ss on %s (%s).", scfg["wait_seconds"], thread_id, kind_now)
+            return
+        smart_instant = smart_on and verdict.reason.startswith("smart-") and verdict.action == "reply"
+
     gw = get_gateway()
     if gw.enabled:
         sysmsg = prompts.render("triage", owner=s.astra_owner_name, tier=int(tier))
@@ -572,6 +645,8 @@ async def handle_inbound(
 
     mode = secretary_plan.mode
     auto = get_autonomy()
+    if smart_instant and mode == Mode.DEFER:      # laufendes Gespräch: nicht schon wieder warten
+        mode = Mode.AUTO
     if auto == "full" and mode in (Mode.DEFER, Mode.ASK):
         mode = Mode.AUTO
         log.info("Autonomy=full → %s escalated to AUTO for %s", decision.mode.value, thread_id)
@@ -610,6 +685,10 @@ async def handle_inbound(
         cur = await db.get_thread(thread_id)
         if cur and cur["state"] != ThreadState.AWAITING_APPROVAL.value:  # a tool may have asked
             await db.set_thread_state(thread_id, ThreadState.ANSWERED.value)
+        if smart_kind and not is_group and smart_reply.applies(secretary_settings(appset), channel,
+                                                               {"rule": contact_rule}, smart_reply.settings(appset)):
+            await db.merge_thread_meta(thread_id, smart_reply.meta_after_reply(
+                smart_reply.REQUEST, smart_reply.settings(appset), time.time()))
 
     elif mode == Mode.DEFER:
         defer_until = datetime.now(timezone.utc) + timedelta(seconds=s.astra_defer_seconds)
@@ -796,15 +875,26 @@ async def step_in(thread_id: str) -> None:
                        contact_id=thread.get("contact_id"), detail={"phase": "deferred_step_in"})
         return
     contact = await db.get_contact(thread["contact_id"]) if thread.get("contact_id") else {}
-    ceiling = (thread.get("meta") or {}).get("max_sensitivity", "freebusy")
+    meta = thread.get("meta") or {}
+    ceiling = meta.get("max_sensitivity", "freebusy")
     history = await db.recent_messages(thread_id)
     card = await _card_for_thread(thread)
+    # Smart-Antwort: nach dem Warten nur bei einer echten Anfrage inhaltlich antworten; bei „Hallo/bist du da“
+    # oder Smalltalk stellt sich ASTRA EINMAL vor (ehrlich, was es kann) und schweigt danach eine Weile.
+    smart_kind = str(meta.get("smart_kind") or "")
+    intro = smart_kind in (smart_reply.PING, smart_reply.CHAT)
+    if intro:
+        lead = smart_reply.intro_instruction(
+            calendar=smart_reply.calendar_ready() and cards.share_ceiling(card) != "none",
+            owner=get_settings().astra_owner_name) + " "
+    else:
+        lead = "Bahrian hat nicht selbst geantwortet. Antworte jetzt stellvertretend, knapp und souverän. "
     reply = await generate_reply(
         register=Register.THIRD, contact=contact or {}, thread_id=thread_id, channel=thread["channel"],
         history=history, summary=thread.get("summary") or "", max_sensitivity=ceiling,
         model_pick=(card or {}).get("model") or None,
         extra_system=(
-            "Bahrian hat nicht selbst geantwortet. Antworte jetzt stellvertretend, knapp und souverän. "
+            lead
             + _secretary_system(
                 thread["channel"],
                 "defer-elapsed",
@@ -820,8 +910,11 @@ async def step_in(thread_id: str) -> None:
         max_sensitivity=ceiling,
     )
     await db.set_thread_state(thread_id, ThreadState.ANSWERED.value)
+    if smart_kind:
+        await db.merge_thread_meta(thread_id, smart_reply.meta_after_reply(
+            smart_kind, smart_reply.settings(appset), time.time()))
     await db.audit("stepin", channel=thread["channel"], thread_id=thread_id,
-                   contact_id=thread.get("contact_id"))
+                   contact_id=thread.get("contact_id"), detail={"intro": intro} if smart_kind else None)
     log.info("Stepped in on %s after deferral.", thread_id)
 
 

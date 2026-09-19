@@ -50,3 +50,10 @@ def test_approval_resumes_only_while_awaiting():
     assert next_state(ThreadState.STANDDOWN, Signal.APPROVAL_DECIDED) == Transition(
         ThreadState.STANDDOWN, Act.NONE
     )
+
+
+def test_owner_stepping_in_mid_conversation_also_stands_down():
+    from app.state import Act, Signal, ThreadState, Transition, next_state
+    assert next_state(ThreadState.ANSWERED, Signal.INBOUND_OWNER) == Transition(ThreadState.STANDDOWN, Act.STAND_DOWN)
+    assert next_state(ThreadState.STANDDOWN, Signal.INBOUND_OWNER) == Transition(ThreadState.STANDDOWN, Act.NONE)
+    assert next_state(ThreadState.IDLE, Signal.INBOUND_OWNER) == Transition(ThreadState.IDLE, Act.NONE)

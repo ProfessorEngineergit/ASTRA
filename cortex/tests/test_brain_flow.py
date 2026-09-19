@@ -106,13 +106,17 @@ class Flow:
     def __init__(self, fdb, monkeypatch):
         self.db = fdb
         self.sent, self.telegram, self.alerts, self.replies = [], [], [], []
+        self.send_kw: list[dict] = []
         self.triage = TriageResult(mode="auto", sensitivity="none")
         self.reply_text = "Klar, ich richte es Bahrian aus."
         self.mp = monkeypatch
 
     # ── Einstellungen ────────────────────────────────────────────────────────
     def configure(self, **secretary):
-        base = {"activation_mode": "on", "enabled": True, "unknown_sender_action": "policy"}
+        # Smart-Antwort (Warten/Filtern) ist hier aus, damit die bestehenden Flow-Tests sofort antworten;
+        # die eigenen Smart-Tests unten schalten sie ein.
+        base = {"activation_mode": "on", "enabled": True, "unknown_sender_action": "policy",
+                "smart": {"enabled": False}}
         self.db.settings["app_settings"] = {"secretary": {**base, **secretary},
                                             "moderation": {"llm": False}}
 
@@ -168,8 +172,9 @@ def flow(monkeypatch, tmp_path):
     f = Flow(fdb, monkeypatch)
 
     class Channels:
-        async def send(self, channel, to, text):
+        async def send(self, channel, to, text, **kw):
             f.sent.append((channel, to, text))
+            f.send_kw.append(kw)
             return True
 
         async def send_telegram(self, chat, text, buttons=None, **kw):
@@ -611,3 +616,246 @@ def test_group_switched_off_stays_silent_even_when_mentioned(flow):
     cards.invalidate()
     flow.group("@Bahrian bist du da?", meta={"mentioned_us": True})
     assert flow.sent == [] and flow.replies == []
+
+
+# ─── Smart-Antwort: warten, filtern, vorstellen, schweigen ────────────────────
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+from app import outbox, smart_reply  # noqa: E402
+
+TID = "waha:491511111111@c.us"
+
+
+def _smart(flow, **smart):
+    flow.configure(smart={"enabled": True, **smart})
+    smart_reply_ready = smart.pop("_calendar", None)
+    return smart_reply_ready
+
+
+def _due(flow):
+    """Die Wartezeit ist abgelaufen → der Sweeper ruft step_in()."""
+    flow.db.threads[TID]["defer_until"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+    asyncio.run(brain.step_in(TID))
+
+
+def _state(flow):
+    return flow.db.threads[TID]["state"]
+
+
+def _meta(flow):
+    return flow.db.threads[TID]["meta"]
+
+
+@pytest.fixture(autouse=True)
+def _reset_outbox():
+    outbox.reset()
+    yield
+    outbox.reset()
+
+
+def test_noise_is_never_answered_and_never_waits(flow):
+    for text in ("😂", "👍", "😂😂😂", "haha", "lol", "https://tenor.com/view/lustig", "ok", "danke!", "🙏"):
+        flow.inbound(text)
+    assert flow.sent == [] and flow.replies == [] and TID in flow.db.threads
+    assert _state(flow) != "deferred"                                            # auch kein Warten für Rauschen
+    assert sum(1 for a in flow.db.audits if a["type"] == "smart_ignored") == 9
+
+
+def test_noise_filter_can_be_switched_off(flow):
+    flow.configure(smart={"enabled": False, "ignore_noise": False})
+    flow.inbound("👍")
+    assert len(flow.replies) == 1
+
+
+def test_ping_waits_a_minute_then_introduces_once_and_then_stays_quiet(flow, monkeypatch):
+    _smart(flow)
+    monkeypatch.setattr(smart_reply, "calendar_ready", lambda: False)
+    flow.inbound("Bahrian, bist du da? Hallo, kann ich mit dir reden?")
+    assert flow.sent == [] and flow.replies == []                                # nichts sofort
+    assert _state(flow) == "deferred" and _meta(flow)["smart_kind"] == "ping"
+    wait = (flow.db.threads[TID]["defer_until"] - datetime.now(timezone.utc)).total_seconds()
+    assert 50 <= wait <= 61                                                       # ~1 Minute
+    _due(flow)
+    assert len(flow.replies) == 1 and len(flow.sent) == 1
+    system = flow.replies[0]["extra_system"]
+    assert "KI-Assistent" in system and "noch nicht gemeldet" in system
+    assert "KEINEN Zugriff auf Bahrians Kalender" in system                        # ehrlich: kein Kalender verbunden
+    assert _state(flow) == "answered" and _meta(flow)["quiet_until"] > time.time()
+    # danach: Smalltalk und Rauschen bekommen keine Antwort mehr
+    flow.inbound("wie gehts dir so")
+    flow.inbound("haha")
+    flow.inbound("hallo??")
+    assert len(flow.replies) == 1
+    # eine konkrete Anfrage bekommt SOFORT eine Antwort (die Ruhephase gilt nur für Smalltalk)
+    flow.inbound("Hast du morgen um 16 Uhr Zeit?")
+    assert len(flow.replies) == 2 and _state(flow) == "answered"
+
+
+def test_intro_tells_the_truth_about_calendar_access(flow, monkeypatch):
+    _smart(flow)
+    monkeypatch.setattr(smart_reply, "calendar_ready", lambda: True)
+    flow.inbound("hey")
+    _due(flow)
+    assert "Zugriff auf Bahrians Kalender" in flow.replies[0]["extra_system"]
+    assert "KEINEN" not in flow.replies[0]["extra_system"]
+    # Karte verbietet Kalenderauskünfte → trotz Kalender keine Terminauskunft versprechen
+    flow.db.threads.clear()
+    flow.add_card(name="Lena", handles=[{"channel": "waha", "id": "491511111111@c.us"}], share={"availability": "none"})
+    flow.inbound("hey")
+    _due(flow)
+    assert "KEINEN Zugriff" in flow.replies[1]["extra_system"]
+
+
+def test_request_waits_then_answers_normally_without_an_introduction(flow):
+    _smart(flow)
+    flow.inbound("Hast du am Samstag Zeit?")
+    assert flow.replies == [] and _meta(flow)["smart_kind"] == "request"
+    _due(flow)
+    system = flow.replies[0]["extra_system"]
+    assert "Bahrian hat nicht selbst geantwortet" in system and "Stelle dich JETZT" not in system
+    assert _meta(flow)["smart_until"] > time.time() and "quiet_until" not in _meta(flow)
+
+
+def test_answering_within_the_wait_cancels_everything(flow):
+    _smart(flow)
+    flow.inbound("Hey, bist du da?")
+    assert _state(flow) == "deferred"
+    flow.inbound("jo bin da, was gibts", force_owner=True)                            # Bahrian schreibt selbst
+    assert _state(flow) == "standdown"
+    _due(flow)                                                                         # Sweeper feuert trotzdem
+    assert flow.sent == [] and flow.replies == []
+
+
+def test_second_message_during_the_wait_keeps_the_timer_and_upgrades_the_kind(flow):
+    _smart(flow)
+    flow.inbound("hey")
+    first = flow.db.threads[TID]["defer_until"]
+    flow.inbound("hast du morgen zeit für ein treffen?")
+    assert flow.db.threads[TID]["defer_until"] == first                                # Timer läuft ab der ERSTEN Nachricht
+    assert _meta(flow)["smart_kind"] == "request"
+    flow.inbound("😂")                                                                  # Rauschen ändert nichts
+    assert flow.db.threads[TID]["defer_until"] == first
+    _due(flow)
+    assert "Stelle dich JETZT" not in flow.replies[0]["extra_system"]                  # Anfrage → normale Antwort
+
+
+def test_owner_stepping_in_mid_conversation_stops_asta_and_the_next_message_waits_again(flow):
+    _smart(flow)
+    flow.inbound("Wann hast du heute Zeit?")
+    _due(flow)                                                                         # ASTRA antwortet nach der Wartezeit
+    assert len(flow.replies) == 1 and _state(flow) == "answered"
+    flow.inbound("und wie sieht es um 18 Uhr aus?")                                    # laufendes Gespräch → sofort
+    assert len(flow.replies) == 2 and _state(flow) == "answered"
+    flow.inbound("Ja, ich bin jetzt da, das war mein KI-Agent", force_owner=True)
+    assert _state(flow) == "standdown" and _meta(flow)["smart_until"] == 0 and _meta(flow)["quiet_until"] == 0
+    flow.inbound("Perfekt, dann um 18 Uhr?")                                            # nächste Nachricht → wieder warten
+    assert len(flow.replies) == 2 and _state(flow) == "deferred"
+
+
+def test_own_echo_is_not_mistaken_for_the_owner_stepping_in(flow):
+    _smart(flow)
+    flow.inbound("Hast du morgen Zeit?")
+    _due(flow)
+    sent = flow.sent_texts[-1]
+    outbox.remember(sent)                                                              # das macht Channels.send
+    flow.inbound(sent, force_owner=True)                                               # WhatsApp meldet es als „fromMe“
+    assert _state(flow) == "answered" and _meta(flow)["smart_until"] > time.time()     # kein Stand-down
+    flow.inbound("ich übernehme kurz", force_owner=True)                               # ein ECHTES Eingreifen wirkt
+    assert _state(flow) == "standdown"
+
+
+def test_explicit_direct_mode_and_direct_cards_keep_instant_answers(flow):
+    _smart(flow)
+    flow.configure(smart={"enabled": True}, channels={"waha": {"enabled": True, "mode": "direct"}})
+    flow.inbound("hey")
+    assert len(flow.replies) == 1                                                       # Kanalmodus „direkt“ = sofort
+    flow.db.threads.clear()
+    flow.configure(smart={"enabled": True})
+    flow.add_card(name="Lena", handles=[{"channel": "waha", "id": "491511111111@c.us"}], rule="direct")
+    flow.inbound("hey")
+    assert len(flow.replies) == 2                                                       # Karte „immer direkt“ = sofort
+
+
+def test_smart_channel_mode_applies_even_when_not_always_on(flow):
+    flow.configure(activation_mode="auto", channels={"waha": {"enabled": True, "mode": "smart"}},
+                   smart={"enabled": True})
+    flow.mp.setattr(brain, "resolve_service_status",
+                    lambda *a, **k: _async(SimpleNamespace(active=True, source="test", reason="test")))
+    flow.inbound("Hast du morgen Zeit?")
+    assert flow.replies == [] and _state(flow) == "deferred"
+
+
+async def _async(value):
+    return value
+
+
+def test_smart_does_not_touch_groups(flow):
+    _smart(flow)
+    flow.add_card(kind="group", name="Astroclub", handles=[{"channel": "waha", "id": "12345-6789@g.us"}],
+                  group={"trigger": "mention", "role": "assistant"})
+    flow.group("@Bahrian hast du morgen zeit?", meta={"mentioned_us": True})
+    assert len(flow.replies) == 1                                                       # Gruppen: wie bisher, kein Warten
+
+
+# ─── Stil-Wechsel mitten im Gespräch ──────────────────────────────────────────
+def test_style_change_mid_conversation_reaches_the_prompt_after_the_history(flow):
+    from app.agent import TAIL_MARK
+    card = flow.add_card(name="Lena", handles=[{"channel": "waha", "id": "491511111111@c.us"}], style="warm")
+    flow.inbound("Hey, was gibts?")
+    warm = flow.replies[0]["extra_system"]
+    assert TAIL_MARK in warm and "warm" in warm.split(TAIL_MARK)[1].lower()
+    asyncio.run(cards.save_card({**card, "style": "arrogant"}))                          # wie im Admin: Stil ändern
+    flow.inbound("Und noch was: Hast du morgen Zeit?")
+    tail = flow.replies[1]["extra_system"].split(TAIL_MARK)[1]
+    assert "überheblich" in tail.lower() and "NICHT nach ihnen" in tail                  # Erinnerung NACH dem Verlauf
+
+
+def test_agent_puts_the_style_reminder_behind_the_conversation_history(monkeypatch):
+    from app import agent
+    from app.agent import TAIL_MARK
+    seen = {}
+
+    class GW:
+        enabled = True
+
+        async def chat(self, messages, tools=None, pick=None):
+            seen["messages"] = messages
+            return SimpleNamespace(content="ok", tool_calls=None)
+    monkeypatch.setattr(agent, "get_gateway", lambda: GW())
+    history = [{"role": "user", "content": "Hallo"}, {"role": "assistant", "content": "Hi! Schön dich zu lesen."},
+               {"role": "user", "content": "Und jetzt?"}]
+    asyncio.run(agent.generate_reply(register=Register.THIRD, contact={"id": "x"}, thread_id="t", channel="waha",
+                                     history=history, extra_system="HEAD" + TAIL_MARK + "STIL-TAIL"))
+    msgs = seen["messages"]
+    assert msgs[-1] == {"role": "system", "content": "STIL-TAIL"}                        # ganz am Ende
+    assert any(m["content"] == "HEAD" and m["role"] == "system" for m in msgs[:-3])
+    assert [m["content"] for m in msgs[-4:-1]] == ["Hallo", "Hi! Schön dich zu lesen.", "Und jetzt?"]
+
+
+# ─── Chat auf Bahrians Handy ungelesen lassen ─────────────────────────────────
+def test_replies_to_third_parties_ask_the_transport_to_keep_the_chat_unread(flow):
+    flow.inbound("Hey, hast du morgen Zeit?")
+    assert flow.send_kw[-1] == {"keep_unread": True}
+    flow.configure(smart={"enabled": False, "keep_unread": False})
+    flow.inbound("Und Samstag?")
+    assert flow.send_kw[-1] == {}
+
+
+def test_owner_own_conversation_is_never_marked_unread(flow):
+    asyncio.run(db.upsert_contact("telegram", OWNER_CHAT, display_name="Bahrian", trust_tier=0, is_owner=True))
+    flow.inbound("Hallo ASTRA", channel="telegram", handle=OWNER_CHAT, name="Bahrian")
+    assert flow.send_kw[-1] == {}
+
+
+def test_short_answer_to_a_question_from_asta_continues_the_conversation(flow):
+    _smart(flow)
+    flow.reply_text = "Meinst du Samstag um 15 Uhr?"
+    flow.inbound("Hast du am Wochenende Zeit für ein Treffen?")
+    _due(flow)
+    assert len(flow.replies) == 1 and _state(flow) == "answered"
+    flow.reply_text = "Alles klar, ich richte es aus."
+    flow.inbound("ja gerne")                                     # kurze Antwort auf die Rückfrage → weiter
+    assert len(flow.replies) == 2
+    flow.inbound("ok")                                           # jetzt gab es keine Rückfrage mehr → nur ein „ok“
+    flow.inbound("super danke")
+    assert len(flow.replies) == 2

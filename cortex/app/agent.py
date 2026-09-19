@@ -15,6 +15,10 @@ from .tools import (
     openai_tools, result_summary,
 )
 
+# Alles hinter dieser Marke im `extra_system` kommt NACH dem Gesprächsverlauf in den Prompt (Stil-Erinnerung):
+# Modelle richten sich sonst nach dem Ton ihrer eigenen früheren Antworten statt nach dem aktuellen Stil.
+TAIL_MARK = "\n\u2063\u2063TAIL\u2063\u2063\n"
+
 log = logging.getLogger("astra.agent")
 MAX_TOOL_ITERS = 4
 
@@ -181,6 +185,9 @@ async def _generate_reply_meta(
                 ),
             }
         )
+    tail = ""
+    if extra_system and TAIL_MARK in extra_system:
+        extra_system, _, tail = extra_system.partition(TAIL_MARK)
     if extra_system:
         messages.append({"role": "system", "content": extra_system})
     if register == Register.OWNER and channel == "web":
@@ -193,6 +200,8 @@ async def _generate_reply_meta(
             ),
         })
     messages += _history_to_messages(history)
+    if tail.strip():
+        messages.append({"role": "system", "content": tail.strip()})
 
     ctx = ToolContext(
         thread_id=thread_id, channel=channel, contact=contact, max_sensitivity=max_sensitivity,

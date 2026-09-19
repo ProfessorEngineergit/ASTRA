@@ -844,3 +844,34 @@ def test_osint_tab_renders_and_run_endpoint_gates_tool(memdb):
     assert c.post("/admin/osint/run", data={"tool": "home_assistant_call"}).status_code == 400
     assert c.post("/admin/osint/run", data={"tool": "ops_exec"}).status_code == 400
     assert c.post("/admin/osint/run", data={"tool": "osint_exit_ip"}).status_code == 400
+
+
+def test_secretary_page_offers_smart_mode_and_saves_smart_settings(memdb, monkeypatch):
+    _prime_manager()
+    from app import db, smart_reply
+
+    async def none(*a, **k):
+        return []
+    monkeypatch.setattr(db, "list_threads", none)
+    monkeypatch.setattr(db, "recent_messages", none)
+    c = TestClient(_app())
+    c.get("/admin/setup")
+    c.post("/admin/setup", data={"csrf": c.cookies.get(auth.CSRF_COOKIE), "password": "geheim123",
+                                 "confirm": "geheim123"}, follow_redirects=False)
+    page = c.get("/admin/secretary").text
+    assert "Smart-Antwort" in page and 'value="smart"' in page and "Smart (warten" in page
+    assert 'name="sec_smart_wait"' in page and 'name="sec_smart_unread"' in page and 'name="sec_smart_noise"' in page
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    r = c.post("/admin/secretary", data={
+        "csrf": csrf, "sec_activation_mode": "on", "sec_waha_mode": "smart", "sec_waha_enabled": "on",
+        "sec_smart_enabled": "on", "sec_smart_wait": "45", "sec_smart_conv": "20", "sec_smart_quiet": "120",
+        "sec_smart_noise": "on"}, follow_redirects=False)
+    assert r.status_code == 303
+    saved = memdb["app_settings"]["secretary"]
+    assert saved["channels"]["waha"]["mode"] == "smart"
+    cfg = smart_reply.settings(memdb["app_settings"])
+    assert cfg == {"enabled": True, "wait_seconds": 45, "conversation_minutes": 20, "quiet_minutes": 120,
+                   "ignore_noise": True, "keep_unread": False}                # nicht angehakt = aus
+    import re
+    assert re.search(r'<option[^>]*value="smart"[^>]*selected|<option[^>]*selected[^>]*value="smart"',
+                     c.get("/admin/secretary").text)                              # gespeicherte Wahl bleibt gewählt

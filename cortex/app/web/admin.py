@@ -2178,11 +2178,41 @@ def _render_contact_rules(rules: list) -> str:
     return f'<div data-contact-rule-list>{rows}</div>'
 
 
+def _smart_settings_block(appset: dict) -> str:
+    """Einstellungen der Smart-Antwort (Warten · Filtern · Vorstellen) im Secretary-Formular."""
+    from .. import smart_reply
+    c = smart_reply.settings(appset)
+
+    def chk(name: str, on: bool, label: str, hint: str = "") -> str:
+        h = f'<div class="note" style="margin:2px 0 0 26px">{esc(hint)}</div>' if hint else ""
+        return (f'<div style="margin-top:8px"><label class="secretary-switch"><input type="checkbox" name="{name}"'
+                f'{" checked" if on else ""}> {esc(label)}</label>{h}</div>')
+
+    def num(name: str, value: int, label: str) -> str:
+        return (f'<div><label>{esc(label)}</label><input type="number" min="1" name="{name}" value="{value}"></div>')
+    return f"""
+        <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border-soft)">
+          <h3 style="margin:0 0 4px;font-size:15px">Smart-Antwort</h3>
+          <p class="note" style="margin:0 0 6px">Bei „Immer an“ (oder Kanalmodus „Smart“) wartet ASTRA erst eine Weile, ob du selbst antwortest;
+          greifst du ein, schweigt es. Danach antwortet es auf echte Anfragen (Kalender, Termine, Ausrichten), stellt sich bei „Hallo / bist du da“
+          <b>einmal</b> vor und schweigt zu Smalltalk. Emojis, GIFs, Links, „ok“ und „danke“ bekommen keine Antwort.</p>
+          {chk("sec_smart_enabled", c["enabled"], "Smart-Antwort aktiv")}
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:10px">
+            {num("sec_smart_wait", c["wait_seconds"], "Warten auf dich (Sekunden)")}
+            {num("sec_smart_conv", c["conversation_minutes"], "Gespräch läuft (Minuten)")}
+            {num("sec_smart_quiet", c["quiet_minutes"], "Ruhe nach Vorstellung (Minuten)")}
+          </div>
+          {chk("sec_smart_noise", c["ignore_noise"], "Emojis, GIFs, Links, „ok“/„danke“ nicht beantworten")}
+          {chk("sec_smart_unread", c["keep_unread"], "Chats auf meinem Handy ungelesen lassen (WhatsApp)",
+               "Setzt den Chat nach ASTRAs Antwort wieder auf „ungelesen“. Klappt nur, wenn WAHA das unterstützt.")}
+        </div>"""
+
+
 def _secretary_channel_card(channel: str, cfg: dict, inst: dict) -> str:
     mode_options = {
-        "waha": [("school_direct", "Schulzeit direkt"), ("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
-        "signal": [("school_direct", "Schulzeit direkt"), ("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
-        "slack": [("school_direct", "Schulzeit direkt"), ("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
+        "waha": [("school_direct", "Schulzeit direkt"), ("smart", "Smart (warten · filtern · vorstellen)"), ("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
+        "signal": [("school_direct", "Schulzeit direkt"), ("smart", "Smart (warten · filtern · vorstellen)"), ("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
+        "slack": [("school_direct", "Schulzeit direkt"), ("smart", "Smart (warten · filtern · vorstellen)"), ("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
         "email": [("always_ask", "Immer fragen"), ("wait", "Warten"), ("direct", "Direkt")],
     }[channel]
     setup = {
@@ -2360,6 +2390,7 @@ async def secretary_page(request: Request, _: bool = Depends(auth.require_admin)
           <label class="secretary-switch"><input type="checkbox" name="sec_school_direct"{_checked(settings.get("school_direct", True))}> In Schulzeit direkt antworten</label>
           {weekday_checks}
         </div>
+        {_smart_settings_block(appset)}
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:14px">
           <div><label>Erste Nachricht</label><input type="text" name="sec_intro" value="{esc(settings.get("intro"))}"></div>
           <div><label>Folge-Header</label><input type="text" name="sec_header" value="{esc(settings.get("header"))}"></div>
@@ -2918,6 +2949,14 @@ async def secretary_save(request: Request, _: bool = Depends(auth.require_admin)
         "email_accounts": email_accounts,
         "contact_rules": contact_rules_list,
         "unknown_sender_action": str(form.get("sec_unknown_sender_action") or "policy"),
+        "smart": {
+            "enabled": "sec_smart_enabled" in form,
+            "wait_seconds": intval("sec_smart_wait", 60),
+            "conversation_minutes": intval("sec_smart_conv", 30),
+            "quiet_minutes": intval("sec_smart_quiet", 180),
+            "ignore_noise": "sec_smart_noise" in form,
+            "keep_unread": "sec_smart_unread" in form,
+        },
     }
     await db.set_setting("app_settings", appset)
     await db.audit("secretary_settings_saved", actor="owner",
