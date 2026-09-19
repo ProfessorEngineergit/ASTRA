@@ -723,3 +723,25 @@ def test_open_rejects_garbage_and_redirects_when_a_card_exists_meanwhile(bulkdb)
     r = c.get(f"/admin/contacts/open?ref={quote(ref)}", follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/admin/contacts/lena"
     assert c.post("/admin/contacts/create", data={"csrf": "x", "ref": ref}, follow_redirects=False).status_code == 403
+
+
+# ─── Secretary-Schalter für alle Ausgewählten (feste Leiste oben) ─────────────
+def test_selection_bar_and_json_bulk_switch(bulkdb):
+    c = _client()
+    _create(c)
+    page = c.get("/admin/contacts").text
+    assert 'id="selbar"' in page and 'id="selbar-switch"' in page and "Secretary für alle Ausgewählten" in page
+    assert page.index('id="selbar"') < page.index('id="dirtbl"')                       # Leiste liegt über der Tabelle
+    csrf = c.cookies.get(auth.CSRF_COOKIE)
+    sel = [_ref_for(page, "Lena"), _ref_for(page, "Tom"), _ref_for(page, "Astroclub")]
+    r = c.post("/admin/contacts/bulk", data={"csrf": csrf, "do": "sec_off", "sel": sel},
+               headers={"Accept": "application/json"})
+    assert r.json() == {"ok": True, "n": 3, "on": False}
+    assert all(bulkdb[k]["active"]["mode"] == "never" for k in ("lena", "tom", "astroclub"))
+    r = c.post("/admin/contacts/bulk", data={"csrf": csrf, "do": "sec_on", "sel": sel},
+               headers={"Accept": "application/json"})
+    assert r.json() == {"ok": True, "n": 3, "on": True}
+    assert all(bulkdb[k]["active"]["mode"] == "inherit" for k in ("lena", "tom", "astroclub"))
+    # ohne Accept-Header (kein JavaScript) bleibt es bei der Weiterleitung
+    r = c.post("/admin/contacts/bulk", data={"csrf": csrf, "do": "sec_off", "sel": sel[:1]}, follow_redirects=False)
+    assert r.status_code == 303 and "bulkoff" in r.headers["location"]

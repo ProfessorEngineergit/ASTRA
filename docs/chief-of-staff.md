@@ -22,8 +22,9 @@ Admin → **Kontakte** (alles dort sind **Secretary-Einstellungen**): eine Liste
 - **Aus** = der Secretary antwortet dieser Person/Gruppe nicht, notiert die Nachrichten aber weiter; **An** hebt „nie"/„blockieren"
   wieder auf. Kontakte ohne Karte lassen sich öffnen, ohne dass etwas gespeichert wird (bis du schaltest oder speicherst); die
   bekannte Vertrauensstufe bleibt dabei erhalten.
-- **In der Liste:** ein Schalter pro Zeile, Filter „Secretary aus", und für mehrere/alle Angehakten Sammelknöpfe Einschalten/
-  Ausschalten sowie „Regeln für die Auswahl" (Regel, Vertrauensstufe, Stil, Freigaben, Aktivzeiten, Modell, Gruppen-Trigger — nur
+- **In der Liste:** ein Schalter pro Zeile und Filter „Secretary aus". Sobald du Kontakte anhakst (oder oben „alle"), erscheint eine
+  **feste Leiste mit einem Secretary-Schalter für alle Ausgewählten** (An / Aus / „Gemischt (x von y an)"; bei „Gemischt" schaltet ein
+  Klick zuerst alle ein). Darunter „Regeln für die Auswahl" (Regel, Vertrauensstufe, Stil, Freigaben, Aktivzeiten, Modell, Gruppen-Trigger — nur
   was du änderst, wird gesetzt).
 
 Eine Karte enthält: Regel (nie/fragen/erlaubt/direkt) · Vertrauensstufe 0–3 · Stil · Anweisung · Freigaben

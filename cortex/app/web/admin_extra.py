@@ -54,6 +54,12 @@ _X_CSS = """
 .sec-toggle.on .track::after{transform:translateX(16px);background:#36d399}
 .sec-toggle:focus-visible{outline:2px solid var(--link);border-radius:8px}
 .sec-toggle.busy{opacity:.5;pointer-events:none}
+.sec-toggle.mixed .track{background:rgba(245,196,81,.18);border-color:rgba(245,196,81,.45)}
+.sec-toggle.mixed .track::after{transform:translateX(8px);background:#f5c451}.sec-toggle.mixed{color:#f8dfa0}
+.selbar{position:sticky;top:66px;z-index:20;display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:12px;
+  padding:10px 16px;background:var(--surface);border:1px solid var(--link);border-radius:var(--r);
+  box-shadow:0 8px 24px rgba(0,0,0,.35)}
+.selbar[hidden]{display:none}.selbar .n{font-weight:650}
 @media(max-width:640px){.x-tbl{font-size:12.5px}.x-tbl td,.x-tbl th{padding:7px 6px}}
 </style>
 """
@@ -435,6 +441,13 @@ Regeln in einem Rutsch. Gruppen funktionieren wie Nutzer: nur was du freigibst, 
 <button class="btn ghost sm" type="submit">Suchen</button></form>
 <form method="post" action="/admin/contacts/bulk" id="bulkform">
 <input type="hidden" name="csrf" value="{esc(token)}">
+<div class="selbar" id="selbar" hidden>
+  <span class="n" id="selbar-n">0 ausgewählt</span>
+  <span class="x-muted">Secretary für alle Ausgewählten:</span>
+  <button type="button" class="sec-toggle" id="selbar-switch" role="switch" aria-checked="false"
+          title="Secretary für alle Ausgewählten ein-/ausschalten"><span class="track"></span><span class="lbl">An</span></button>
+  <a href="#bulkpanel" class="x-muted">Weitere Regeln ↓</a>
+</div>
 {table}
 {_bulk_panel()}
 </form>
@@ -448,15 +461,42 @@ Regeln in einem Rutsch. Gruppen funktionieren wie Nutzer: nur was du freigibst, 
     document.getElementById('bulkapply').disabled=n===0;
     document.getElementById('bulkdelete').disabled=n===0;
     document.getElementById('bulkon').disabled=n===0; document.getElementById('bulkoff').disabled=n===0;
+    barSync();
     all.checked=n>0&&n===rows().length; all.indeterminate=n>0&&n<rows().length;
   }}
+  const bar=document.getElementById('selbar'), sw=document.getElementById('selbar-switch');
+  const selRows=()=>rows().filter(r=>r.checked);
+  const rowSwitch=r=>r.closest('tr').querySelector('.sec-toggle');
+  function barSync(){{
+    const sel=selRows(); bar.hidden=sel.length===0;
+    document.getElementById('selbar-n').textContent=sel.length+(sel.length===1?' ausgewählt':' ausgewählt');
+    const on=sel.filter(r=>rowSwitch(r).classList.contains('on')).length;
+    const state=on===sel.length?'on':(on===0?'off':'mixed');
+    sw.classList.toggle('on',state==='on'); sw.classList.toggle('mixed',state==='mixed');
+    sw.setAttribute('aria-checked',state==='on'?'true':(state==='mixed'?'mixed':'false'));
+    sw.querySelector('.lbl').textContent=state==='on'?'An':(state==='off'?'Aus':'Gemischt ('+on+' von '+sel.length+' an)');
+    sw.dataset.next=state==='on'?'sec_off':'sec_on';                    // gemischt → erst alle an
+  }}
+  sw.addEventListener('click',async()=>{{
+    const sel=selRows(); if(!sel.length||sw.classList.contains('busy')) return;
+    sw.classList.add('busy');
+    const fd=new FormData(); fd.append('csrf',form.querySelector('[name=csrf]').value); fd.append('do',sw.dataset.next);
+    sel.forEach(r=>fd.append('sel',r.value));
+    try{{
+      const r=await fetch('/admin/contacts/bulk',{{method:'POST',body:fd,headers:{{'Accept':'application/json'}}}});
+      const j=await r.json(); if(!j.ok) throw new Error(j.error||'Fehler');
+      sel.forEach(row=>{{const b=rowSwitch(row); b.classList.toggle('on',j.on); b.setAttribute('aria-checked',j.on?'true':'false');
+        b.querySelector('.lbl').textContent=j.on?'An':'Aus'; b.value=b.value.split('|')[0]+'|'+(j.on?0:1);}});
+    }}catch(err){{ alert('Konnte den Schalter nicht setzen: '+err.message); }}
+    sw.classList.remove('busy'); barSync();
+  }});
   all.addEventListener('change',()=>{{rows().forEach(r=>r.checked=all.checked);sync();}});
   form.addEventListener('click',e=>{{           // ganze Zeile anklickbar (außer Häkchen, Schalter, Links)
     if(e.target.closest('input,button,a,label')) return;
     const link=e.target.closest('tr')?.querySelector('a.rowlink'); if(link) location.href=link.href;
   }});
   form.addEventListener('click',async e=>{{
-    const b=e.target.closest('.sec-toggle'); if(!b) return;
+    const b=e.target.closest('.sec-toggle'); if(!b||b.id==='selbar-switch') return;
     e.preventDefault(); if(b.classList.contains('busy')) return;
     b.classList.add('busy');
     const fd=new FormData(); fd.append('csrf',form.querySelector('[name=csrf]').value);
@@ -467,7 +507,7 @@ Regeln in einem Rutsch. Gruppen funktionieren wie Nutzer: nur was du freigibst, 
       b.classList.toggle('on',j.on); b.setAttribute('aria-checked',j.on?'true':'false');
       b.querySelector('.lbl').textContent=j.on?'An':'Aus'; b.value=b.value.split('|')[0]+'|'+(j.on?0:1);
     }} catch(err) {{ alert('Konnte den Schalter nicht setzen: '+err.message); }}
-    b.classList.remove('busy');
+    b.classList.remove('busy'); barSync();
   }});
   form.addEventListener('change',e=>{{if(e.target.classList.contains('rowsel'))sync();}});
   sync();
@@ -817,6 +857,8 @@ async def contacts_bulk(request: Request, _: bool = Depends(auth.require_admin))
         n += 1
     await db.audit("cards_bulk_saved", actor="owner", detail={"n": n, "fields": fields,
                                                               "secretary": action if action.startswith("sec_") else None})
+    if action.startswith("sec_") and "application/json" in request.headers.get("accept", ""):
+        return JSONResponse({"ok": True, "n": n, "on": action == "sec_on"})
     saved = {"sec_on": "bulkon", "sec_off": "bulkoff"}.get(action, "bulk")
     return RedirectResponse(f"/admin/contacts?saved={saved}&n={n}", status_code=303)
 
