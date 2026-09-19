@@ -96,7 +96,9 @@ class Channels:
             if parse_mode:
                 payload["parse_mode"] = parse_mode
             if buttons and i == len(chunks) - 1:   # buttons only on the last chunk
-                payload["reply_markup"] = {"inline_keyboard": [buttons]}
+                # Eine flache Liste = eine Zeile; eine Liste von Listen = mehrere Zeilen.
+                rows = buttons if isinstance(buttons[0], list) else [buttons]
+                payload["reply_markup"] = {"inline_keyboard": rows}
             ok = await self._post_telegram(payload) and ok
         return ok
 

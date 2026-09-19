@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
-from . import abuse, db, knowledge
+from . import (abuse, cards, db, digest, knowledge, model_choice, models, moderation,
+               moderation_gate, prompts, styles, usage)
 from .agent import generate_reply
 from .channels import get_channels
 from .config import get_settings
@@ -20,7 +23,7 @@ from .context_ledger import record_interaction
 from .memory import get_memory
 from .models import get_gateway
 from .persona import TRIAGE_INSTRUCTIONS, Register
-from .policy import Mode, Sensitivity, TrustTier, reconcile
+from .policy import Decision, Mode, Sensitivity, TrustTier, reconcile
 from .secretary import (
     CHANNEL_LABELS, SECRETARY_CHANNELS, channel_enabled, contact_rule_for, is_group_context,
     plan_for, resolve_service_status, shadow_enabled, tone_instruction, unknown_sender_action,
@@ -78,32 +81,50 @@ def _secretary_system(
     app_settings: dict | None = None,
     thread_meta: dict | None = None,
     handle: str = "",
+    card: dict | None = None,
 ) -> str:
     if channel not in SECRETARY_CHANNELS:
         return ""
     person = knowledge.person_file_for(channel, handle) if handle else None
-    # A per-person tone (from their profile) overrides the global/default tone.
-    if person and person.get("tone"):
+    meta = thread_meta or {}
+    # Vorrang beim Ton: Eskalation der Moderation (bestimmt/überheblich) > Stil der
+    # Kontaktkarte > `Ton:` im Profil > globaler Standard.
+    if meta.get("tone_override") or meta.get("security_watch"):
+        tone = tone_instruction(app_settings, thread_meta)
+    elif card and card.get("style"):
+        tone = styles.instruction(card["style"])
+    elif person and person.get("tone"):
         tone = f"Umgangston mit dieser Person (verbindlich): {person['tone']}."
     else:
         tone = tone_instruction(app_settings, thread_meta)
-    group_note = (
-        "Dieser Thread ist ein Gruppenchat. Fuehre keine Aktionen aus und triff keine Zusagen, "
-        "wenn Bahrian das nicht fuer genau diese Gruppe freigegeben hat. "
-        if (thread_meta or {}).get("is_group") else ""
-    )
+    group_note = ""
+    if meta.get("is_group"):
+        role = ((card or {}).get("group") or {}).get("role", "assistant")
+        group_note = (
+            "Dieser Thread ist ein Gruppenchat, in dem du angesprochen wurdest. Antworte kurz und nur "
+            "auf das, was dich betrifft; führe keine Aktionen aus und triff keine Zusagen, wenn Bahrian "
+            "das nicht für genau diese Gruppe freigegeben hat. "
+            + ("Du bist hier als Moderator freigegeben: ruhig ermahnen statt bloßstellen. "
+               if role == "moderator" else "")
+        )
     person_block = ""
     if person:
         person_block = (
             "\n\nProfil dieser Person (nutze es fuer Ton, Beziehung und was du teilen darfst):\n"
             + person["content"][:1600]
         )
+    card_block = " ".join(x for x in (cards.instruction_block(card), cards.share_prompt(card)) if x)
+    # Notizkarte NUR dieser Person/Gruppe (nie die eines anderen) — als Daten markiert.
+    try:
+        capsule = digest.prompt_block(digest.capsule_for(channel, handle, group=bool(meta.get("is_group"))))
+    except Exception:  # noqa: BLE001
+        capsule = ""
+    if capsule:
+        card_block = (card_block + " " if card_block else "") + capsule
     return (
-        "Du bist ASTRA im Secretary-Modus fuer Bahrians externe Kommunikation. "
-        "Sprich transparent als ASTRA, nie als Bahrian. Antworte knapp, organisatorisch, "
-        "ohne verbindliche Zusagen ohne Datenbasis. Wenn du Kalender/Stundenplan brauchst, "
-        "nutze Tools oder bleibe vorsichtig. "
-        f"{tone} {group_note}"
+        prompts.get("secretary_core")
+        + f"{tone} {group_note}"
+        f"{card_block + ' ' if card_block else ''}"
         f"Policy-Grund: {plan_reason or 'secretary'}."
         f"{person_block}"
     )
@@ -117,7 +138,10 @@ async def _send_and_record(
     contact: dict,
     *,
     max_sensitivity: str = "none",
+    moderate: bool = True,
 ) -> None:
+    """Senden + protokollieren. `moderate=False` nur für die festen Moderationsantworten
+    (die enthalten bewusst Nummern wie die Telefonseelsorge und dürfen nicht geschwärzt werden)."""
     if not text:
         return
     if channel in SECRETARY_CHANNELS:
@@ -144,6 +168,19 @@ async def _send_and_record(
                 app_settings=appset,
             )
         await db.merge_thread_meta(thread_id, {"secretary_announced": True})
+        if moderate:
+            out = moderation.moderate_outbound(text, app_settings=appset, third_party=True,
+                                               recipient_handles=(peer,))
+            if out.reasons:
+                await db.audit("moderation_outbound", channel=channel, thread_id=thread_id,
+                               contact_id=contact.get("id"),
+                               detail={"reasons": list(out.reasons), "blocked": out.blocked,
+                                       "preview": text[:160]})
+            if out.blocked:
+                text = with_secretary_header(
+                    out.text, first_interaction=False, app_settings=appset)
+            else:
+                text = out.text
     ok = await get_channels().send(channel, peer, text)
     await db.add_message(thread_id, "assistant", text)
     try:
@@ -217,6 +254,27 @@ async def handle_inbound(
     # where the peer is a THIRD party but Bahrian sent the message from his phone.)
     author_is_owner = force_owner if force_owner is not None else peer_is_owner
 
+    # ── Karten: Gruppen sind wie Benutzer — ohne Freigabe existieren sie nicht ────────
+    card: dict | None = None
+    is_group = bool(thread_meta.get("is_group"))
+    # In Gruppen zählt der TEILNEHMER (nicht die Gruppen-Id) für Rate-Limit und Moderation,
+    # sonst würde ein Störer die ganze Gruppe stummschalten.
+    actor = (thread_meta.get("participant_handle") if is_group else None) or sender_handle
+    if not peer_is_owner:
+        card = await cards.find_card(channel, sender_handle, kind="group" if is_group else "person")
+        if is_group:
+            if card is None:
+                if not author_is_owner:
+                    await _ask_new_group(channel, sender_handle, sender_display, text)
+                return
+            if card.get("rule") == "block":
+                await db.audit("group_blocked", channel=channel, detail={"group": sender_handle})
+                return
+            if actor != sender_handle:
+                pcard = await cards.find_card(channel, actor, kind="person")
+                if pcard and pcard.get("rule") == "block":
+                    return
+
     contact = await db.resolve_contact(channel, sender_handle)
     if not contact:
         contact = await db.upsert_contact(
@@ -248,10 +306,29 @@ async def handle_inbound(
 
     # ── Owner's own conversation with ASTRA (peer IS the owner) ─────────────────
     if peer_is_owner:
+        # Deterministische Chat-Befehle: /modell … (pro Chat) und /verbrauch … — ohne LLM/Token.
+        snapshot = models.model_config_snapshot()
+        is_cmd, new_pick, cmd_reply = model_choice.parse_command(text, snapshot)
+        if is_cmd:
+            meta_now = thread.get("meta") or {}
+            if new_pick is not None:
+                await db.merge_thread_meta(thread_id, {"model_pick": new_pick})
+                cmd_reply = f"{cmd_reply} Aktiv: {model_choice.label(new_pick, snapshot)}"
+            elif not cmd_reply:
+                cmd_reply = ("Aktuell: " + model_choice.label(meta_now.get("model_pick"), snapshot) +
+                             "\nWechseln: /modell schwer · klein · mittel · code · auto")
+            await _send_and_record(channel, sender_handle, thread_id, cmd_reply, contact, moderate=False)
+            return
+        if (ucmd := usage.parse_usage_command(text)) is not None:
+            report = await usage.report(*ucmd, tz=get_settings().astra_timezone)
+            await _send_and_record(channel, sender_handle, thread_id, report, contact, moderate=False)
+            return
         history = await db.recent_messages(thread_id)
         reply = await generate_reply(
             register=Register.OWNER, contact=contact, thread_id=thread_id, channel=channel,
             history=history, summary=thread.get("summary") or "", max_sensitivity="details",
+            model_pick=model_choice.clean_pick((thread.get("meta") or {}).get("model_pick")) or None,
+            chat_id=thread_id,
         )
         await _send_and_record(channel, sender_handle, thread_id, reply, contact)
         await db.set_thread_state(thread_id, ThreadState.ANSWERED.value)
@@ -274,7 +351,7 @@ async def handle_inbound(
                        contact_id=contact["id"])
         log.info("Secretary disabled for %s — recorded inbound message without replying.", channel)
         return
-    contact_rule = contact_rule_for(appset_pre, channel, sender_handle)
+    contact_rule = (card or {}).get("rule") or contact_rule_for(appset_pre, channel, sender_handle)
 
     # Explicit block rule → silent, cheapest possible path.
     if contact_rule == "block":
@@ -286,8 +363,10 @@ async def handle_inbound(
     # Cheap abuse / rate guards BEFORE any LLM or triage cost. The owner has
     # already been handled above, so this only ever clamps third parties.
     sec_pre = (appset_pre.get("secretary") or {})
+    # Inhalte (Code-Farming, Sexuelles …) prüft ab hier die Moderation — abuse.check
+    # bleibt für Rate-Limits zuständig (leerer Text = nur zählen).
     av = abuse.check(
-        channel, sender_handle, text,
+        channel, actor, "",
         short_max=int(sec_pre.get("rate_short_max") or 8),
         long_max=int(sec_pre.get("rate_long_max") or 60),
     )
@@ -304,12 +383,58 @@ async def handle_inbound(
                                    contact, max_sensitivity="none")
         return
 
+    # ── Content-Moderation: Eingang prüfen, BEVOR ein Token bezahlt wird ────────
+    tokens = cards.mention_tokens(s.astra_owner_name, card,
+                                  [thread_meta.get("own_id"), s.signal_phone_number])
+    reply_to_us = bool(thread_meta.get("reply_to_us") or thread_meta.get("mentioned_us"))
+    # Die Vertrauensstufe der Karte gilt auch für die Moderation (Kumpels sammeln keine Strikes).
+    gate_contact = {**contact, "trust_tier": card["trust_tier"]} if card and not is_group else contact
+    gate = await moderation_gate.gate_inbound(
+        channel=channel, handle=actor, thread_id=thread_id, contact=gate_contact,
+        text=text, app_settings=appset_pre)
+    if gate.escalation and gate.escalation.style != "normal":
+        # Die Eskalation schaltet den Stil dieser Person (bestimmt → überheblich).
+        thread_meta_patch = {"tone_override": gate.escalation.style, "security_watch": True,
+                             "security_reasons": list(gate.verdict.categories)}
+        await db.merge_thread_meta(thread_id, thread_meta_patch)
+        thread = {**thread, "meta": {**(thread.get("meta") or {}), **thread_meta_patch}}
+    if gate.stop:
+        log.info("Moderation stopped %s on %s (%s).", actor, channel,
+                 "muted" if gate.muted else gate.verdict.action)
+        speak = bool(gate.verdict.response) and not gate.muted and channel != "email"
+        if is_group:   # in Gruppen nur antworten, wenn ASTRA überhaupt angesprochen wurde
+            speak = speak and cards.group_decision(card, text, tokens=tokens,
+                                                   reply_to_us=reply_to_us).respond
+        if speak:
+            await _send_and_record(channel, sender_handle, thread_id, gate.verdict.response,
+                                   contact, max_sensitivity="none", moderate=False)
+        return
+
+    # ── Gruppen: spricht ASTRA hier überhaupt? (Trigger/Rolle der Gruppenkarte) ────
+    if is_group:
+        gd = cards.group_decision(card, text, tokens=tokens, reply_to_us=reply_to_us,
+                                  flagged=gate.verdict.flagged)
+        if not gd.respond:
+            log.debug("Group %s: not addressed (%s) — listening only.", sender_handle, gd.reason)
+            return
+        if gd.moderating:
+            await _moderate_group(channel, sender_handle, thread_id, contact, text, card,
+                                  thread, appset_pre)
+            return
+
     # The global Secretary state is resolved before contact-specific automation.
     # In Auto mode, EduPage is authoritative; Calendar/static school time are
     # fallbacks. This also prevents a `direct` contact from receiving a reply
     # after Bahrian's actual school day has ended.
+    # Eigenes Zeitfenster der Karte: „nie“ schlägt alles, „immer“ schlägt den Secretary-Plan
+    # (nicht aber den Master-Schalter — der stoppt schon weiter oben).
+    card_active = cards.active_state(card, datetime.now(ZoneInfo(s.astra_timezone)))
+    if card_active is False:
+        await db.audit("card_inactive", channel=channel, thread_id=thread_id,
+                       contact_id=contact["id"], detail={"card": (card or {}).get("key")})
+        return
     service_status = await resolve_service_status(appset_pre, s.astra_timezone)
-    if not service_status.active:
+    if not service_status.active and card_active is not True:
         await db.audit(
             "secretary_inactive",
             channel=channel,
@@ -325,7 +450,7 @@ async def handle_inbound(
         )
         return
 
-    if contact_rule is None:
+    if contact_rule is None and card is None:
         # Unknown sender — apply the configured default action
         action = unknown_sender_action(appset_pre)
         if action == "block":
@@ -372,10 +497,11 @@ async def handle_inbound(
             register=Register.THIRD, contact=contact, thread_id=thread_id, channel=channel,
             history=history, summary=thread.get("summary") or "",
             max_sensitivity=Sensitivity.DETAILS.value,
+            model_pick=(card or {}).get("model") or None,
             extra_system=_secretary_system(channel, "contact-rule-direct",
                                            app_settings=appset_for_reply,
                                            thread_meta=thread.get("meta") or {},
-                                           handle=sender_handle),
+                                           handle=sender_handle, card=card),
         )
         await _send_and_record(channel, sender_handle, thread_id, reply, contact,
                                max_sensitivity=Sensitivity.DETAILS.value)
@@ -384,59 +510,15 @@ async def handle_inbound(
     # contact_rule == "allow" → fall through to normal triage (policy decides mode)
 
     # ── Third party → triage + policy ──────────────────────────────────────────
-    inbound_verdict = check_inbound(text, channel=channel)
-    if not inbound_verdict.ok:
-        security_meta = {
-            "security_watch": True,
-            "security_reasons": inbound_verdict.reasons,
-            "tone_override": "firm",
-        }
-        await db.merge_thread_meta(thread_id, security_meta)
-        await db.audit(
-            "security_blocked_inbound",
-            channel=channel,
-            thread_id=thread_id,
-            contact_id=contact["id"],
-            detail={"reasons": inbound_verdict.reasons, "preview": text[:160]},
-        )
-        if channel == "email":
-            await db.add_message(thread_id, "assistant", "E-Mail wurde vom Security-Check blockiert.")
-            await _notify_owner(channel, thread_id, contact, text, "Security-Check hat eine E-Mail blockiert.")
-            return
-        await _send_and_record(
-            channel,
-            sender_handle,
-            thread_id,
-            "Ich kann diese Anfrage so nicht bearbeiten. Ich leite sie bei Bedarf an Bahrian weiter.",
-            contact,
-            max_sensitivity="none",
-        )
-        return
-    if inbound_verdict.reasons:
-        current_meta = (thread.get("meta") or {})
-        security_reasons = sorted(set((current_meta.get("security_reasons") or []) + inbound_verdict.reasons))
-        security_meta = {
-            "security_watch": True,
-            "security_reasons": security_reasons,
-            "security_strikes": int(current_meta.get("security_strikes") or 0) + 1,
-            "tone_override": "firm",
-        }
-        await db.merge_thread_meta(thread_id, security_meta)
-        thread = {**thread, "meta": {**current_meta, **security_meta}}
-        await db.audit(
-            "security_warn_inbound",
-            channel=channel,
-            thread_id=thread_id,
-            contact_id=contact["id"],
-            detail={"reasons": inbound_verdict.reasons},
-        )
-
-    tier = TrustTier(int(contact["trust_tier"]))
+    tier = TrustTier(int(card["trust_tier"]) if card else int(contact["trust_tier"]))
     history = await db.recent_messages(thread_id)
     gw = get_gateway()
     if gw.enabled:
-        sysmsg = TRIAGE_INSTRUCTIONS.format(owner=s.astra_owner_name, tier=int(tier))
-        triage = await gw.triage(sysmsg, _transcript(history, s.astra_owner_name))
+        sysmsg = prompts.render("triage", owner=s.astra_owner_name, tier=int(tier))
+        with usage.tag(purpose="triage", channel=channel, thread_id=thread_id,
+                       contact=str(contact.get("display_name") or sender_handle),
+                       third_party=True):
+            triage = await gw.triage(sysmsg, _transcript(history, s.astra_owner_name))
         decision = reconcile(_as_mode(triage.mode), tier, _as_sens(triage.sensitivity))
     else:
         decision = reconcile(Mode.DEFER, tier, Sensitivity.DETAILS)
@@ -447,6 +529,25 @@ async def handle_inbound(
     )
     _remember(contact, text, owner=False)
 
+    # Kartenfreigabe („Verfügbarkeit: nur frei/belegt“) ist die Obergrenze — nach oben UND unten.
+    # Wünscht die Anfrage mehr als erlaubt, fragt ASTRA Bahrian (Freigabe-Schleife, „Immer“/„Nie“).
+    ceiling = cards.share_ceiling(card)
+    card_ask = False
+    if ceiling:
+        order = {Sensitivity.NONE: 0, Sensitivity.FREEBUSY: 1, Sensitivity.DETAILS: 2}
+        wanted = _as_sens(triage.sensitivity) if gw.enabled else Sensitivity.DETAILS
+        new_mode = decision.mode
+        if order[wanted] > order[Sensitivity(ceiling)]:
+            # Mehr als freigegeben verlangt → Bahrian fragen (auch wenn die Vertrauensstufe
+            # schon ASK sagte: der Kanalmodus „direct“ würde das sonst wieder wegbügeln).
+            if decision.mode in (Mode.AUTO, Mode.ASK):
+                new_mode = Mode.ASK
+                card_ask = True
+        elif decision.mode == Mode.ASK and decision.reason.startswith("disclosure-above-tier"):
+            # Die Karte erlaubt es ausdrücklich, obwohl die Stufe „fremd“ fragen würde → antworten.
+            new_mode = Mode.AUTO
+        decision = Decision(new_mode, Sensitivity(ceiling), decision.reason + "+card-share")
+
     # Autonomy override: a confident/full owner lets ASTRA skip waiting/asking.
     mode = decision.mode
     appset = appset_pre
@@ -456,8 +557,10 @@ async def handle_inbound(
         max_sensitivity=decision.max_sensitivity,
         app_settings=appset,
         timezone=s.astra_timezone,
-        is_group=bool((thread.get("meta") or {}).get("is_group")),
-        service_active=service_status.active,
+        # Eine Gruppe mit Karte hat Bahrian schon freigegeben (Trigger/Rolle stehen dort) —
+        # das pauschale „Gruppen fragen immer nach“ aus plan_for würde jede Erwähnung erneut fragen.
+        is_group=False,
+        service_active=service_status.active or card_active is True,
         service_reason=service_status.reason,
     )
     # A 'silent' window (e.g. night quiet) → don't respond at all, just log.
@@ -474,18 +577,25 @@ async def handle_inbound(
         log.info("Autonomy=full → %s escalated to AUTO for %s", decision.mode.value, thread_id)
     elif auto == "confident" and mode == Mode.DEFER:
         mode = Mode.AUTO
+    # Verletzt die Anfrage die Freigabe der Karte, fragt ASTRA Bahrian — auch bei Kanalmodus
+    # „direct“. Nur bei Autonomie „full“ antwortet ASTRA stattdessen innerhalb der Obergrenze
+    # (der Prompt verbietet mehr; das Tool request_owner_approval bleibt für Rückfragen).
+    if card_ask and auto != "full" and mode == Mode.AUTO:
+        mode = Mode.ASK
 
     if mode == Mode.AUTO:
         reply = await generate_reply(
             register=Register.THIRD, contact=contact, thread_id=thread_id, channel=channel,
             history=history, summary=thread.get("summary") or "",
             max_sensitivity=decision.max_sensitivity.value,
+            model_pick=(card or {}).get("model") or None,
             extra_system=_secretary_system(
                 channel,
                 secretary_plan.reason,
                 app_settings=appset,
                 thread_meta=thread.get("meta") or {},
                 handle=sender_handle,
+                card=card,
             ),
         )
         # Shadow mode: send the draft to Bahrian for review instead of the contact.
@@ -515,25 +625,118 @@ async def handle_inbound(
         await _ask_owner(channel, sender_handle, thread_id, contact, text, decision)
 
 
+async def _card_for_thread(thread: dict) -> dict | None:
+    """Kontaktkarte zu einem gespeicherten Thread (für step_in/resume ohne handle_inbound-Kontext)."""
+    try:
+        kind = "group" if (thread.get("meta") or {}).get("is_group") else "person"
+        return await cards.find_card(thread["channel"], _peer(thread["thread_id"]), kind=kind)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _ask_new_group(channel: str, handle: str, name: str | None, text: str) -> None:
+    """Eine unbekannte Gruppe schreibt: Bahrian fragen, was ASTRA dort tun soll (höchstens alle
+    3 Tage pro Gruppe). Bis zur Freigabe wird NICHTS gespeichert und nicht geantwortet."""
+    s = get_settings()
+    key = f"groupask:{channel}:{handle}"
+    try:
+        last = float(await db.get_setting(key, 0) or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+    if time.time() - last < 3 * 24 * 3600:
+        return
+    await db.set_setting(key, time.time())
+    if not (s.telegram_enabled and s.telegram_owner_chat_id):
+        return
+    label = CHANNEL_LABELS.get(channel, channel)
+    title = name or handle
+    approval_id = await db.create_approval(
+        thread_id=None, contact_id=None, kind="new_group", question=text[:500],
+        payload={"channel": channel, "handle": handle, "name": title})
+    buttons = [
+        [{"text": "👂 Nur zuhören", "callback_data": f"apv:{approval_id}:g_listen"},
+         {"text": "💬 Bei @Erwähnung", "callback_data": f"apv:{approval_id}:g_mention"}],
+        [{"text": "🚫 Blockieren", "callback_data": f"apv:{approval_id}:g_block"}],
+    ]
+    await get_channels().send_telegram(
+        s.telegram_owner_chat_id,
+        f"👥 Neue Gruppe auf {label}: {title}\n„{text[:300]}“\n\nGruppen gibt es für mich erst, "
+        "wenn du sie freigibst. Was soll ich hier tun?",
+        buttons=buttons)
+    await db.audit("group_ask", channel=channel, detail={"group": handle, "name": title})
+
+
+async def resume_new_group(approval: dict, decision: str) -> None:
+    """Bahrian hat über eine neue Gruppe entschieden → Gruppenkarte anlegen."""
+    s = get_settings()
+    payload = approval.get("payload") or {}
+    ch, handle, name = payload.get("channel", ""), payload.get("handle", ""), payload.get("name", "")
+    setup = {"g_listen": ("listener", "off", "allow", "👂 Ich höre nur zu (sammle Kontext, antworte nie)."),
+             "g_mention": ("assistant", "mention", "allow",
+                           "💬 Ich antworte nur, wenn jemand @Bahrian/@ASTRA schreibt."),
+             "g_block": ("assistant", "mention", "block", "🚫 Blockiert — ich ignoriere die Gruppe.")}.get(decision)
+    if not (ch and handle and setup):
+        return
+    role, trigger, rule, said = setup
+    card = cards.new_card("group", name or handle, [{"channel": ch, "id": handle}])
+    card["group"].update(role=role, trigger=trigger)
+    card["rule"] = rule
+    taken = {c["key"] for c in await cards.load_all(force=True)}
+    base, i = card["key"], 2
+    while card["key"] in taken:
+        card["key"] = f"{base}_{i}"
+        i += 1
+    await cards.save_card(card)
+    await db.audit("group_decided", actor="owner", channel=ch, detail={"group": handle, "decision": decision})
+    if s.telegram_enabled and s.telegram_owner_chat_id:
+        await get_channels().send_telegram(
+            s.telegram_owner_chat_id, f"Gruppe „{name}“: {said}\n(Feinheiten unter Personen → Gruppen.)")
+
+
+async def _moderate_group(channel: str, handle: str, thread_id: str, contact: dict, text: str,
+                          card: dict, thread: dict, appset: dict) -> None:
+    """Moderator-Rolle: bei auffälligen Nachrichten ruhig eingreifen (mit Abkühlzeit)."""
+    meta = thread.get("meta") or {}
+    if time.time() - float(meta.get("last_moderated_at") or 0) < 90:
+        return
+    history = await db.recent_messages(thread_id)
+    m_meta = {**meta, "tone_override": "moderator"}
+    reply = await generate_reply(
+        register=Register.THIRD, contact=contact, thread_id=thread_id, channel=channel,
+        history=history, summary=thread.get("summary") or "", max_sensitivity="none",
+        model_pick=card.get("model") or None,
+        extra_system=_secretary_system(channel, "group-moderation", app_settings=appset,
+                                       thread_meta=m_meta, handle=handle, card=card)
+        + " Eine Nachricht in der Gruppe war unangemessen. Greife kurz, ruhig und freundlich ein, "
+          "ohne jemanden namentlich bloßzustellen.")
+    await db.merge_thread_meta(thread_id, {"last_moderated_at": time.time()})
+    await _send_and_record(channel, handle, thread_id, reply, contact, max_sensitivity="none")
+
+
 async def _ask_owner(channel: str, peer: str, thread_id: str, contact: dict, text: str, decision) -> None:
     s = get_settings()
     approval_id = await db.create_approval(
         thread_id=thread_id, contact_id=contact["id"], kind="disclosure",
-        question=text, payload={"channel": channel},
+        question=text, payload={"channel": channel, "topic": cards.topic_for(text)},
     )
     await db.set_thread_state(thread_id, ThreadState.AWAITING_APPROVAL.value)
     await db.audit("ask_principal", channel=channel, thread_id=thread_id, contact_id=contact["id"],
                    detail={"approval_id": approval_id})
     name = contact.get("display_name") or contact.get("handle")
     if s.telegram_enabled and s.telegram_owner_chat_id:
+        topic = cards.TOPIC_LABELS.get(cards.topic_for(text), "")
         buttons = [
-            {"text": "✅ Ja", "callback_data": f"apv:{approval_id}:yes"},
-            {"text": "🟡 Nur 'beschäftigt'", "callback_data": f"apv:{approval_id}:busy_only"},
-            {"text": "❌ Nein", "callback_data": f"apv:{approval_id}:no"},
+            [{"text": "✅ Ja", "callback_data": f"apv:{approval_id}:yes"},
+             {"text": "🟡 Nur 'beschäftigt'", "callback_data": f"apv:{approval_id}:busy_only"},
+             {"text": "❌ Nein", "callback_data": f"apv:{approval_id}:no"}],
+            [{"text": "♾ Immer ja", "callback_data": f"apv:{approval_id}:always_yes"},
+             {"text": "♾ Immer nur 'beschäftigt'", "callback_data": f"apv:{approval_id}:always_busy"},
+             {"text": "🚫 Nie", "callback_data": f"apv:{approval_id}:never"}],
         ]
         await get_channels().send_telegram(
             s.telegram_owner_chat_id,
-            f"🔔 {name} ({channel}) fragt:\n„{text}“\n\nDarf ASTRA antworten?",
+            f"🔔 {name} ({channel}) fragt:\n„{text}“\n\nDarf ASTRA antworten?"
+            + (f"\n(Thema: {topic} — „Immer/Nie“ merke ich mir für {name}.)" if topic else ""),
             buttons=buttons,
         )
     if channel == "email":
@@ -595,9 +798,11 @@ async def step_in(thread_id: str) -> None:
     contact = await db.get_contact(thread["contact_id"]) if thread.get("contact_id") else {}
     ceiling = (thread.get("meta") or {}).get("max_sensitivity", "freebusy")
     history = await db.recent_messages(thread_id)
+    card = await _card_for_thread(thread)
     reply = await generate_reply(
         register=Register.THIRD, contact=contact or {}, thread_id=thread_id, channel=thread["channel"],
         history=history, summary=thread.get("summary") or "", max_sensitivity=ceiling,
+        model_pick=(card or {}).get("model") or None,
         extra_system=(
             "Bahrian hat nicht selbst geantwortet. Antworte jetzt stellvertretend, knapp und souverän. "
             + _secretary_system(
@@ -606,6 +811,7 @@ async def step_in(thread_id: str) -> None:
                 app_settings=appset,
                 thread_meta=thread.get("meta") or {},
                 handle=_peer(thread_id),
+                card=card,
             )
         ),
     )
@@ -641,17 +847,24 @@ async def resume_after_approval(approval: dict, decision: str) -> None:
                        contact_id=thread.get("contact_id"), detail={"phase": "approval_resume"})
         return
     contact = await db.get_contact(thread["contact_id"]) if thread.get("contact_id") else {}
+    # „Immer/Nie“ → dauerhaft in die Karte schreiben; für DIESE Antwort gilt die Grundentscheidung.
+    if decision in cards.LEARN_DECISIONS:
+        await cards.learn_from_approval(approval, decision)
+        decision = cards.LEARN_DECISIONS[decision]
     ceiling, instruction = _RESUME.get(decision, _RESUME["no"])
     history = await db.recent_messages(thread_id)
+    card = await _card_for_thread(thread)
     reply = await generate_reply(
         register=Register.THIRD, contact=contact or {}, thread_id=thread_id, channel=thread["channel"],
         history=history, summary=thread.get("summary") or "", max_sensitivity=ceiling.value,
+        model_pick=(card or {}).get("model") or None,
         extra_system=instruction + " " + _secretary_system(
             thread["channel"],
             "owner-approved",
             app_settings=appset,
             thread_meta=thread.get("meta") or {},
             handle=_peer(thread_id),
+            card=card,
         ),
     )
     await _send_and_record(

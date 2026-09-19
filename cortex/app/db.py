@@ -133,6 +133,47 @@ async def _migrate() -> None:
         )
         """
     )
+    # LLM-Verbrauch & Kosten (jeder Gateway-Aufruf, siehe usage.py)
+    await _pool.execute(
+        """
+        CREATE TABLE IF NOT EXISTS usage_log (
+            id                BIGSERIAL PRIMARY KEY,
+            ts                TIMESTAMPTZ NOT NULL DEFAULT now(),
+            principal_key     TEXT NOT NULL DEFAULT '',
+            provider          TEXT NOT NULL DEFAULT '',
+            model             TEXT NOT NULL DEFAULT '',
+            role              TEXT NOT NULL DEFAULT '',
+            purpose           TEXT NOT NULL DEFAULT 'other',
+            channel           TEXT NOT NULL DEFAULT '',
+            thread_id         TEXT NOT NULL DEFAULT '',
+            chat_id           TEXT NOT NULL DEFAULT '',
+            contact           TEXT NOT NULL DEFAULT '',
+            prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            cost_usd          DOUBLE PRECISION,
+            latency_ms        INTEGER NOT NULL DEFAULT 0,
+            ok                BOOLEAN NOT NULL DEFAULT TRUE,
+            estimated         BOOLEAN NOT NULL DEFAULT FALSE,
+            error             TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    await _pool.execute("CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_log (ts DESC)")
+    # Kontaktkarten (Personen & Gruppen): Berechtigungen, Stil, Anweisung, Gelerntes.
+    # data = die ganze Karte als JSON (cards.py bereinigt/validiert), Spalten nur zum Listen.
+    await _pool.execute(
+        """
+        CREATE TABLE IF NOT EXISTS contact_cards (
+            principal_key TEXT NOT NULL DEFAULT '',
+            key           TEXT NOT NULL,
+            kind          TEXT NOT NULL DEFAULT 'person',
+            name          TEXT NOT NULL DEFAULT '',
+            data          JSONB NOT NULL DEFAULT '{}'::jsonb,
+            updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (principal_key, key)
+        )
+        """
+    )
     await _pool.execute("ALTER TABLE threads ADD COLUMN IF NOT EXISTS principal_key TEXT NOT NULL DEFAULT ''")
     await _pool.execute("ALTER TABLE approvals ADD COLUMN IF NOT EXISTS principal_key TEXT NOT NULL DEFAULT ''")
     # Seed exactly one default principal from the configured owner name.
@@ -168,6 +209,14 @@ async def resolve_contact(channel: str, handle: str) -> dict | None:
         "SELECT * FROM contacts WHERE channel=$1 AND handle=$2", channel, handle
     )
     return dict(row) if row else None
+
+
+async def contacts_list(limit: int = 500) -> list[dict]:
+    """Alle bekannten Kontakte außer dir selbst (für die Kontakt-Liste im Admin)."""
+    rows = await pool().fetch(
+        "SELECT channel, handle, display_name, trust_tier, relationship, updated_at FROM contacts "
+        "WHERE NOT is_owner ORDER BY updated_at DESC LIMIT $1", limit)
+    return [dict(r) for r in rows]
 
 
 async def get_contact(contact_id) -> dict | None:
@@ -296,7 +345,7 @@ async def get_approval(approval_id: str) -> dict | None:
 async def decide_approval(approval_id: str, decision: str) -> dict | None:
     row = await pool().fetchrow(
         """
-        UPDATE approvals SET status = CASE WHEN $2='no' THEN 'denied' ELSE 'approved' END,
+        UPDATE approvals SET status = CASE WHEN $2 IN ('no','never') THEN 'denied' ELSE 'approved' END,
                decision=$2, decided_at=now()
         WHERE id=$1 AND status='pending' RETURNING *
         """,
@@ -368,6 +417,14 @@ async def get_setting(key: str, default=None):
     if val is None:
         return default
     return val.get("v", default) if isinstance(val, dict) else val
+
+
+async def settings_by_prefix(prefix: str, limit: int = 200) -> dict:
+    """Alle Einstellungen, deren Schlüssel mit `prefix` beginnt (z. B. 'modstate:')."""
+    rows = await pool().fetch(
+        "SELECT key, value FROM settings WHERE key LIKE $1 ESCAPE '\\' ORDER BY updated_at DESC LIMIT $2",
+        prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%", limit)
+    return {r["key"]: (r["value"].get("v") if isinstance(r["value"], dict) else r["value"]) for r in rows}
 
 
 async def set_setting(key: str, value) -> None:
@@ -650,6 +707,109 @@ async def update_job(job_id: int, *, status: str | None = None, plan: str | None
         """,
         job_id, status, plan, result,
     )
+
+
+# ─── Usage (LLM-Verbrauch & Kosten) ───────────────────────────────────────────
+async def usage_insert(ev) -> None:
+    await pool().execute(
+        """
+        INSERT INTO usage_log (ts, principal_key, provider, model, role, purpose, channel,
+                               thread_id, chat_id, contact, prompt_tokens, completion_tokens,
+                               cost_usd, latency_ms, ok, estimated, error)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+        """,
+        ev.ts, ev.principal_key, ev.provider, ev.model, ev.role, ev.purpose, ev.channel,
+        ev.thread_id, ev.chat_id, ev.contact, ev.prompt_tokens, ev.completion_tokens,
+        ev.cost_usd, ev.latency_ms, ev.ok, ev.estimated, ev.error,
+    )
+
+
+async def usage_rows(since: datetime, until: datetime | None = None, *,
+                     principal_key: str | None = None, limit: int = 50000) -> list[dict]:
+    q = ("SELECT ts, principal_key, provider, model, role, purpose, channel, thread_id, chat_id, "
+         "contact, prompt_tokens, completion_tokens, cost_usd, latency_ms, ok, estimated "
+         "FROM usage_log WHERE ts >= $1")
+    args: list = [since]
+    if until is not None:
+        args.append(until)
+        q += f" AND ts < ${len(args)}"
+    if principal_key is not None:
+        args.append(principal_key)
+        q += f" AND principal_key = ${len(args)}"
+    args.append(limit)
+    q += f" ORDER BY ts DESC LIMIT ${len(args)}"
+    return [dict(r) for r in await pool().fetch(q, *args)]
+
+
+async def usage_for_chat(chat_id: str, limit: int = 5000) -> list[dict]:
+    rows = await pool().fetch(
+        "SELECT ts, provider, model, role, purpose, channel, chat_id, prompt_tokens, "
+        "completion_tokens, cost_usd, ok, estimated FROM usage_log WHERE chat_id = $1 "
+        "ORDER BY ts DESC LIMIT $2", chat_id, limit)
+    return [dict(r) for r in rows]
+
+
+async def usage_recent(limit: int = 30) -> list[dict]:
+    rows = await pool().fetch(
+        "SELECT ts, provider, model, role, purpose, channel, chat_id, prompt_tokens, "
+        "completion_tokens, cost_usd, latency_ms, ok, estimated FROM usage_log "
+        "ORDER BY ts DESC LIMIT $1", limit)
+    return [dict(r) for r in rows]
+
+
+async def usage_month_cost(since: datetime, *, third_party_only: bool = False) -> float:
+    q = "SELECT COALESCE(SUM(cost_usd),0) FROM usage_log WHERE ts >= $1"
+    if third_party_only:
+        q += " AND channel IN ('waha','signal','slack','email')"
+    return float(await pool().fetchval(q, since) or 0)
+
+
+async def usage_models_seen(limit: int = 12) -> list[dict]:
+    rows = await pool().fetch(
+        "SELECT provider, model, count(*) AS n, max(ts) AS last FROM usage_log "
+        "GROUP BY provider, model ORDER BY max(ts) DESC LIMIT $1", limit)
+    return [dict(r) for r in rows]
+
+
+# ─── Contact cards ────────────────────────────────────────────────────────────
+async def card_list(principal_key: str = "") -> list[dict]:
+    rows = await pool().fetch(
+        "SELECT key, kind, name, data FROM contact_cards WHERE principal_key=$1 ORDER BY kind, lower(name)",
+        principal_key)
+    out = []
+    for r in rows:
+        data = dict(r["data"] or {})
+        data.update(key=r["key"], kind=r["kind"], name=r["name"])
+        out.append(data)
+    return out
+
+
+async def card_get(key: str, principal_key: str = "") -> dict | None:
+    r = await pool().fetchrow(
+        "SELECT key, kind, name, data FROM contact_cards WHERE principal_key=$1 AND key=$2",
+        principal_key, key)
+    if not r:
+        return None
+    data = dict(r["data"] or {})
+    data.update(key=r["key"], kind=r["kind"], name=r["name"])
+    return data
+
+
+async def card_save(card: dict, principal_key: str = "") -> None:
+    await pool().execute(
+        """
+        INSERT INTO contact_cards (principal_key, key, kind, name, data, updated_at)
+        VALUES ($1,$2,$3,$4,$5, now())
+        ON CONFLICT (principal_key, key) DO UPDATE
+            SET kind=EXCLUDED.kind, name=EXCLUDED.name, data=EXCLUDED.data, updated_at=now()
+        """,
+        principal_key, card["key"], card.get("kind", "person"), card.get("name", ""), card)
+
+
+async def card_delete(key: str, principal_key: str = "") -> int:
+    return int(await pool().fetchval(
+        "WITH d AS (DELETE FROM contact_cards WHERE principal_key=$1 AND key=$2 RETURNING 1) "
+        "SELECT count(*) FROM d", principal_key, key) or 0)
 
 
 # ─── Audit ────────────────────────────────────────────────────────────────────
