@@ -41,6 +41,7 @@ from .config import get_settings
 from .integrations.transcription import get_transcriber
 from .plugins.registry import get_manager
 from .web import admin as web_admin
+from .web import admin_extra as web_admin_extra
 from .web import auth as web_auth
 
 log = logging.getLogger("astra.main")
@@ -134,7 +135,20 @@ async def _handle_tg_update(
         # Acknowledge immediately so the spinner disappears
         await client.post(f"{base}/answerCallbackQuery", json={"callback_query_id": callback_id})
 
-        if data.startswith("apv:"):
+        if data.startswith("sec:"):
+            # Secretary-Knöpfe: NUR der Owner darf sie drücken (anders als apv: gibt es hier
+            # keine unratbare Id, die als Schutz dient).
+            from . import owner_commands
+            if sender_id == str(s.telegram_owner_chat_id):
+                cmd = owner_commands.command_from_callback(data)
+                if cmd:
+                    reply, with_buttons = await owner_commands.execute(cmd, timezone=s.astra_timezone)
+                    chat_id = (cb.get("message") or {}).get("chat", {}).get("id") or sender_id
+                    await get_channels().send_telegram(
+                        str(chat_id), reply, buttons=owner_commands.buttons() if with_buttons else None)
+            else:
+                log.warning("Secretary-Knopf von Nicht-Owner %s ignoriert.", sender_id)
+        elif data.startswith("apv:"):
             parts = data.split(":", 2)
             if len(parts) == 3:
                 _, approval_id, decision = parts
@@ -192,6 +206,15 @@ async def _handle_tg_update(
         chat = msg.get("chat") or {}
         chat_type = chat.get("type", "private")
         is_group = chat_type in {"group", "supergroup"}
+
+        # Schnellbefehle („/secretary aus“, „secretary bis 18 uhr aus“): deterministisch, ohne LLM.
+        if not is_group and sender_id == str(s.telegram_owner_chat_id):
+            from . import owner_commands
+            if (cmd := owner_commands.parse(text)) is not None:
+                reply, with_buttons = await owner_commands.execute(cmd, timezone=s.astra_timezone)
+                await get_channels().send_telegram(
+                    sender_id, reply, buttons=owner_commands.buttons() if with_buttons else None)
+                return
 
         # Owner typing a bare "ja"/"nein" decides a pending approval directly.
         if not is_group and sender_id == str(s.telegram_owner_chat_id):
@@ -276,6 +299,8 @@ async def _resume_approval(approval: dict, decision: str) -> None:
         await brain.resume_outbound_send(approval, decision)
     elif kind == "ops_exec":
         await brain.resume_ops_exec(approval, decision)
+    elif kind == "new_group":
+        await brain.resume_new_group(approval, decision)
     else:
         await brain.resume_after_approval(approval, decision)
 
@@ -326,6 +351,8 @@ async def lifespan(app: FastAPI):
     # Give ASTRA control over its own setup (owner-only core tools).
     from .admin_tools import register_admin_tools
     register_admin_tools()
+    from .chief_tools import register_chief_tools
+    register_chief_tools()
 
     # Apply web-configured preferences (model override, UI font, autonomy) live.
     try:
@@ -335,7 +362,9 @@ async def lifespan(app: FastAPI):
         from .web.templates import set_font, set_theme
         set_model_override(appset.get("ai_model"))
         set_economy(bool(appset.get("economy_mode")))
-        set_model_config(appset.get("models"))   # provider registry + role assignment
+        set_model_config(appset.get("models"))
+        from . import usage as _usage
+        _usage.set_config(appset.get("usage"))   # provider registry + role assignment
         set_font(appset.get("font"))
         set_theme((appset.get("labs") or {}).get("theme"))
         set_autonomy(appset.get("autonomy", "ask"))
@@ -351,6 +380,27 @@ async def lifespan(app: FastAPI):
     rules_task = asyncio.create_task(_rules_scheduler(), name="rules_scheduler")
     tasks.append(rules_task)
     log.info("Rules scheduler started.")
+
+    # Hält den WAHA-Webhook am Leben (Session ohne Hook = WhatsApp empfängt nichts).
+    try:
+        from . import cards as _cards
+        made = await _cards.sync_legacy(await db.get_setting("app_settings", {}) or {})
+        if made:
+            log.info("%d Kontaktkarte(n) aus bestehenden Profilen/Regeln angelegt.", made)
+    except Exception:  # noqa: BLE001
+        log.warning("Kontaktkarten-Import fehlgeschlagen.", exc_info=True)
+
+    from . import digest as _digest
+    tasks.append(asyncio.create_task(_digest.scheduler(), name="digest_scheduler"))
+    log.info("Kontext-Digest scheduler started (03:30).")
+    if s.signal_phone_number:
+        from . import signal_events
+        tasks.append(asyncio.create_task(signal_events.listener(), name="signal_listener"))
+        log.info("Signal receive listener started.")
+
+    from . import waha_hooks
+    tasks.append(asyncio.create_task(waha_hooks.watchdog(), name="waha_watchdog"))
+    log.info("WAHA webhook watchdog started.")
 
     if s.astra_telegram_mode == "poll":
         poller_task = asyncio.create_task(_telegram_poller(), name="telegram_poller")
@@ -390,6 +440,7 @@ if _STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 app.include_router(web_admin.router)
+app.include_router(web_admin_extra.router)
 
 
 # ─── Auth helper ──────────────────────────────────────────────────────────────
@@ -460,6 +511,15 @@ async def ingress_telegram(
 
 # ─── WAHA (WhatsApp) ingress ───────────────────────────────────────────────────
 
+def _replied_to_us(payload: dict, body: dict) -> bool:
+    """Ist diese Gruppennachricht die Antwort auf eine Nachricht von uns? (WAHA: replyTo)"""
+    import re as _re
+    reply = payload.get("replyTo") or {}
+    own = _re.sub(r"\D", "", str((body.get("me") or {}).get("id") or "").split("@", 1)[0])
+    who = _re.sub(r"\D", "", str(reply.get("participant") or "").split("@", 1)[0])
+    return bool(reply) and bool(own) and who[-9:] == own[-9:]
+
+
 @app.post("/ingress/waha", tags=["ingress"])
 async def ingress_waha(
     request: Request,
@@ -510,6 +570,8 @@ async def ingress_waha(
         thread_meta={
             "is_group": is_group,
             "group_id": from_jid if is_group else None,
+            "own_id": (body.get("me") or {}).get("id"),
+            "reply_to_us": _replied_to_us(payload, body),
             "participant_handle": payload.get("participant") or raw_data.get("participant"),
             "participant_display": raw_data.get("notifyName"),
             "participant_username": raw_data.get("pushname") or raw_data.get("notifyName"),
@@ -543,39 +605,12 @@ async def ingress_signal(
     _verify_secret(x_astra_secret)
     body = await request.json()
     log.debug("Signal envelope received.")
-
-    envelope = body.get("envelope", {})
-    data_msg = envelope.get("dataMessage") or {}
-    text: str = data_msg.get("message") or ""
-    if not text.strip():
-        return {"ok": True, "skipped": "empty message"}
-
-    sender_handle: str = envelope.get("source") or envelope.get("sourceNumber") or ""
-    if not sender_handle:
-        log.warning("Signal webhook missing source number.")
-        return {"ok": True, "skipped": "no source"}
-
-    display_name: str | None = envelope.get("sourceName")
-    group_info = data_msg.get("groupInfo") or {}
-    group_id = group_info.get("groupId") or group_info.get("group_id")
-    is_group = bool(group_id)
-
-    await brain.handle_inbound(
-        channel="signal",
-        sender_handle=group_id or sender_handle,
-        text=text,
-        sender_display=group_info.get("name") or display_name,
-        thread_meta={
-            "is_group": is_group,
-            "group_id": group_id,
-            "group_name": group_info.get("name"),
-            "participant_handle": sender_handle,
-            "participant_display": display_name,
-            "participant_username": envelope.get("sourceUuid") or display_name,
-            "username": envelope.get("sourceUuid") or display_name,
-            "source_tag": "from Signal",
-        },
-    )
+    from . import signal_events
+    s = get_settings()
+    kwargs = signal_events.normalize(body, s.signal_phone_number, s.astra_owner_name)
+    if not kwargs:
+        return {"ok": True, "skipped": "no text / not a message"}
+    await brain.handle_inbound(**kwargs)
     return {"ok": True}
 
 

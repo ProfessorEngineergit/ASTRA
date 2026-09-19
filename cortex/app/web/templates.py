@@ -400,9 +400,11 @@ header.topbar {
 }
 .brand { display: flex; align-items: center; flex-shrink: 0; }
 .brand img { height: 30px; width: auto; display: block; }
-header.topbar nav { margin-left: auto; display: flex; gap: 4px; align-items: center; }
-.navlink { padding: 8px 14px; border-radius: var(--r-sm); font-size: 14px; color: var(--text-dim);
-  font-weight: 500; }
+header.topbar nav { margin-left: auto; display: flex; gap: 2px; align-items: center; min-width: 0;
+  overflow-x: auto; scrollbar-width: none; }
+header.topbar nav::-webkit-scrollbar { display: none; }
+.navlink { padding: 8px 10px; border-radius: var(--r-sm); font-size: 13.5px; color: var(--text-dim);
+  font-weight: 500; flex: 0 0 auto; white-space: nowrap; }
 .navlink:hover { color: var(--text); background: rgba(255,255,255,.05); }
 .navlink.active { color: var(--text); background: rgba(255,255,255,.08); }
 
@@ -428,6 +430,11 @@ input[type=text], input[type=password], input[type=number], input[type=email], s
   border-radius: var(--r-sm); padding: 11px 13px; font-size: 14px; font-family: inherit;
   transition: border-color .15s, box-shadow .15s; }
 .search { padding-left: 40px !important; }
+.panel textarea, .field textarea { width: 100%; background: var(--surface); border: 1px solid var(--border);
+  color: var(--text); border-radius: var(--r-sm); padding: 11px 13px; font-size: 14px; font-family: inherit;
+  line-height: 1.5; resize: vertical; }
+.panel textarea:focus, .field textarea:focus { outline: none; border-color: var(--link);
+  box-shadow: 0 0 0 3px color-mix(in srgb,var(--link) 18%,transparent); }
 input:focus, select:focus { outline: none; border-color: var(--link);
   box-shadow: 0 0 0 3px color-mix(in srgb,var(--link) 18%,transparent); }
 input::placeholder { color: var(--text-faint); }
@@ -1047,8 +1054,12 @@ def page(
             f'{navlink("/admin", "Plugins", "plugins")}'
             f'{navlink("/admin/chat", "Chat", "chat")}'
             f'{navlink("/admin/brain", "Wissen", "brain")}'
+            f'{navlink("/admin/prompts", "Prompts", "prompts")}'
             f'{navlink("/admin/secretary", "Secretary", "secretary")}'
+            f'{navlink("/admin/contacts", "Kontakte", "contacts")}'
+            f'{navlink("/admin/safety", "Sicherheit", "safety")}'
             f'{navlink("/admin/osint", "Recon", "osint")}'
+            f'{navlink("/admin/usage", "Verbrauch", "usage")}'
             f'{navlink("/admin/system", "System", "system")}'
             f'{navlink("/admin/settings", "Einstellungen", "settings")}'
             f'{navlink("/admin/update", "Update", "update")}'

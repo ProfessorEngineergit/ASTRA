@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
 from .. import __version__ as ASTRA_VERSION
-from .. import db, knowledge, sysinfo
+from .. import db, knowledge, model_choice, models, sysinfo, usage
 from ..config import get_settings
 from ..config_store import SECRET_SENTINEL, get_config_store
 from ..google_oauth import authorization_url, exchange_code, token_patch, user_email
@@ -3625,6 +3625,7 @@ def _new_chat(title: str = "Neuer Chat", *, messages: list[dict] | None = None) 
         "parent_id": None,
         "branch_base_count": 0,
         "permission_mode": "ask",
+        "model": {},                  # Modellwahl nur für diesen Chat (siehe model_choice)
         "messages": messages or [],
         "pending_action": None,
         "created_at": now,
@@ -3914,6 +3915,24 @@ def _render_messages(chat: dict) -> str:
     return "".join(msgs)
 
 
+def _model_select_options(snapshot: dict, seen: list[dict], current: dict) -> str:
+    """<option>-Liste für die Modellwahl; die aktuelle Wahl bleibt auch dann sichtbar,
+    wenn sie nicht in der Liste steht (z. B. frei eingegebenes Modell)."""
+    opts = model_choice.options(snapshot, seen)
+    cur = model_choice.encode(current)
+    if cur and not any(o["value"] == cur for o in opts):
+        opts.append({"value": cur, "label": model_choice.label(current, snapshot),
+                     "group": "Zuletzt genutzt", "disabled": False})
+    html, group = [], None
+    for o in opts:
+        if o["group"] != group:
+            html.append((f'</optgroup>' if group else "") + f'<optgroup label="{esc(o["group"])}">')
+            group = o["group"]
+        html.append(f'<option value="{esc(o["value"])}"{" selected" if o["value"] == cur else ""}'
+                    f'{" disabled" if o["disabled"] else ""}>{esc(o["label"])}</option>')
+    return "".join(html) + ("</optgroup>" if group else "")
+
+
 @router.get("/admin/chat", response_class=HTMLResponse)
 async def chat_page(
     request: Request,
@@ -3936,6 +3955,24 @@ async def chat_page(
     autonomy_cls = autonomy if autonomy in ("ask", "confident", "full") else "ask"
     active_count = sum(1 for c in store["chats"] if not c.get("archived"))
     archived_count = sum(1 for c in store["chats"] if c.get("archived"))
+    model_pick = model_choice.clean_pick((active or {}).get("model"))
+    model_snapshot = models.model_config_snapshot()
+    try:
+        seen_models = await db.usage_models_seen()
+    except Exception:  # noqa: BLE001
+        seen_models = []
+    model_options_html = _model_select_options(model_snapshot, seen_models, model_pick)
+    model_pill = esc(model_choice.label(model_pick, model_snapshot))
+    chat_cost_pill = ""
+    if active_id:
+        try:
+            chat_totals = usage.totals(await db.usage_for_chat(active_id))
+        except Exception:  # noqa: BLE001
+            chat_totals = None
+        if chat_totals and chat_totals["calls"]:
+            chat_cost_pill = (
+                f'<span class="mode-pill" title="Verbrauch nur dieses Chats">'
+                f'{esc(usage.fmt_tokens(chat_totals["tokens"]))} Token · {esc(usage.fmt_cost(chat_totals["cost"]))}</span>')
     can_merge = bool(active and active.get("parent_id") and not archive_view)
     delete_chat_btn = (
         '<button class="icon-btn title-icon danger" id="deletechat" title="Chat löschen" '
@@ -3993,6 +4030,10 @@ async def chat_page(
               <option value="auto" {"selected" if mode == "auto" else ""}>Auto</option>
               <option value="bypass" {"selected" if mode == "bypass" else ""}>Berechtigungen umgehen</option>
             </select>
+            <label>Modell</label>
+            <select id="model" {"disabled" if archive_view else ""} title="Nur für diesen Chat. Im Chat geht auch: /modell schwer">
+              {model_options_html}
+            </select>
             <label>Autonomie</label>
             <select id="autonomy" {"disabled" if archive_view else ""}>
               <option value="ask" {"selected" if autonomy == "ask" else ""}>ask</option>
@@ -4012,6 +4053,8 @@ async def chat_page(
             <div class="chat-state">
               <span class="mode-pill mode-{esc(mode_cls)}">{esc(_mode_label(mode))}</span>
               <span class="mode-pill autonomy-{esc(autonomy_cls)}">Autonomie {esc(autonomy)}</span>
+              <span class="mode-pill" id="modelpill" title="Modell dieses Chats">{model_pill}</span>
+              {chat_cost_pill}
             </div>
           </div>
           <div class="chat-title-actions">{title_actions}</div>
@@ -4036,7 +4079,7 @@ async def chat_page(
     <script>
       const root=document.querySelector('.chat-shell'), chatId=root.dataset.chat, archiveView=root.dataset.view==='archive';
       const log=document.getElementById('log'), inp=document.getElementById('inp'), files=document.getElementById('files');
-      const perm=document.getElementById('perm'), autonomy=document.getElementById('autonomy');
+      const perm=document.getElementById('perm'), autonomy=document.getElementById('autonomy'), modelSel=document.getElementById('model');
       const scroll=()=>log.scrollTop=log.scrollHeight; scroll();
       function add(role,txt){{const r=document.createElement('div');r.className='msg-row '+role;
         const b=document.createElement('div');b.className='msg '+role;b.textContent=txt;r.appendChild(b);log.appendChild(r);scroll();return r;}}
@@ -4084,8 +4127,9 @@ async def chat_page(
           document.onkeydown=e=>{{if(e.key==='Escape') close(false);}};
         }});
       }}
-      async function saveSettings(){{if(!archiveView&&chatId) await post('/admin/chat/settings',{{chat_id:chatId,permission_mode:perm.value,autonomy:autonomy.value}});}}
-      if(perm) perm.onchange=saveSettings; if(autonomy) autonomy.onchange=saveSettings;
+      async function saveSettings(){{if(!archiveView&&chatId){{const d=await post('/admin/chat/settings',{{chat_id:chatId,permission_mode:perm.value,autonomy:autonomy.value,model:modelSel?modelSel.value:undefined}});
+        const pill=document.getElementById('modelpill'); if(pill&&d&&d.model_label) pill.textContent=d.model_label;}}}}
+      if(perm) perm.onchange=saveSettings; if(autonomy) autonomy.onchange=saveSettings; if(modelSel) modelSel.onchange=saveSettings;
       if(inp) {{
         inp.addEventListener('input',()=>{{inp.style.height='auto';inp.style.height=Math.min(inp.scrollHeight,220)+'px';}});
         inp.addEventListener('keydown',e=>{{if(e.key==='Enter'&&!e.shiftKey){{e.preventDefault();go();}}}});
@@ -4160,9 +4204,12 @@ async def chat_settings(request: Request, _: bool = Depends(auth.require_admin))
         appset["autonomy"] = autonomy
         set_autonomy(autonomy)
         await db.set_setting("app_settings", appset)
+    if "model" in data:
+        chat["model"] = model_choice.decode(str(data.get("model") or ""))
     chat["updated_at"] = _now_iso()
     await _save_chat_store(store)
-    return JSONResponse({"ok": True})
+    return JSONResponse({"ok": True, "model_label": model_choice.label(
+        chat.get("model"), models.model_config_snapshot())})
 
 
 @router.post("/admin/chat/new")
@@ -4197,6 +4244,27 @@ async def chat_send(request: Request, _: bool = Depends(auth.require_admin)):
     chat = _get_chat(store, data.get("chat_id"))
     if data.get("permission_mode") in ("ask", "auto", "bypass"):
         chat["permission_mode"] = data["permission_mode"]
+    snapshot = models.model_config_snapshot()
+    is_cmd, new_pick, cmd_reply = model_choice.parse_command(msg, snapshot)
+    if is_cmd:
+        # Modellwechsel ist ein Chat-Befehl, kein Auftrag an das LLM: kostet keinen Token.
+        if new_pick is not None:
+            chat["model"] = new_pick
+        else:
+            cmd_reply = cmd_reply or ("Aktuell: " + model_choice.label(chat.get("model"), snapshot) +
+                                      "\nWechseln: /modell schwer · klein · mittel · code · auto")
+        chat["messages"].append(_msg("user", msg))
+        chat["messages"].append(_msg("assistant", (cmd_reply + "\n" + "Aktiv: " + model_choice.label(
+            chat.get("model"), snapshot)) if new_pick is not None else cmd_reply))
+        chat["updated_at"] = _now_iso()
+        await _save_chat_store(store)
+        return JSONResponse({"reply": cmd_reply, "chat_id": chat["id"]})
+    if (ucmd := usage.parse_usage_command(msg)) is not None:
+        chat["messages"].append(_msg("user", msg))
+        chat["messages"].append(_msg("assistant", await usage.report(*ucmd, tz=st.astra_timezone)))
+        chat["updated_at"] = _now_iso()
+        await _save_chat_store(store)
+        return JSONResponse({"chat_id": chat["id"]})
     user_msg = _msg("user", msg or "Anhang", attachments=attachments)
     chat["messages"].append(user_msg)
     if len([m for m in chat["messages"] if m["role"] == "user"]) == 1:
@@ -4209,6 +4277,8 @@ async def chat_send(request: Request, _: bool = Depends(auth.require_admin)):
             thread_id=f"web-owner:{chat['id']}", channel="web",
             history=_chat_messages_for_agent(chat),
             permission_mode=chat.get("permission_mode", "ask"),
+            model_pick=model_choice.clean_pick(chat.get("model")) or None,
+            chat_id=chat["id"],
         )
     except Exception as e:  # noqa: BLE001
         log.exception("web chat failed")
@@ -4317,6 +4387,7 @@ async def chat_branch(request: Request, _: bool = Depends(auth.require_admin)):
     copied = [{**m, "id": f"m_{uuid4().hex[:10]}", "pending_action": None} for m in messages]
     child = _new_chat(f"{chat.get('title', 'Chat')} / Branch", messages=copied)
     child["permission_mode"] = chat.get("permission_mode", "ask")
+    child["model"] = dict(chat.get("model") or {})      # Branch startet mit dem Modell des Ursprungs
     child["parent_id"] = chat["id"]
     child["branch_base_count"] = len(copied)
     store["chats"].insert(0, child)
