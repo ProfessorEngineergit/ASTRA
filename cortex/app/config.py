@@ -102,6 +102,12 @@ class Settings(BaseSettings):
     astra_briefing_time: str = "07:00"       # local time HH:MM
     astra_briefing_chat_id: str = ""         # defaults to telegram_owner_chat_id
 
+    # ── OpenBoard wall display (/display/v1/*, LAN only) ─────────────────────────
+    # Blank token → ASTRA generates one on first use (shown in /admin/display).
+    astra_display_token: str = ""
+    astra_tts_model: str = "gpt-4o-mini-tts"  # OpenAI audio.speech model
+    astra_tts_voice: str = "nova"             # natural, German-capable voice
+
     @property
     def openai_enabled(self) -> bool:
         return bool(self.openai_api_key)

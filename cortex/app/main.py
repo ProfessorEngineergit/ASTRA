@@ -39,10 +39,12 @@ from fastapi.staticfiles import StaticFiles
 from . import __version__, brain, briefing, db, knowledge
 from .channels import get_channels
 from .config import get_settings
+from .display import api as display_api
 from .integrations.transcription import get_transcriber
 from .plugins.registry import get_manager
 from .web import admin as web_admin
 from .web import admin_extra as web_admin_extra
+from .web import admin_display as web_admin_display
 from .web import admin_google as web_admin_google
 from .web import auth as web_auth
 
@@ -419,10 +421,11 @@ async def lifespan(app: FastAPI):
     else:
         log.info("Telegram mode=%s — no background poller.", s.astra_telegram_mode)
 
-    if s.astra_briefing_enabled and s.telegram_enabled:
-        briefing_task = asyncio.create_task(briefing.scheduler(), name="briefing")
-        tasks.append(briefing_task)
-        log.info("Morning briefing scheduler started (%s).", s.astra_briefing_time)
+    # Immer starten: Zeit und Ziele (Telegram und/oder OpenBoard-Display) kommen live aus
+    # den Einstellungen; ohne aktives Ziel tut der Scheduler zur Briefing-Zeit nichts.
+    briefing_task = asyncio.create_task(briefing.scheduler(), name="briefing")
+    tasks.append(briefing_task)
+    log.info("Morning briefing scheduler started (Telegram/Display je nach Einstellung).")
 
     # Self-documenting boot log: voice + which plugins are live.
     enabled_plugins = ", ".join(p.slug for p in get_manager().enabled()) or "(none)"
@@ -452,6 +455,9 @@ if _STATIC_DIR.is_dir():
 app.include_router(web_admin.router)
 app.include_router(web_admin_extra.router)
 app.include_router(web_admin_google.router)
+app.include_router(web_admin_display.router)
+# OpenBoard-Wanddisplay (Bearer-Token, nur LAN — bewusst nicht im Caddyfile).
+app.include_router(display_api.router)
 
 
 # ─── Auth helper ──────────────────────────────────────────────────────────────
@@ -496,7 +502,9 @@ async def health():
 async def briefing_run(x_astra_secret: str | None = Header(default=None)):
     _verify_secret(x_astra_secret)
     ok = await briefing.send()
-    return {"ok": ok}
+    cfg = await briefing.briefing_settings()
+    shown = await briefing.send_display() if cfg["display"] else None
+    return {"ok": ok, "display": shown}
 
 
 @app.get("/briefing/preview", tags=["briefing"])

@@ -1057,6 +1057,7 @@ def page(
             f'{navlink("/admin/brain", "Wissen", "brain")}'
             f'{navlink("/admin/prompts", "Prompts", "prompts")}'
             f'{navlink("/admin/secretary", "Secretary", "secretary")}'
+            f'{navlink("/admin/display", "Display", "display")}'
             f'{navlink("/admin/contacts", "Kontakte", "contacts")}'
             f'{navlink("/admin/safety", "Sicherheit", "safety")}'
             f'{navlink("/admin/osint", "Recon", "osint")}'

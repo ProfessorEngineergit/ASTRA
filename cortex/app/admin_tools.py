@@ -1181,7 +1181,12 @@ def register_admin_tools() -> None:
          "\"expect\":{\"path\":\"data.done\",\"equals\":false}}. actions ist eine Liste, z. B. "
          "[{\"type\":\"speak\",\"text\":\"Duolingo nicht vergessen\",\"where\":\"Schlafzimmer\"},"
          "{\"type\":\"notify\",\"text\":\"Duolingo offen\"},{\"type\":\"tool\","
-         "\"tool\":\"add_google_task\",\"args\":{\"title\":\"Duolingo\"}}]. Wenn Bahrian dich im "
+         "\"tool\":\"add_google_task\",\"args\":{\"title\":\"Duolingo\"}}]. Einmalig: trigger.date="
+         "'YYYY-MM-DD' (schaltet sich nach dem Feuern ab). Wecker/Alarme auf dem Wand-Display "
+         "(OpenBoard) sind Regeln mit einer display-Aktion: {\"type\":\"display\",\"event\":\"alarm\","
+         "\"data\":{\"label\":\"Aufstehen\",\"sound\":\"gentle\",\"briefing\":true}} — dafür gibt es "
+         "bequemer display_alarm_set. Weitere display-Events: say {text}, card {card}, "
+         "command {action:sleep|wake|open_app, app}. Wenn Bahrian dich im "
          "Chat darum bittet, ist die Regel sofort aktiv.",
          {"type": "object", "properties": {
              "name": {"type": "string"},
