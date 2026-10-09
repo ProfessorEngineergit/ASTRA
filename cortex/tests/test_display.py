@@ -170,6 +170,21 @@ def test_message_flow_with_mocked_agent(disp, monkeypatch):
         "Was steht heute an?", "Heute hast du Klavier um 16 Uhr.", "Und morgen?"]
 
 
+def test_new_conversation_resets_history(disp, monkeypatch):
+    from app import agent
+    seen = {}
+
+    async def fake_reply(**kw):
+        seen.update(kw)
+        return {"reply": "Okay.", "tool_calls": []}
+    monkeypatch.setattr(agent, "generate_reply_meta", fake_reply)
+    c = _client()
+    c.post("/display/v1/message", headers=_auth(_token()), json={"session_id": "display-main", "text": "Erste Frage"})
+    c.post("/display/v1/message", headers=_auth(_token()), json={
+        "session_id": "display-main", "text": "Neues Thema", "context": {"new_conversation": True}})
+    assert [m["content"] for m in seen["history"]] == ["Neues Thema"]
+
+
 def test_message_speak_uses_voice_register_and_returns_speech(disp, monkeypatch):
     from app import agent
     from app.persona import Register

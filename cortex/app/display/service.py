@@ -315,6 +315,9 @@ async def handle_message(body: dict) -> dict:
     lock = _locks.setdefault(sid, asyncio.Lock())
     async with lock:
         session = await load_session(sid)
+        # "Neues Gespräch" on the display keeps the session id but starts fresh.
+        if context.get("new_conversation"):
+            session["messages"] = []
         now_iso = datetime.now(_tz()).isoformat()
         session["messages"].append({"role": "user", "content": text, "ts": now_iso})
         history = [{"role": m["role"], "content": m["content"]}
