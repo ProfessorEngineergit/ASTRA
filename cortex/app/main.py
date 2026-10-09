@@ -24,6 +24,7 @@ Health:
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
@@ -31,7 +32,7 @@ from typing import Any
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -342,6 +343,7 @@ async def lifespan(app: FastAPI):
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     log.info("ASTRA cortex starting up…")
+    warn_weak_secret(s.cortex_shared_secret)
     knowledge.ensure_seeded()
     await db.init_pool()
     await web_auth.ensure_password_from_env()
@@ -454,9 +456,27 @@ app.include_router(web_admin_google.router)
 
 # ─── Auth helper ──────────────────────────────────────────────────────────────
 
+_WEAK_SECRETS = {"", "dev-secret", "change-me-too", "change-me"}
+
+
+def warn_weak_secret(secret: str) -> bool:
+    """Laut warnen, wenn CORTEX_SHARED_SECRET noch ein Standardwert ist. True = schwach."""
+    if (secret or "").strip() in _WEAK_SECRETS:
+        log.warning("!" * 78)
+        log.warning("!!  CORTEX_SHARED_SECRET ist ein Standardwert (%r) — /ingress/* und "
+                    "/briefing/* sind damit offen.", secret)
+        log.warning("!!  Setze in .env einen starken Wert:  openssl rand -hex 32")
+        log.warning("!" * 78)
+        return True
+    return False
+
+
 def _verify_secret(x_astra_secret: str | None) -> None:
-    """Raise 403 if the shared secret header is missing or wrong."""
-    if x_astra_secret != get_settings().cortex_shared_secret:
+    """Raise 403 if the shared secret header is missing or wrong (constant-time compare)."""
+    expected = get_settings().cortex_shared_secret or ""
+    presented = x_astra_secret or ""
+    if not expected or not presented or not hmac.compare_digest(
+            presented.encode("utf-8"), expected.encode("utf-8")):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid or missing X-Astra-Secret header.",
@@ -489,7 +509,7 @@ async def briefing_preview(x_astra_secret: str | None = Header(default=None)):
 # ─── Dashboard (lightweight status GUI) ─────────────────────────────────────────
 
 @app.get("/dashboard", response_class=HTMLResponse, tags=["infra"])
-async def dashboard():
+async def dashboard(_: bool = Depends(web_auth.require_admin)):
     from .dashboard import render
     s = get_settings()
     threads = await db.list_threads(20)
