@@ -42,6 +42,9 @@
 		reverse_proxy cortex:8000
 	}
 
+	# OpenBoard-Wanddisplay (/display/v1/*) wird hier ABSICHTLICH NICHT veröffentlicht:
+	# Der Kiosk-Controller spricht ASTRA nur im LAN direkt an (http://<server>:8088).
+
 	# Everything else is closed.
 	handle {
 		respond "ASTRA" 404

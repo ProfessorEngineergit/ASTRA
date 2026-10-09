@@ -24,6 +24,7 @@ Health:
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
@@ -31,17 +32,19 @@ from typing import Any
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__, brain, briefing, db, knowledge
 from .channels import get_channels
 from .config import get_settings
+from .display import api as display_api
 from .integrations.transcription import get_transcriber
 from .plugins.registry import get_manager
 from .web import admin as web_admin
 from .web import admin_extra as web_admin_extra
+from .web import admin_display as web_admin_display
 from .web import admin_google as web_admin_google
 from .web import auth as web_auth
 
@@ -342,6 +345,7 @@ async def lifespan(app: FastAPI):
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     log.info("ASTRA cortex starting up…")
+    warn_weak_secret(s.cortex_shared_secret)
     knowledge.ensure_seeded()
     await db.init_pool()
     await web_auth.ensure_password_from_env()
@@ -417,10 +421,11 @@ async def lifespan(app: FastAPI):
     else:
         log.info("Telegram mode=%s — no background poller.", s.astra_telegram_mode)
 
-    if s.astra_briefing_enabled and s.telegram_enabled:
-        briefing_task = asyncio.create_task(briefing.scheduler(), name="briefing")
-        tasks.append(briefing_task)
-        log.info("Morning briefing scheduler started (%s).", s.astra_briefing_time)
+    # Immer starten: Zeit und Ziele (Telegram und/oder OpenBoard-Display) kommen live aus
+    # den Einstellungen; ohne aktives Ziel tut der Scheduler zur Briefing-Zeit nichts.
+    briefing_task = asyncio.create_task(briefing.scheduler(), name="briefing")
+    tasks.append(briefing_task)
+    log.info("Morning briefing scheduler started (Telegram/Display je nach Einstellung).")
 
     # Self-documenting boot log: voice + which plugins are live.
     enabled_plugins = ", ".join(p.slug for p in get_manager().enabled()) or "(none)"
@@ -450,13 +455,34 @@ if _STATIC_DIR.is_dir():
 app.include_router(web_admin.router)
 app.include_router(web_admin_extra.router)
 app.include_router(web_admin_google.router)
+app.include_router(web_admin_display.router)
+# OpenBoard-Wanddisplay (Bearer-Token, nur LAN — bewusst nicht im Caddyfile).
+app.include_router(display_api.router)
 
 
 # ─── Auth helper ──────────────────────────────────────────────────────────────
 
+_WEAK_SECRETS = {"", "dev-secret", "change-me-too", "change-me"}
+
+
+def warn_weak_secret(secret: str) -> bool:
+    """Laut warnen, wenn CORTEX_SHARED_SECRET noch ein Standardwert ist. True = schwach."""
+    if (secret or "").strip() in _WEAK_SECRETS:
+        log.warning("!" * 78)
+        log.warning("!!  CORTEX_SHARED_SECRET ist ein Standardwert (%r) — /ingress/* und "
+                    "/briefing/* sind damit offen.", secret)
+        log.warning("!!  Setze in .env einen starken Wert:  openssl rand -hex 32")
+        log.warning("!" * 78)
+        return True
+    return False
+
+
 def _verify_secret(x_astra_secret: str | None) -> None:
-    """Raise 403 if the shared secret header is missing or wrong."""
-    if x_astra_secret != get_settings().cortex_shared_secret:
+    """Raise 403 if the shared secret header is missing or wrong (constant-time compare)."""
+    expected = get_settings().cortex_shared_secret or ""
+    presented = x_astra_secret or ""
+    if not expected or not presented or not hmac.compare_digest(
+            presented.encode("utf-8"), expected.encode("utf-8")):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid or missing X-Astra-Secret header.",
@@ -476,7 +502,9 @@ async def health():
 async def briefing_run(x_astra_secret: str | None = Header(default=None)):
     _verify_secret(x_astra_secret)
     ok = await briefing.send()
-    return {"ok": ok}
+    cfg = await briefing.briefing_settings()
+    shown = await briefing.send_display() if cfg["display"] else None
+    return {"ok": ok, "display": shown}
 
 
 @app.get("/briefing/preview", tags=["briefing"])
@@ -489,7 +517,7 @@ async def briefing_preview(x_astra_secret: str | None = Header(default=None)):
 # ─── Dashboard (lightweight status GUI) ─────────────────────────────────────────
 
 @app.get("/dashboard", response_class=HTMLResponse, tags=["infra"])
-async def dashboard():
+async def dashboard(_: bool = Depends(web_auth.require_admin)):
     from .dashboard import render
     s = get_settings()
     threads = await db.list_threads(20)

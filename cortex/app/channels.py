@@ -4,6 +4,7 @@ Two backends (config ASTRA_SEND_BACKEND):
   • "direct" — cortex calls WAHA / signal-cli / Telegram APIs itself (easy first run).
   • "n8n"    — cortex POSTs to the visual tool/send_* workflows (the n8n layer you like).
 Telegram (your control channel) is always sent directly for low latency + buttons.
+"display" pushes a `say` event to connected OpenBoard wall displays (app/display).
 """
 from __future__ import annotations
 
@@ -58,6 +59,10 @@ class Channels:
         try:
             if channel == "telegram":
                 return await self.send_telegram(to, text)
+            if channel == "display":
+                # OpenBoard-Wanddisplay: `to` ist bedeutungslos (es gibt nur Bahrians Displays).
+                from .display import service as display
+                return await display.deliver_text(text)
             # WhatsApp's UI setup and self-test use the native WAHA transport.
             # Keep real sends on that exact same path as well: an old global
             # ASTRA_SEND_BACKEND=n8n must not bypass the Secretary installation

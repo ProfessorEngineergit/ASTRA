@@ -6,11 +6,14 @@ bauen. Regeln sind JSON (inspizierbar, editierbar) und liegen in der `rules`-Tab
 
 Aufbau einer Regel:
     trigger   {"type":"schedule","at":"21:50","days":[0,1,2,3,4],"offset_min":0}
+              (einmalig: {"type":"schedule","at":"07:00","date":"2026-10-10"} — danach aus)
     condition {"type":"always"} | {"type":"tool","tool":"duolingo_status",
                "expect":{"path":"data.done","equals":false}}
     actions   [{"type":"speak","text":"…","where":"Schlafzimmer"},
                {"type":"notify","text":"…","urgency":"normal"},
-               {"type":"tool","tool":"add_google_task","args":{"title":"Duolingo"}}]
+               {"type":"tool","tool":"add_google_task","args":{"title":"Duolingo"}},
+               {"type":"display","event":"alarm","data":{"label":"Aufstehen","sound":"gentle",
+                "briefing":true}}]   # → OpenBoard-Wanddisplay (Wecker, say, card, command, board)
 
 Die Zeit- und Bedingungslogik ist rein (I/O-frei) gehalten — genau so testbar.
 Ausführung läuft über den notify-Router (W3) und das Tool-Registry (dispatch).
@@ -18,7 +21,7 @@ Ausführung läuft über den notify-Router (W3) und das Tool-Registry (dispatch)
 from __future__ import annotations
 
 import logging
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -51,6 +54,13 @@ def schedule_matches(trigger: dict, now: datetime, *, last_run: datetime | None 
     offset = int(trigger.get("offset_min") or 0)
     fire_dt = (datetime.combine(now.date(), base, tzinfo=now.tzinfo)
                - timedelta(minutes=offset))
+    if trigger.get("date"):
+        # Einmalige Regel: nur an diesem Kalendertag (Offset kann über Mitternacht schieben).
+        try:
+            day = date.fromisoformat(str(trigger["date"]))
+        except ValueError:
+            return False
+        fire_dt = datetime.combine(day, base, tzinfo=now.tzinfo) - timedelta(minutes=offset)
     # innerhalb desselben Minuten-Slots?
     if not (fire_dt <= now < fire_dt + timedelta(minutes=1)):
         return False
@@ -58,6 +68,37 @@ def schedule_matches(trigger: dict, now: datetime, *, last_run: datetime | None 
             now.replace(second=0, microsecond=0):
         return False   # in dieser Minute schon gelaufen
     return True
+
+
+def is_one_shot(trigger: dict) -> bool:
+    return bool((trigger or {}).get("date") or (trigger or {}).get("once"))
+
+
+def next_occurrence(trigger: dict, now: datetime, *, horizon_days: int = 7) -> datetime | None:
+    """Nächster Feuerzeitpunkt einer schedule-Regel ab `now` (inklusive), sonst None. Rein."""
+    if (trigger or {}).get("type") != "schedule":
+        return None
+    base = _parse_hhmm(trigger.get("at", ""))
+    if base is None:
+        return None
+    offset = timedelta(minutes=int(trigger.get("offset_min") or 0))
+    floor = now.replace(second=0, microsecond=0)
+    if trigger.get("date"):
+        try:
+            day = date.fromisoformat(str(trigger["date"]))
+        except ValueError:
+            return None
+        at = datetime.combine(day, base, tzinfo=now.tzinfo) - offset
+        return at if floor <= at <= now + timedelta(days=horizon_days) else None
+    days = {int(d) for d in trigger.get("days") or []}
+    for i in range(horizon_days + 1):
+        day = now.date() + timedelta(days=i)
+        if days and day.weekday() not in days:
+            continue
+        at = datetime.combine(day, base, tzinfo=now.tzinfo) - offset
+        if at >= floor:
+            return at
+    return None
 
 
 # ─── Bedingung ────────────────────────────────────────────────────────────────
@@ -114,7 +155,7 @@ async def _run_condition(condition: dict, principal: str) -> bool:
     return False
 
 
-async def run_actions(actions: list, *, principal: str = "") -> list[dict]:
+async def run_actions(actions: list, *, principal: str = "", rule_id: Any = None) -> list[dict]:
     """Führt die Aktionen einer Regel aus. Gibt je Aktion ein Ergebnis zurück."""
     from . import notify as notify_mod
     from . import tools
@@ -142,6 +183,10 @@ async def run_actions(actions: list, *, principal: str = "") -> list[dict]:
                 ok, summary, _p = result_summary(raw)
                 out.append({"type": "tool", "tool": action.get("tool"),
                             "ok": ok is not False, "summary": summary})
+            elif atype == "display":
+                from .display import service as display
+                res = await display.run_rule_action(action, rule_id=rule_id, principal=principal)
+                out.append({"type": "display", "event": action.get("event") or "alarm", **res})
             else:
                 out.append({"type": atype, "ok": False, "summary": "unbekannte Aktion"})
         except Exception as e:  # noqa: BLE001 — one bad action must not abort the rest
@@ -150,18 +195,24 @@ async def run_actions(actions: list, *, principal: str = "") -> list[dict]:
     return out
 
 
-async def fire_rule(rule: dict) -> str:
-    """Bedingung prüfen, ggf. Aktionen ausführen, Ergebnis als kurzer String."""
+async def fire_rule(rule: dict, *, scheduled: bool = False) -> str:
+    """Bedingung prüfen, ggf. Aktionen ausführen, Ergebnis als kurzer String.
+
+    `scheduled`: vom Ticker ausgelöst — dann schaltet sich eine einmalige Regel danach ab
+    (ein manueller Testlauf über astra_rule_run_now lässt sie aktiv)."""
     from . import db
     principal = rule.get("principal_key") or ""
     try:
         if not await _run_condition(rule.get("condition") or {}, principal):
             await db.mark_rule_run(rule["id"], "condition-false")
             return "condition-false"
-        results = await run_actions(rule.get("actions") or [], principal=principal)
+        results = await run_actions(rule.get("actions") or [], principal=principal,
+                                    rule_id=rule.get("id"))
         ok = sum(1 for r in results if r.get("ok"))
         summary = f"{ok}/{len(results)} Aktionen ok"
         await db.mark_rule_run(rule["id"], summary)
+        if scheduled and is_one_shot(rule.get("trigger") or {}):
+            await db.set_rule_enabled(rule["id"], False)   # einmalig: erledigt
         await db.audit("rule_fired", detail={"rule": rule.get("name"), "id": rule["id"],
                                              "results": results})
         return summary
@@ -186,6 +237,6 @@ async def tick(now: datetime | None = None) -> int:
     fired = 0
     for rule in await db.active_schedule_rules():
         if schedule_matches(rule.get("trigger") or {}, now, last_run=rule.get("last_run_at")):
-            await fire_rule(rule)
+            await fire_rule(rule, scheduled=True)
             fired += 1
     return fired

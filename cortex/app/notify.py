@@ -7,6 +7,8 @@ soll stattdessen die Dringlichkeit UND die Anwesenheit entscheiden, wohin es geh
   control → Telegram (Freigaben, Buttons — unverändert)
   normal  → Push auf die HA-Companion-App (iOS + Android)
   urgent  → zusätzlich gesprochen auf dem Lautsprecher, wenn zu Hause & wach
+  display → normal/urgent zusätzlich aufs OpenBoard-Wanddisplay, wenn eines verbunden ist,
+            Bahrian wach ist und nicht nachweislich unterwegs (urgent dort auch gesprochen)
 
 Push-Fehlschlag fällt auf Telegram zurück. Ohne HA/Push konfiguriert bleibt immer
 Telegram als Sockel. Die Kanalwahl ist als reine Funktion herausgezogen, damit sie
@@ -29,13 +31,20 @@ NORMAL = "normal"
 URGENT = "urgent"
 
 
-def choose_channels(urgency: str, *, at_home: bool | None, awake: bool) -> list[str]:
-    """Reine Routing-Entscheidung. `at_home=None` = unbekannt (dann kein Speaker)."""
+def choose_channels(urgency: str, *, at_home: bool | None, awake: bool,
+                    display: bool = False) -> list[str]:
+    """Reine Routing-Entscheidung. `at_home=None` = unbekannt (dann kein Speaker).
+
+    `display` = ein OpenBoard-Display ist verbunden (und für Meldungen freigegeben). Ein
+    verbundenes Wanddisplay ist selbst ein Zuhause-Indiz, darum genügt dort „nicht
+    nachweislich weg“ (at_home True/None) — aber nur, solange Bahrian wach ist."""
     if urgency == CONTROL:
         return ["telegram"]
     channels = ["push"]
     if urgency == URGENT and at_home is True and awake:
         channels.append("speak")
+    if display and awake and at_home is not False:
+        channels.append("display")
     return channels
 
 
@@ -128,6 +137,24 @@ async def _speak(text: str, where: str) -> bool:
         return False
 
 
+async def _display_available() -> bool:
+    try:
+        from .display import service as display
+        return await display.notify_target()
+    except Exception:  # noqa: BLE001
+        log.debug("display availability check failed", exc_info=True)
+        return False
+
+
+async def _display(text: str, title: str, *, urgent: bool) -> bool:
+    try:
+        from .display import service as display
+        return await display.notify_display(text, title=title, urgent=urgent)
+    except Exception:  # noqa: BLE001
+        log.debug("display notify failed", exc_info=True)
+        return False
+
+
 async def _telegram(text: str, principal: str, actions: list[dict] | None) -> bool:
     chat = await _owner_chat(principal)
     if not chat:
@@ -152,7 +179,8 @@ async def notify(
     Returns {channel: ok} for every channel attempted. Never raises — a dead HA
     just means Telegram carries the message."""
     at_home, awake = await _presence(principal)
-    wanted = choose_channels(urgency, at_home=at_home, awake=awake)
+    display_on = await _display_available() if urgency != CONTROL else False
+    wanted = choose_channels(urgency, at_home=at_home, awake=awake, display=display_on)
     results: dict[str, bool] = {}
 
     if "telegram" in wanted:
@@ -164,6 +192,8 @@ async def notify(
             results["telegram_fallback"] = await _telegram(text, principal, actions)
     if "speak" in wanted:
         results["speak"] = await _speak(text, where)
+    if "display" in wanted:
+        results["display"] = await _display(text, title, urgent=(urgency == URGENT))
 
     await db.audit("notify", detail={"urgency": urgency, "where": where,
                                      "at_home": at_home, "awake": awake, "results": results})
