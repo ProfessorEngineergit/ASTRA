@@ -137,7 +137,7 @@ Alle optional, alle einzeln per `.env` aktivierbar. Nicht konfiguriert = no-op (
 | 🏫 **Stundenplan** | `EDUPAGE_SUBDOMAIN/USERNAME/PASSWORD` | heutigen/morgigen Stundenplan abrufen |
 | 🚆 **ÖPNV (RMV)** | `RMV_API_KEY` (+ `RMV_HOME_STOP_ID`) | nächste Abfahrten + Ausfall-Warnungen |
 | ✅ **Google Tasks** | `GOOGLE_TASKS_ENABLED=true` + n8n-Workflow | To-Dos anlegen |
-| ☀️ **Morning Briefing** | `ASTRA_BRIEFING_ENABLED=true` | proaktiv morgens: Übernacht-Nachrichten + Stundenplan + Abfahrten via Telegram |
+| ☀️ **Morning Briefing** | `ASTRA_BRIEFING_ENABLED=true` oder Admin → Display | proaktiv morgens: Übernacht-Nachrichten + Stundenplan + Abfahrten via Telegram und/oder aufs OpenBoard-Display |
 
 ASTRA kann sich außerdem per Tool `remember_fact` selbst dauerhafte Fakten/Routinen merken (landet in den Markdown-Files, s. u.).
 
@@ -165,7 +165,60 @@ Token-/Kostenübersicht und Modellwahl pro Chat — Details in [`docs/chief-of-s
 Zentrale Anmeldung für Kalender, Aufgaben und Gmail mit mehreren Konten und Kontowechsel — siehe [`docs/google.md`](docs/google.md).
 
 ### 📊 Dashboard
-Status-GUI (read-only) unter **`http://127.0.0.1:8088/dashboard`** — aktive Threads, offene Freigaben, Audit-Log, welche Fähigkeiten live sind. Hinter VPN/Caddy halten.
+Status-GUI (read-only) unter **`http://127.0.0.1:8088/dashboard`** — aktive Threads, offene Freigaben, Audit-Log, welche Fähigkeiten live sind. Nur mit Admin-Login erreichbar.
+
+## 📺 OpenBoard-Display
+
+ASTRA wohnt auch auf deinem Wand-Touch-Display: Mit [OpenBoard](https://github.com/ProfessorEngineergit/mega-display-kiosk)
+(dem Whiteboard-OS für große Touchscreens) sprichst du per Stimme oder Touch mit ASTRA – und bekommst
+Antworten nicht nur als Text, sondern als Karten: Termine, Wetter, Smart-Home-Werte, Listen, Skizzen, Bilder.
+
+### Einrichten (zwei Minuten)
+
+1. In ASTRA **Admin → Display** öffnen. Dort stehen die **ASTRA-URL** (die LAN-Adresse, z. B.
+   `http://192.168.178.189:8088`) und der **Token**. Der Token wird beim ersten Öffnen erzeugt und liegt
+   verschlüsselt in der Datenbank. Du kannst ihn jederzeit neu erzeugen – danach gilt der alte nicht mehr.
+   Wer ihn lieber selbst setzt: `ASTRA_DISPLAY_TOKEN` in der `.env` (hat dann Vorrang).
+2. In OpenBoard unter **Einstellungen → ASTRA** URL und Token eintragen, „Verbindung testen“.
+3. Optional in ASTRA unter **Display → ASTRA-Werkzeuge** einschalten: Dann darf ASTRA das Display auch
+   von sich aus bespielen (Karten zeigen, sprechen, Apps öffnen, aufs Whiteboard zeichnen, Wecker stellen).
+   Für Bilder zusätzlich das Plugin **Bildgenerierung** aktivieren.
+
+Der OpenBoard-Controller spricht ASTRA serverseitig an (`Authorization: Bearer <Token>`); der Browser auf
+dem Display sieht den Token nie. Admin-Login und `X-Astra-Secret` öffnen diese Schnittstelle **nicht**.
+
+### Was ASTRA auf dem Display kann
+
+- **Gespräch:** Sprache (Whisper) oder Text rein, Antwort als Text, Karten und – wenn gewünscht – gesprochen
+  (OpenAI-TTS, Stimme und Modell im Admin unter Display wählbar, Standard `gpt-4o-mini-tts` / `nova`).
+- **Karten:** Kalender, Wetter (inkl. Stunden- und Tagesvorschau), Home-Assistant-Werte entstehen automatisch
+  aus den Antworten; dazu Markdown, Listen, Fakten-Tabellen, SVG-Skizzen und generierte Bilder.
+- **Glance:** Begrüßung je nach Tageszeit, Wetter, heutige Termine, Kurz-Briefing und die nächsten Wecker.
+- **Whiteboard:** Text, Mermaid-Diagramme, Bilder und SVGs direkt aufs Board.
+- **Steuern:** Display schlafen legen/aufwecken, Apps öffnen.
+- **Meldungen:** Normale und dringende Meldungen landen zusätzlich auf dem Display, wenn eines verbunden ist,
+  du wach bist und nicht nachweislich unterwegs (abschaltbar).
+
+### Wecker & Morgen-Briefing
+
+„Weck mich morgen um 7“ – ASTRA legt dafür eine Regel mit einer **display-Aktion** an. Zur Weckzeit klingelt
+das Display (sanft, klassisch oder lautlos) und liest danach auf Wunsch ein kurzes Briefing mit Wetter und
+Terminen vor. Einmalige Wecker schalten sich danach ab; wiederkehrende („werktags 6:40“) bleiben. Wecker lassen
+sich auch unter **Admin → Display** stellen und löschen. Ist zur Weckzeit kein Display verbunden, kommt der
+Wecker als dringende Meldung aufs Handy.
+
+Das **Morgen-Briefing** kann zusätzlich (oder statt Telegram) aufs Display: Karten für Wetter, Termine und den
+Rest plus eine gesprochene Kurzfassung. Uhrzeit und Ziele stellst du unter **Admin → Display** ein
+(`ASTRA_BRIEFING_TIME` / `ASTRA_BRIEFING_ENABLED` bleiben als Fallback).
+
+### Privatsphäre
+
+- `/display/*` ist **nur im Heimnetz** erreichbar und wird bewusst nicht über Caddy ins Internet gereicht.
+  Wer den Token hat, spricht als du – behandle ihn wie ein Passwort.
+- Gesprächsverläufe des Displays liegen in deiner Datenbank (die letzten 80 Nachrichten pro Sitzung).
+- Sprache und Bilder laufen über OpenAI (wie Chat und Whisper). Ohne OpenAI-Key zeigt das Display nur Text.
+- Generierte Bilder liegen im `brain_data`-Volume und kosten pro Bild – darum gibt es ein Tageslimit, und im
+  Web-Chat fragt ASTRA vorher nach.
 
 ## 🧩 Plugins & Web-Konfiguration
 
@@ -233,8 +286,15 @@ Vorbild: [`builtin/rmv.py`](cortex/app/plugins/builtin/rmv.py).
 | POST | `/ingress/telegram` | nur wenn `ASTRA_TELEGRAM_MODE=webhook` |
 | POST | `/briefing/run` | Briefing jetzt senden |
 | GET  | `/briefing/preview` | Briefing-Text rendern (nicht senden) |
+| GET  | `/display/v1/hello` | OpenBoard: Name, Version, Fähigkeiten |
+| POST | `/display/v1/message` | OpenBoard: Gesprächs-Turn (Text oder Audio → Antwort, Karten, Sprache) |
+| GET  | `/display/v1/glance` | OpenBoard: Begrüßung, Wetter, Termine, Kurz-Briefing, Wecker |
+| POST | `/display/v1/tts` | OpenBoard: Text → MP3 (base64) |
+| GET  | `/display/v1/events` | OpenBoard: Ereignisstrom (SSE: card, say, alarm, command, board, ping …) |
 
-`/ingress/*` und `/briefing/*` verlangen den Header `X-Astra-Secret: <CORTEX_SHARED_SECRET>`; `/admin*` ist passwortgeschützt.
+`/ingress/*` und `/briefing/*` verlangen den Header `X-Astra-Secret: <CORTEX_SHARED_SECRET>` (zeitkonstant
+geprüft; beim Start warnt ASTRA laut, wenn noch ein Standardwert gesetzt ist); `/admin*` und `/dashboard` sind
+passwortgeschützt; `/display/*` verlangt `Authorization: Bearer <Display-Token>` und ist nur im LAN gedacht.
 
 ## ✅ Tests
 
